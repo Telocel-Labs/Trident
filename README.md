@@ -19,9 +19,7 @@
 
 ## The Problem
 
-Soroban's RPC node is intentionally thin. No long-term storage, no historical queries, no filtering. That's a reasonable protocol decision — but it means every developer building on Stellar has to build their own event pipeline from scratch.
-
-Every team. Same problem. Every time.
+Soroban's RPC node is intentionally thin — no long-term event storage, no historical queries, no filtering. That's a reasonable protocol decision, but it forces every developer building on Stellar to solve the same infrastructure problem before they can build their actual product. Every serious team ends up writing their own event streaming pipeline, their own database schema, their own parser — in isolation, with no shared guarantees, and no easy recovery when something breaks.
 
 Every mature smart contract ecosystem has solved this exactly once:
 
@@ -36,29 +34,26 @@ Every mature smart contract ecosystem has solved this exactly once:
 
 ## What Trident Does
 
-Trident streams every Soroban contract event off the network, stores it, and gives developers a clean API to query it — by contract, by topic, by ledger range, in real time or historically.
+Trident is a dedicated indexing layer that streams every Soroban contract event off the network, stores it persistently, and exposes it through a clean API. A developer using Trident can query every event a contract has ever emitted — filtered by topic, paginated, in real time or historically — without writing a single line of indexing infrastructure themselves.
 
-```
-Soroban RPC  →  Event Streamer  →  Event Parser  →  PostgreSQL
-                                                         ↓
-                                              REST + GraphQL API
-                                                         ↓
-                                              TypeScript / Rust SDK
-```
+---
 
-The indexer is written in **Rust** — chosen for a system that needs to run 24/7, process binary XDR data at volume, and scale without a rewrite as Stellar grows. The developer-facing SDK is TypeScript because that's what most Stellar dApp developers actually use.
+## Architecture
+
+The system is split into two layers with a hard boundary between them. Everything from ingestion to storage is handled by a **Rust core** — chosen because it decodes XDR natively through the same libraries the Stellar protocol uses, has no garbage collector to introduce latency spikes, and gives the kind of predictable performance a 24/7 indexer demands. The **Go front office** sits in front of that, serving the REST, GraphQL, and WebSocket interfaces that developers actually interact with.
+
+<img width="1400" height="1000" alt="trident-architecture" src="https://github.com/user-attachments/assets/91b8fddf-4837-406e-a76d-d44d0b963005" />
+
+
+The Rust gRPC server polls Soroban RPC on a short interval, decodes every event from XDR into a normalised record, and writes it to PostgreSQL. It also publishes each event into Redis Streams — a persistent, ordered log that the Go layer consumes to power real-time WebSocket subscriptions. This separation is intentional: historical queries read from PostgreSQL, real-time delivery reads from Redis, and the two paths never interfere with each other.
 
 ---
 
 ## Planned Features
 
-- Full historical Soroban event storage — no retention limits
-- Query by contract address, topic, ledger range, or timestamp
-- REST and GraphQL APIs
-- Real-time WebSocket subscriptions per contract
-- TypeScript SDK
-- Self-hosted via Docker Compose
-- Free hosted tier for the Stellar ecosystem
+Trident is being built to cover the full range of what developers need from an indexer — not just the easy parts.
+
+Full historical event storage with no enforced retention limit, so a query against a contract's entire history works on day one and on day one thousand. Filtering by contract address, event topic, ledger range, and timestamp, with cursor-based pagination for large result sets. A REST API for straightforward queries and a GraphQL interface for composable ones. Real-time WebSocket subscriptions so a frontend can react to new contract events as they land on-chain. A TypeScript SDK that wraps all of this into a typed client developers can drop into an existing project in minutes. Self-hosted deployment via a single Docker Compose command, and a free hosted tier so teams that don't want to run infrastructure don't have to.
 
 ---
 
@@ -66,7 +61,7 @@ The indexer is written in **Rust** — chosen for a system that needs to run 24/
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| **1 — MVP** | Rust indexer, PostgreSQL, REST API, Testnet support | 🔄 In progress |
+| **1 — MVP** | Rust indexer, PostgreSQL, REST API, Testnet | 🔄 In progress |
 | **2 — Developer Ready** | GraphQL, TypeScript SDK, Mainnet, hosted free tier | 📋 Planned |
 | **3 — Scale** | WebSocket subscriptions, analytics, developer dashboard | 📋 Planned |
 | **4 — Ecosystem** | Public event explorer, Rust SDK, multi-RPC redundancy | 📋 Planned |
@@ -76,26 +71,9 @@ The indexer is written in **Rust** — chosen for a system that needs to run 24/
 ## Project Status
 
 - [x] Architecture defined
+- [x] Full specification written — [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md)
 - [ ] Repository scaffolding
 - [ ] Phase 1 development begins
-
----
-
-## Contributing
-
-The codebase isn't public yet. The most useful contributions right now:
-
-- **Read the spec** at [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md) and open an issue if something is wrong, underspecified, or questionable
-- **Share your use case** — what would you build on Trident? What queries do you need? Open a [Discussion](https://github.com/trident-build/trident/discussions)
-- **Challenge the architecture** — if you've built something similar, your experience matters
-
-Once development is underway, the full contribution guide is in [CONTRIBUTING.md](https://github.com/Depo-dev/Trident/blob/main/contribute.md).
-
----
-
-## License
-
-MIT — see [LICENSE](./LICENSE).
 
 ---
 
@@ -103,6 +81,8 @@ MIT — see [LICENSE](./LICENSE).
 
 *Build on Stellar. Query everything.*
 
-[Discussions](https://github.com/trident-build/trident/discussions)  · [Contributing](./CONTRIBUTING.md)
+🔱
+
+[Discussions](https://github.com/trident-build/trident/discussions) · [Specification](./docs/SPECIFICATION.md)
 
 </div>
