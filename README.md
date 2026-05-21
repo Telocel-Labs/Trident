@@ -72,8 +72,36 @@ Full historical event storage with no enforced retention limit, so a query again
 
 - [x] Architecture defined
 - [x] Full specification written — [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md)
-- [ ] Repository scaffolding
+- [x] Repository scaffolded
+- [x] CI pipeline active
 - [ ] Phase 1 development begins
+
+---
+
+## Contributing
+
+All branches come off `dev`. Before opening a pull request, make sure all three CI checks pass locally — the pipeline will block merge if any of them fail.
+
+**Rust**
+```bash
+cargo fmt --all             # format — CI runs --check, so this must be clean
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+```
+
+**Go** (`services/api`)
+```bash
+go vet ./...
+golangci-lint run           # install: https://golangci-lint.run/usage/install/
+```
+
+**TypeScript** (`sdk/typescript`)
+```bash
+npm ci
+npm run lint                # runs tsc --noEmit in strict mode
+```
+
+Running these before pushing means CI passes on the first try. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for branching conventions, commit message format, and code standards.
 
 ---
 
