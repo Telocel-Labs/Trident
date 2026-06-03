@@ -116,3 +116,13 @@ jobs:
           tags: trident-indexer:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build gRPC API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/api/Dockerfile
+          push: false
+          tags: trident-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
