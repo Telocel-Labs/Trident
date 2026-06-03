@@ -59,6 +59,7 @@ jobs:
         with:
           version: latest
           working-directory: services/api
+          args: --go=1.22
 
   # ---------------------------------------------------------------------------
   # TypeScript — type check
