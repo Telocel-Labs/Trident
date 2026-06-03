@@ -9,6 +9,12 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	trident "github.com/Depo-dev/trident/services/api/internal/proto"
+	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/middleware"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
@@ -17,42 +23,31 @@ func main() {
 		port = "3000"
 	}
 
+	grpcAddr := os.Getenv("GRPC_API_ADDR")
+	if grpcAddr == "" {
+		grpcAddr = "localhost:50051"
+	}
+
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		slog.Error("failed to connect to gRPC API", "addr", grpcAddr, "err", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	eventsClient := trident.NewEventsClient(conn)
+	eventsHandler := handlers.NewEventsHandler(eventsClient)
+
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/health", handlers.Health)
+	mux.HandleFunc("GET /v1/events", eventsHandler.ListEvents)
+	mux.HandleFunc("GET /v1/events/{id}", eventsHandler.GetEvent)
 
-	// ---------------------------------------------------------------------------
-	// REST router
-	// Wire in the REST handler here. Each resource group gets its own handler
-	// func registered under /v1/. Example:
-	//   mux.HandleFunc("GET /v1/events", handlers.ListEvents)
-	//   mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
-	// ---------------------------------------------------------------------------
-
-	// ---------------------------------------------------------------------------
-	// GraphQL handler
-	// Mount the GraphQL endpoint here, e.g. using gqlgen:
-	//   srv := handler.NewDefaultServer(generated.NewExecutableSchema(cfg))
-	//   mux.Handle("/graphql", srv)
-	//   mux.Handle("/playground", playground.Handler("Trident", "/graphql"))
-	// ---------------------------------------------------------------------------
-
-	// ---------------------------------------------------------------------------
-	// WebSocket handler
-	// Mount the WebSocket subscription endpoint here. Clients subscribe to a
-	// contract address and receive a stream of SorobanEvent JSON objects in
-	// real time as they land on-chain.
-	//   mux.HandleFunc("/ws", ws.Handler(redisClient))
-	// ---------------------------------------------------------------------------
-
-	// ---------------------------------------------------------------------------
-	// Redis Streams consumer
-	// Start the background consumer here. It reads from the Redis Stream written
-	// by the Rust indexer and fans out to connected WebSocket clients.
-	//   go consumer.Start(ctx, redisClient, hub)
-	// ---------------------------------------------------------------------------
+	chain := middleware.Logging(middleware.RequestID(mux))
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
-		Handler:      mux,
+		Handler:      chain,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
