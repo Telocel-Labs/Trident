@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── builder ──────────────────────────────────────────────────────────────────
-FROM rust:1.78-slim AS builder
+FROM rust:1.84-slim AS builder
 
 WORKDIR /build
 
