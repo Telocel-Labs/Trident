@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # Cache dependency compilation separately from source changes.
-COPY Cargo.toml Cargo.lock ./
+# Cargo.lock is gitignored; cargo will generate one if absent.
+COPY Cargo.toml ./
 COPY crates/common/Cargo.toml crates/common/Cargo.toml
 COPY crates/api/Cargo.toml crates/api/Cargo.toml
 COPY crates/indexer/Cargo.toml crates/indexer/Cargo.toml
