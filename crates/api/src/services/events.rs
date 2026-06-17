@@ -71,8 +71,6 @@ impl Events for EventsServiceImpl {
 
         let limit = req.limit.clamp(1, 200) as i64;
 
-        // Cursor: the UUID of the last event seen in the previous page.
-        // Translated to (ledger_sequence, event_index) ordering bounds via a subquery.
         let (cursor_seq, cursor_idx): (Option<i64>, Option<i32>) = if req.cursor.is_empty() {
             (None, None)
         } else {
@@ -93,8 +91,6 @@ impl Events for EventsServiceImpl {
             }
         };
 
-        // Build a dynamic WHERE clause.
-        // Using explicit positional parameters so we can compose conditions.
         let rows: Vec<EventRow> = sqlx::query_as(
             r#"
             SELECT id, contract_id, ledger_sequence, ledger_timestamp,
@@ -146,8 +142,28 @@ impl Events for EventsServiceImpl {
         &self,
         request: Request<GetEventRequest>,
     ) -> Result<Response<Event>, Status> {
-        let _req = request.into_inner();
-        Err(Status::unimplemented("get_event not yet implemented"))
+        let req = request.into_inner();
+
+        let id = Uuid::parse_str(&req.id)
+            .map_err(|_| Status::invalid_argument("id must be a valid UUID"))?;
+
+        let row: Option<EventRow> = sqlx::query_as(
+            r#"
+            SELECT id, contract_id, ledger_sequence, ledger_timestamp,
+                   transaction_hash, event_index, event_type, topics, data, created_at
+            FROM soroban_events
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(db_err)?;
+
+        match row {
+            Some(r) => Ok(Response::new(row_to_event(r))),
+            None => Err(Status::not_found(format!("event {id} not found"))),
+        }
     }
 
     type StreamEventsStream = tokio_stream::wrappers::ReceiverStream<Result<Event, Status>>;
@@ -196,6 +212,24 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    async fn insert_one_event(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO soroban_events
+                (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+                 event_index, event_type, topics, data)
+            VALUES ($1, 'CTEST', 999, NOW(), 'txhashtest', 0, 'contract', '["transfer"]', '{}')
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
     }
 
     #[tokio::test]
@@ -259,5 +293,52 @@ mod tests {
 
         assert_eq!(second_page.events.len(), 3);
         assert!(!second_page.has_more);
+    }
+
+    #[tokio::test]
+    async fn get_existing_event_returns_correct_fields() {
+        let db_url = require_db!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let event_id = insert_one_event(&pool).await;
+
+        let svc = EventsServiceImpl::new(pool);
+        let req = Request::new(GetEventRequest {
+            id: event_id.to_string(),
+        });
+        let event = svc.get_event(req).await.unwrap().into_inner();
+
+        assert_eq!(event.id, event_id.to_string());
+        assert_eq!(event.contract_id, "CTEST");
+        assert_eq!(event.event_type, "contract");
+        assert_eq!(event.topics, vec!["transfer".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_unknown_uuid_returns_not_found() {
+        let db_url = require_db!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        let svc = EventsServiceImpl::new(pool);
+
+        let req = Request::new(GetEventRequest {
+            id: Uuid::new_v4().to_string(),
+        });
+        let err = svc.get_event(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_malformed_uuid_returns_invalid_argument() {
+        let db_url = require_db!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        let svc = EventsServiceImpl::new(pool);
+
+        let req = Request::new(GetEventRequest {
+            id: "not-a-uuid".to_string(),
+        });
+        let err = svc.get_event(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
