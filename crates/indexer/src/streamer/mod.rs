@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
+use tokio_util::sync::CancellationToken;
 use trident_common::TridentError;
 
 use crate::{config::Config, db, parser::Parser, redis_stream, rpc::RpcClient};
@@ -44,9 +45,9 @@ impl Streamer {
         }
     }
 
-    /// Start the polling loop. Runs indefinitely — spawn with `tokio::spawn`
-    /// or drive directly from `main`. Never returns `Ok(())` in normal operation.
-    pub async fn run(&mut self) -> Result<(), TridentError> {
+    /// Start the polling loop. Runs until `shutdown` is cancelled, always
+    /// finishing the current `poll_once` before stopping (never mid-batch).
+    pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
         tracing::info!(
             network = %self.config.network,
             poll_interval_ms = %self.config.poll_interval.as_millis(),
@@ -57,6 +58,12 @@ impl Streamer {
         tracing::info!(cursor, "Resuming from ledger cursor");
 
         loop {
+            // Check for shutdown before starting a new poll so we never begin
+            // a batch we can't finish atomically.
+            if shutdown.is_cancelled() {
+                break;
+            }
+
             match self.poll_once(&mut cursor).await {
                 Ok(events_processed) => {
                     if events_processed > 0 {
@@ -71,8 +78,18 @@ impl Streamer {
                 }
             }
 
-            tokio::time::sleep(self.config.poll_interval).await;
+            // Sleep until the next poll interval, waking immediately on shutdown.
+            tokio::select! {
+                _ = tokio::time::sleep(self.config.poll_interval) => {}
+                _ = shutdown.cancelled() => {
+                    tracing::info!("Shutdown signal received, stopping after current poll");
+                    break;
+                }
+            }
         }
+
+        tracing::info!("Streamer stopped cleanly");
+        Ok(())
     }
 
     /// Execute a single poll cycle. Fetches all available pages from the RPC

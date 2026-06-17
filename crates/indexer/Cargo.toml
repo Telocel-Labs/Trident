@@ -47,3 +47,6 @@ hex = "0.4"
 
 # Retry logic with exponential backoff
 tokio-retry = "0.3"
+
+# CancellationToken for graceful shutdown
+tokio-util = "0.7"

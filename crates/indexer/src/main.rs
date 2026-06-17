@@ -1,3 +1,4 @@
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 mod config;
@@ -24,8 +25,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_conn = redis_client.get_multiplexed_async_connection().await?;
     tracing::info!("Redis connected");
 
-    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn);
-    s.run().await?;
+    let shutdown = CancellationToken::new();
 
+    // Spawn signal watcher — cancels the token on SIGTERM or SIGINT.
+    let shutdown_trigger = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Received SIGINT, initiating graceful shutdown");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Received SIGINT, initiating graceful shutdown");
+        }
+
+        shutdown_trigger.cancel();
+    });
+
+    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn);
+    s.run(shutdown).await?;
+
+    tracing::info!("Trident indexer stopped");
     Ok(())
 }
