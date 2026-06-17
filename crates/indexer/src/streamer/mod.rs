@@ -115,7 +115,7 @@ impl Streamer {
         loop {
             let pc = page_cursor.clone();
             let sl = start_ledger;
-            let page = Retry::spawn(retry_strategy.clone(), || async {
+            let page = Retry::start(retry_strategy.clone(), || async {
                 self.rpc.get_events(sl, pc.clone()).await
             })
             .await?;

@@ -1,4 +1,8 @@
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
+use redis::streams::{StreamReadOptions, StreamReadReply};
+use redis::AsyncCommands;
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -8,13 +12,17 @@ use crate::trident::{
     StreamEventsRequest,
 };
 
+const REDIS_STREAM_KEY: &str = "trident:events";
+const STREAM_CHANNEL_BUF: usize = 128;
+
 pub struct EventsServiceImpl {
     pub db: PgPool,
+    pub redis: redis::aio::ConnectionManager,
 }
 
 impl EventsServiceImpl {
-    pub fn new(db: PgPool) -> Self {
-        Self { db }
+    pub fn new(db: PgPool, redis: redis::aio::ConnectionManager) -> Self {
+        Self { db, redis }
     }
 }
 
@@ -172,25 +180,142 @@ impl Events for EventsServiceImpl {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        let _req = request.into_inner();
-        Err(Status::unimplemented("stream_events not yet implemented"))
+        let req = request.into_inner();
+
+        if req.contract_id.is_empty() {
+            return Err(Status::invalid_argument("contract_id is required"));
+        }
+
+        let contract_id = req.contract_id;
+        let topic_0_filter = if req.topic_0.is_empty() {
+            None
+        } else {
+            Some(req.topic_0)
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BUF);
+        let mut redis = self.redis.clone();
+
+        tokio::spawn(async move {
+            let mut last_id = "$".to_string();
+            let opts = StreamReadOptions::default().block(5_000).count(100);
+
+            loop {
+                let reply: redis::RedisResult<StreamReadReply> = redis
+                    .xread_options(&[REDIS_STREAM_KEY], &[&last_id], &opts)
+                    .await;
+
+                match reply {
+                    Ok(StreamReadReply { keys }) => {
+                        for stream_key in keys {
+                            for entry in stream_key.ids {
+                                last_id = entry.id.clone();
+
+                                let get = |field: &str| -> String {
+                                    entry
+                                        .map
+                                        .get(field)
+                                        .and_then(|v| {
+                                            if let redis::Value::Data(b) = v {
+                                                String::from_utf8(b.clone()).ok()
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or_default()
+                                };
+
+                                if get("contract_id") != contract_id {
+                                    continue;
+                                }
+
+                                if let Some(ref t0) = topic_0_filter {
+                                    let topics_json = get("topics");
+                                    let topics: Vec<String> =
+                                        serde_json::from_str(&topics_json).unwrap_or_default();
+                                    if topics.first().map(String::as_str) != Some(t0.as_str()) {
+                                        continue;
+                                    }
+                                }
+
+                                let topics_json = get("topics");
+                                let topics: Vec<String> =
+                                    serde_json::from_str(&topics_json).unwrap_or_default();
+
+                                let event = Event {
+                                    id: String::new(),
+                                    contract_id: get("contract_id"),
+                                    ledger_sequence: get("ledger_sequence").parse().unwrap_or(0),
+                                    ledger_timestamp: get("ledger_timestamp"),
+                                    transaction_hash: get("transaction_hash"),
+                                    event_index: get("event_index").parse().unwrap_or(0),
+                                    event_type: get("event_type"),
+                                    topics,
+                                    data: get("data"),
+                                    created_at: String::new(),
+                                };
+
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis XREAD error in stream_events, retrying");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if tx.is_closed() {
+                            return;
+                        }
+                    }
+                }
+
+                if tx.is_closed() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio_stream::StreamExt as _;
+
     use super::*;
 
-    macro_rules! require_db {
-        () => {
-            match std::env::var("TEST_DATABASE_URL") {
+    macro_rules! require_services {
+        () => {{
+            let db = match std::env::var("TEST_DATABASE_URL") {
                 Ok(url) => url,
                 Err(_) => {
                     eprintln!("SKIP: TEST_DATABASE_URL not set");
                     return;
                 }
-            }
-        };
+            };
+            let rd = match std::env::var("TEST_REDIS_URL") {
+                Ok(url) => url,
+                Err(_) => {
+                    eprintln!("SKIP: TEST_REDIS_URL not set");
+                    return;
+                }
+            };
+            (db, rd)
+        }};
+    }
+
+    async fn make_svc(db_url: &str, redis_url: &str) -> EventsServiceImpl {
+        let db = PgPool::connect(db_url).await.unwrap();
+        let redis = redis::Client::open(redis_url)
+            .unwrap()
+            .get_connection_manager()
+            .await
+            .unwrap();
+        EventsServiceImpl::new(db, redis)
     }
 
     async fn seed_events(pool: &PgPool, contract_id: &str, count: usize) {
@@ -234,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_events_filters_by_contract_id() {
-        let db_url = require_db!();
+        let (db_url, redis_url) = require_services!();
         let pool = PgPool::connect(&db_url).await.unwrap();
 
         let contract_a = format!("CONTRACT_A_{}", uuid::Uuid::new_v4());
@@ -243,7 +368,7 @@ mod tests {
         seed_events(&pool, &contract_a, 3).await;
         seed_events(&pool, &contract_b, 2).await;
 
-        let svc = EventsServiceImpl::new(pool);
+        let svc = make_svc(&db_url, &redis_url).await;
         let req = Request::new(ListEventsRequest {
             contract_id: contract_a.clone(),
             limit: 200,
@@ -258,13 +383,13 @@ mod tests {
 
     #[tokio::test]
     async fn list_events_cursor_pagination() {
-        let db_url = require_db!();
+        let (db_url, redis_url) = require_services!();
         let pool = PgPool::connect(&db_url).await.unwrap();
 
         let contract_id = format!("CONTRACT_PAGE_{}", uuid::Uuid::new_v4());
         seed_events(&pool, &contract_id, 5).await;
 
-        let svc = EventsServiceImpl::new(pool);
+        let svc = make_svc(&db_url, &redis_url).await;
 
         let first_page = svc
             .list_events(Request::new(ListEventsRequest {
@@ -297,12 +422,12 @@ mod tests {
 
     #[tokio::test]
     async fn get_existing_event_returns_correct_fields() {
-        let db_url = require_db!();
+        let (db_url, redis_url) = require_services!();
         let pool = PgPool::connect(&db_url).await.unwrap();
 
         let event_id = insert_one_event(&pool).await;
 
-        let svc = EventsServiceImpl::new(pool);
+        let svc = make_svc(&db_url, &redis_url).await;
         let req = Request::new(GetEventRequest {
             id: event_id.to_string(),
         });
@@ -316,9 +441,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_unknown_uuid_returns_not_found() {
-        let db_url = require_db!();
-        let pool = PgPool::connect(&db_url).await.unwrap();
-        let svc = EventsServiceImpl::new(pool);
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
 
         let req = Request::new(GetEventRequest {
             id: Uuid::new_v4().to_string(),
@@ -330,9 +454,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_malformed_uuid_returns_invalid_argument() {
-        let db_url = require_db!();
-        let pool = PgPool::connect(&db_url).await.unwrap();
-        let svc = EventsServiceImpl::new(pool);
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
 
         let req = Request::new(GetEventRequest {
             id: "not-a-uuid".to_string(),
@@ -340,5 +463,56 @@ mod tests {
         let err = svc.get_event(req).await.unwrap_err();
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn stream_events_delivers_published_event() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(StreamEventsRequest {
+            contract_id: "CTEST_STREAM".to_string(),
+            topic_0: String::new(),
+        });
+
+        let mut stream = svc.stream_events(req).await.unwrap().into_inner();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut pub_conn = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let _: String = redis::cmd("XADD")
+            .arg(REDIS_STREAM_KEY)
+            .arg("*")
+            .arg("contract_id")
+            .arg("CTEST_STREAM")
+            .arg("ledger_sequence")
+            .arg("777")
+            .arg("ledger_timestamp")
+            .arg("2024-01-01T00:00:00Z")
+            .arg("transaction_hash")
+            .arg("txhashstream")
+            .arg("event_index")
+            .arg("0")
+            .arg("event_type")
+            .arg("contract")
+            .arg("topics")
+            .arg(r#"["transfer"]"#)
+            .arg("data")
+            .arg("null")
+            .query_async(&mut pub_conn)
+            .await
+            .unwrap();
+
+        let event: Event = tokio::time::timeout(Duration::from_secs(8), stream.next())
+            .await
+            .expect("timed out waiting for streamed event")
+            .expect("stream ended unexpectedly")
+            .expect("stream returned error");
+
+        assert_eq!(event.contract_id, "CTEST_STREAM");
+        assert_eq!(event.ledger_sequence, 777);
     }
 }
