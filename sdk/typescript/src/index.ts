@@ -18,7 +18,7 @@ export interface TridentClientConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Domain types (mirrors SorobanEvent on the server side)
+// Domain types
 // ---------------------------------------------------------------------------
 
 export const EventTypeSchema = z.enum(["contract", "system", "diagnostic"]);
