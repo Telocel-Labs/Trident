@@ -50,3 +50,7 @@ tokio-retry = "0.3"
 
 # CancellationToken for graceful shutdown
 tokio-util = "0.7"
+
+[dev-dependencies]
+# Mock HTTP server for RPC integration tests
+wiremock = "0.6"

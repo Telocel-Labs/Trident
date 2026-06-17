@@ -201,3 +201,185 @@ fn scaddress_to_string(addr: &ScAddress) -> String {
         other => format!("{other:?}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use stellar_xdr::curr::{
+        AccountId, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress, ScMap,
+        ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+    };
+
+    use crate::rpc::RawEvent;
+
+    fn xdr_b64(val: &ScVal) -> String {
+        let mut buf = Vec::new();
+        val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+            .expect("XDR encode failed");
+        STANDARD.encode(buf)
+    }
+
+    fn sym(s: &str) -> ScVal {
+        ScVal::Symbol(ScSymbol::try_from(s.to_string()).expect("symbol too long"))
+    }
+
+    fn make_event(
+        event_type: &str,
+        contract_id: Option<&str>,
+        topics: Vec<ScVal>,
+        value: ScVal,
+        successful: bool,
+    ) -> RawEvent {
+        RawEvent {
+            event_type: event_type.to_string(),
+            ledger: "500".to_string(),
+            ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
+            contract_id: contract_id.map(str::to_string),
+            id: "0000000000500000-0".to_string(),
+            paging_token: "token1".to_string(),
+            tx_hash: "deadbeefdeadbeef".to_string(),
+            topic: topics.iter().map(xdr_b64).collect(),
+            value: xdr_b64(&value),
+            in_successful_contract_call: successful,
+        }
+    }
+
+    #[test]
+    fn token_transfer_topics_and_amount_decoded() {
+        // Standard SEP-41 transfer: topics=[Symbol("transfer"), Addr(from), Addr(to)], data=I128(amount)
+        let from = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])),
+        )));
+        let to = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])),
+        )));
+        let amount = ScVal::I128(Int128Parts {
+            hi: 0,
+            lo: 1_000_000,
+        });
+
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let raw = make_event(
+            "contract",
+            Some(contract_id),
+            vec![sym("transfer"), from, to],
+            amount,
+            true,
+        );
+
+        let parser = Parser::new(false);
+        let event = parser.parse_event(&raw).unwrap().unwrap();
+
+        assert_eq!(event.contract_id, contract_id);
+        assert_eq!(event.topics[0], "transfer");
+        assert_eq!(event.data, serde_json::json!(1_000_000u64));
+        assert_eq!(event.ledger_sequence, 500);
+        assert_eq!(event.transaction_hash, "deadbeefdeadbeef");
+    }
+
+    #[test]
+    fn mint_event_symbol_and_address_topics() {
+        let to = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32])),
+        )));
+        let amount = ScVal::I128(Int128Parts { hi: 0, lo: 5_000 });
+
+        let raw = make_event(
+            "contract",
+            Some("CONTRACT"),
+            vec![sym("mint"), to],
+            amount,
+            true,
+        );
+
+        let parser = Parser::new(false);
+        let event = parser.parse_event(&raw).unwrap().unwrap();
+
+        assert_eq!(event.topics[0], "mint");
+        assert_eq!(event.data, serde_json::json!(5_000u64));
+    }
+
+    #[test]
+    fn map_event_data_decodes_to_json_object() {
+        let entries: Vec<ScMapEntry> = vec![
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("amount".to_string()).unwrap()),
+                val: ScVal::I128(Int128Parts { hi: 0, lo: 100 }),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("fee".to_string()).unwrap()),
+                val: ScVal::I128(Int128Parts { hi: 0, lo: 1 }),
+            },
+        ];
+        let map_val = ScVal::Map(Some(ScMap(VecM::try_from(entries).unwrap())));
+        let raw = make_event("contract", None, vec![sym("custom")], map_val, true);
+
+        let parser = Parser::new(false);
+        let event = parser.parse_event(&raw).unwrap().unwrap();
+
+        let obj = event
+            .data
+            .as_object()
+            .expect("data should be a JSON object");
+        assert_eq!(obj["amount"], serde_json::json!(100u64));
+        assert_eq!(obj["fee"], serde_json::json!(1u64));
+    }
+
+    #[test]
+    fn diagnostic_event_skipped_when_index_diagnostic_false() {
+        let raw = make_event("diagnostic", None, vec![sym("debug")], ScVal::Void, true);
+        let parser = Parser::new(false);
+        assert!(
+            parser.parse_event(&raw).unwrap().is_none(),
+            "diagnostic events must be skipped when index_diagnostic=false"
+        );
+    }
+
+    #[test]
+    fn diagnostic_event_included_when_index_diagnostic_true() {
+        let raw = make_event("diagnostic", None, vec![sym("debug")], ScVal::Void, true);
+        let parser = Parser::new(true);
+        assert!(
+            parser.parse_event(&raw).unwrap().is_some(),
+            "diagnostic events must be indexed when index_diagnostic=true"
+        );
+    }
+
+    #[test]
+    fn failed_contract_call_filtered() {
+        let raw = make_event("contract", None, vec![sym("transfer")], ScVal::Void, false);
+        let parser = Parser::new(false);
+        assert!(
+            parser.parse_event(&raw).unwrap().is_none(),
+            "events from failed contract calls must be filtered out"
+        );
+    }
+
+    #[test]
+    fn contract_address_topic_decoded_to_strkey() {
+        let contract_hash = [0xABu8; 32];
+        let addr = ScVal::Address(ScAddress::Contract(ContractId(Hash(contract_hash))));
+        let raw = make_event(
+            "contract",
+            None,
+            vec![sym("event"), addr],
+            ScVal::Void,
+            true,
+        );
+
+        let parser = Parser::new(false);
+        let event = parser.parse_event(&raw).unwrap().unwrap();
+
+        assert!(
+            event.topics[1].starts_with('C'),
+            "contract strkey must start with C, got: {}",
+            event.topics[1]
+        );
+        assert_eq!(
+            event.topics[1].len(),
+            56,
+            "contract strkey must be 56 chars"
+        );
+    }
+}

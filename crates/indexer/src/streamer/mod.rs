@@ -158,12 +158,25 @@ impl Streamer {
                 if seq > *cursor {
                     *cursor = seq;
                     db::set_cursor(&self.db, *cursor).await?;
-                    // Ledger hash is not available from getEvents; record what we have.
-                    // TODO: enrich with ledger hash via getLedger RPC when needed.
+
+                    // Fetch the real ledger hash from getLedgers RPC.
+                    // Non-critical: log a warning on failure, store empty string.
+                    let ledger_hash = match self.rpc.get_ledger(seq).await {
+                        Ok(Some(h)) => h,
+                        Ok(None) => {
+                            tracing::warn!(seq, "getLedgers returned no ledger for sequence");
+                            String::new()
+                        }
+                        Err(e) => {
+                            tracing::warn!(seq, error = %e, "getLedgers failed, storing empty hash");
+                            String::new()
+                        }
+                    };
+
                     db::insert_ledger_metadata(
                         &self.db,
                         seq,
-                        "",
+                        &ledger_hash,
                         &last.ledger_closed_at,
                         events_in_page,
                     )
@@ -180,5 +193,282 @@ impl Streamer {
         }
 
         Ok(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use stellar_xdr::curr::{Limited, Limits, ScSymbol, ScVal, WriteXdr};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Skip the test and return early if required env vars are missing.
+    macro_rules! require_services {
+        () => {{
+            let db = match std::env::var("TEST_DATABASE_URL") {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("SKIP: TEST_DATABASE_URL not set");
+                    return;
+                }
+            };
+            let rd = match std::env::var("TEST_REDIS_URL") {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("SKIP: TEST_REDIS_URL not set");
+                    return;
+                }
+            };
+            (db, rd)
+        }};
+    }
+
+    fn sym_xdr(s: &str) -> String {
+        let val = ScVal::Symbol(ScSymbol::try_from(s.to_string()).unwrap());
+        let mut buf = vec![];
+        val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+            .unwrap();
+        STANDARD.encode(buf)
+    }
+
+    fn void_xdr() -> String {
+        let val = ScVal::Void;
+        let mut buf = vec![];
+        val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+            .unwrap();
+        STANDARD.encode(buf)
+    }
+
+    fn events_page(ledger: u64, count: usize) -> serde_json::Value {
+        let events: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": "CTEST",
+                    "id": format!("{:016}-{}", ledger, i),
+                    "pagingToken": format!("{}-{}", ledger, i),
+                    "txHash": format!("hash{}{}", ledger, i),
+                    "topic": [sym_xdr("transfer")],
+                    "value": void_xdr(),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": ledger
+            }
+        })
+    }
+
+    fn error_500() -> ResponseTemplate {
+        ResponseTemplate::new(500).set_body_string("Internal Server Error")
+    }
+
+    fn rpc_ok(body: serde_json::Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+
+    async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
+        let db = sqlx::PgPool::connect(db_url).await.unwrap();
+        let redis = redis::Client::open(redis_url)
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let config = Config {
+            stellar_rpc_url: rpc_url,
+            database_url: db_url.to_string(),
+            redis_url: redis_url.to_string(),
+            network: "testnet".to_string(),
+            poll_interval: Duration::from_millis(50),
+            index_diagnostic: false,
+        };
+        Streamer::new(config, db, redis)
+    }
+
+    async fn reset_db(pool: &sqlx::PgPool) {
+        sqlx::query("DELETE FROM soroban_events")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM ledger_metadata")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE system_state SET value = '0' WHERE key = 'latest_ledger_cursor'")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_written_to_postgres_after_poll() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 3)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = db::get_cursor(&s.db).await.unwrap();
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM soroban_events")
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 3, "expected 3 events in soroban_events");
+    }
+
+    #[tokio::test]
+    async fn cursor_advances_in_system_state_after_poll() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(200, 2)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(200, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let stored = db::get_cursor(&s.db).await.unwrap();
+        assert_eq!(stored, 200, "cursor should advance to ledger 200");
+        assert_eq!(cursor, 200);
+    }
+
+    #[tokio::test]
+    async fn events_published_to_redis_stream_after_poll() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(300, 2)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(300, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        // Trim the stream so we start fresh.
+        let _: () = redis::cmd("XTRIM")
+            .arg("trident:events")
+            .arg("MAXLEN")
+            .arg(0)
+            .query_async(&mut s.redis)
+            .await
+            .unwrap_or(());
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let len: i64 = redis::cmd("XLEN")
+            .arg("trident:events")
+            .query_async(&mut s.redis)
+            .await
+            .unwrap();
+        assert_eq!(len, 2, "expected 2 events in Redis stream");
+    }
+
+    #[tokio::test]
+    async fn poll_returns_error_when_rpc_consistently_fails() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // Always return 500 so all retries exhaust.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(error_500())
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = 0u64;
+        // tokio-retry with max 5 retries and 200ms base — allow up to 10s
+        let result = tokio::time::timeout(Duration::from_secs(10), s.poll_once(&mut cursor))
+            .await
+            .expect("poll_once timed out");
+        assert!(
+            result.is_err(),
+            "poll_once should fail after retries exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_page_triggers_followup_poll_partial_page_stops() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // First call returns 200 events (full page) → triggers follow-up
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(400, 200)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Second call returns 5 events (partial page) → stops pagination
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(401, 5)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Any further calls return empty
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(401, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = 0u64;
+        let total = s.poll_once(&mut cursor).await.unwrap();
+
+        assert_eq!(
+            total, 205,
+            "should process 200 + 5 = 205 events across two pages"
+        );
     }
 }
