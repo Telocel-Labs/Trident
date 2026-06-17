@@ -57,6 +57,28 @@ struct JsonRpcError {
 }
 
 #[derive(Serialize)]
+struct GetLedgersParams {
+    #[serde(rename = "startLedger")]
+    start_ledger: u64,
+    pagination: LedgerPagination,
+}
+
+#[derive(Serialize)]
+struct LedgerPagination {
+    limit: u32,
+}
+
+#[derive(Deserialize)]
+struct GetLedgersResult {
+    ledgers: Vec<LedgerSummary>,
+}
+
+#[derive(Deserialize)]
+struct LedgerSummary {
+    hash: String,
+}
+
+#[derive(Serialize)]
 struct GetEventsParams {
     #[serde(rename = "startLedger", skip_serializing_if = "Option::is_none")]
     start_ledger: Option<u64>,
@@ -93,6 +115,48 @@ impl RpcClient {
             http: reqwest::Client::new(),
             url,
         }
+    }
+
+    /// Fetch the ledger hash for a given sequence number via `getLedgers`.
+    /// Returns `None` if the RPC does not know about that ledger yet.
+    pub async fn get_ledger(&self, sequence: u64) -> Result<Option<String>, TridentError> {
+        let params = GetLedgersParams {
+            start_ledger: sequence,
+            pagination: LedgerPagination { limit: 1 },
+        };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "getLedgers",
+            params,
+        };
+
+        let resp = self
+            .http
+            .post(&self.url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| TridentError::RpcError(format!("getLedgers HTTP failed: {e}")))?;
+
+        let body: JsonRpcResponse<GetLedgersResult> = resp
+            .json()
+            .await
+            .map_err(|e| TridentError::RpcError(format!("getLedgers decode failed: {e}")))?;
+
+        if let Some(err) = body.error {
+            return Err(TridentError::RpcError(format!(
+                "getLedgers RPC error {}: {}",
+                err.code, err.message
+            )));
+        }
+
+        let hash = body
+            .result
+            .and_then(|r| r.ledgers.into_iter().next())
+            .map(|l| l.hash);
+
+        Ok(hash)
     }
 
     /// Fetch a page of events from the Stellar RPC node.

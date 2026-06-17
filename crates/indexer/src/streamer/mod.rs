@@ -158,12 +158,25 @@ impl Streamer {
                 if seq > *cursor {
                     *cursor = seq;
                     db::set_cursor(&self.db, *cursor).await?;
-                    // Ledger hash is not available from getEvents; record what we have.
-                    // TODO: enrich with ledger hash via getLedger RPC when needed.
+
+                    // Fetch the real ledger hash from getLedgers RPC.
+                    // Non-critical: log a warning on failure, store empty string.
+                    let ledger_hash = match self.rpc.get_ledger(seq).await {
+                        Ok(Some(h)) => h,
+                        Ok(None) => {
+                            tracing::warn!(seq, "getLedgers returned no ledger for sequence");
+                            String::new()
+                        }
+                        Err(e) => {
+                            tracing::warn!(seq, error = %e, "getLedgers failed, storing empty hash");
+                            String::new()
+                        }
+                    };
+
                     db::insert_ledger_metadata(
                         &self.db,
                         seq,
-                        "",
+                        &ledger_hash,
                         &last.ledger_closed_at,
                         events_in_page,
                     )
