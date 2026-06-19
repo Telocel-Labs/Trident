@@ -33,7 +33,7 @@ func main() {
 		slog.Error("failed to connect to gRPC API", "addr", grpcAddr, "err", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	eventsClient := trident.NewEventsClient(conn)
 	eventsHandler := handlers.NewEventsHandler(eventsClient)
