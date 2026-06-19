@@ -36,7 +36,7 @@ func (c *Client) run(rdb *redis.Client) {
 
 	c.hub.register(c)
 	defer c.hub.unregister(c)
-	defer c.conn.Close()
+	defer func() { _ = c.conn.Close() }()
 
 	// Pong handler resets the read deadline so the connection stays alive.
 	c.conn.SetPongHandler(func(string) error {

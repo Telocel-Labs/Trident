@@ -33,7 +33,7 @@ func TestHub_missingContractID_returns400(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -107,14 +107,14 @@ func TestHub_websocketConnect_receivesEvent(t *testing.T) {
 		}
 		h.register(&Client{hub: h, contractID: contractID})
 		// Close immediately to test disconnect lifecycle.
-		conn.Close()
+		_ = conn.Close()
 	})
 
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	conn := dialWS(t, srv, "/ws?contractId=CTEST")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Give the server goroutine time to register.
 	time.Sleep(50 * time.Millisecond)
