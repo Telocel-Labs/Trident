@@ -120,6 +120,6 @@ func TestHub_websocketConnect_receivesEvent(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// The connection will be closed server-side; reading triggers EOF.
-	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	_, _, _ = conn.ReadMessage() // expected to return error on close
 }
