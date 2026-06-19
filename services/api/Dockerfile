@@ -11,7 +11,7 @@ RUN go mod download
 
 # Copy source and build the binary.
 COPY services/api/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o /api ./...
+RUN CGO_ENABLED=0 GOOS=linux go build -o /api .
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 FROM alpine:3.19 AS runtime
