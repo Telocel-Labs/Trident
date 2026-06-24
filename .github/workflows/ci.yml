@@ -8,11 +8,25 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Rust — format, lint, test
+  # Rust — format, lint, test, and SQLx prepare
   # ---------------------------------------------------------------------------
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: trident
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: trident
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +37,20 @@ jobs:
 
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres
+
+      - name: Run migrations
+        run: |
+          DATABASE_URL=postgres://trident:password@localhost:5432/trident sqlx migrate run
+        env:
+          DATABASE_URL: postgres://trident:password@localhost:5432/trident
+
+      - name: Run sqlx prepare
+        run: cargo sqlx prepare --workspace
+        env:
+          DATABASE_URL: postgres://trident:password@localhost:5432/trident
 
       - name: Check formatting
         run: cargo fmt --all -- --check

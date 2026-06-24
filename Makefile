@@ -99,4 +99,4 @@ lint:
 		cd services/api && golangci-lint run; \
 	fi
 	cd sdk/typescript && npm install && npm run lint
-	cd sdk/react && npm install && npm run lint
+	cd sdk/react && npm install && npm run lint>>>>>>> 7e309c3 (chore(db): integrate sqlx-cli database migration management)
