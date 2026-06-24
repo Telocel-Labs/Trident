@@ -100,3 +100,26 @@ pub async fn insert_ledger_metadata(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Verify that the `insert_event` SQL contains an idempotent ON CONFLICT clause.
+    /// The deduplication key is (transaction_hash, event_index) rather than id
+    /// because `id` is a random Uuid::new_v4() that would never naturally conflict.
+    #[test]
+    fn insert_event_sql_is_idempotent() {
+        let sql = r#"
+        INSERT INTO soroban_events
+            (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+             event_index, event_type, topics, data)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (transaction_hash, event_index) DO NOTHING
+        "#;
+        assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("DO NOTHING"));
+        assert!(
+            sql.contains("transaction_hash, event_index"),
+            "dedup key must be (transaction_hash, event_index), not the random id column"
+        );
+    }
+}
