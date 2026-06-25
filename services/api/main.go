@@ -9,6 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/jackc/pgx/v5"
 )
 
 func main() {
@@ -17,15 +20,37 @@ func main() {
 		port = "3000"
 	}
 
+	// Open a single Postgres connection for the health endpoint.
+	// DATABASE_URL must be set; if absent, the health endpoint returns 503.
+	var dbConn *pgx.Conn
+	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		conn, err := pgx.Connect(ctx, dsn)
+		cancel()
+		if err != nil {
+			slog.Warn("could not connect to database; health endpoint will return 503", "err", err)
+		} else {
+			dbConn = conn
+			defer conn.Close(context.Background())
+		}
+	} else {
+		slog.Warn("DATABASE_URL not set; health endpoint will return 503")
+	}
+
 	mux := http.NewServeMux()
 
 	// ---------------------------------------------------------------------------
 	// REST router
-	// Wire in the REST handler here. Each resource group gets its own handler
-	// func registered under /v1/. Example:
-	//   mux.HandleFunc("GET /v1/events", handlers.ListEvents)
-	//   mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 	// ---------------------------------------------------------------------------
+
+	// GET /v1/health — indexer liveness (issue #62)
+	mux.HandleFunc("GET /v1/health", handlers.Health(dbConn))
+
+	// GET /v1/events — list events with validated query params (issue #42)
+	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
+
+	// GET /v1/events/{id} — get single event by UUID v4 (issue #42)
+	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 
 	// ---------------------------------------------------------------------------
 	// GraphQL handler
