@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -11,9 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/handlers"
-	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
@@ -76,7 +73,7 @@ func main() {
 	mux.HandleFunc("GET /v1/health", handlers.Health(dbConn))
 
 	// GET /v1/events — validated, cursor-paginated event listing (issues #42, #44)
-	mux.HandleFunc("GET /v1/events", handleListEvents)
+	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
 
 	// GET /v1/events/{id} — single event by UUID v4 (issue #42)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
@@ -107,50 +104,5 @@ func main() {
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
-	}
-}
-
-// handleListEvents handles GET /v1/events with query-param validation and
-// opaque cursor-based pagination.
-func handleListEvents(w http.ResponseWriter, r *http.Request) {
-	type response struct {
-		NextCursor string `json:"next_cursor"`
-		Events     []any  `json:"events"`
-	}
-
-	q := r.URL.Query()
-
-	// Validate query params (issue #42).
-	_, verr := validation.ValidateQueryEvents(
-		q.Get("limit"),
-		q.Get("ledgerFrom"),
-		q.Get("ledgerTo"),
-		q.Get("contractId"),
-		q.Get("cursor"),
-	)
-	if verr != nil {
-		http.Error(w, verr.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Decode opaque cursor to internal paging token (issue #44).
-	var pagingToken string
-	if raw := q.Get("cursor"); raw != "" {
-		decoded, err := cursor.Decode(raw)
-		if err != nil {
-			http.Error(w, "invalid cursor", http.StatusBadRequest)
-			return
-		}
-		pagingToken = decoded
-	}
-
-	nextCursor := cursor.Encode(pagingToken)
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response{
-		NextCursor: nextCursor,
-		Events:     []any{},
-	}); err != nil {
-		slog.Error("handleListEvents: encode response", "err", err)
 	}
 }

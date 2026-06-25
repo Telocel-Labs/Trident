@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/handlers"
 )
 
@@ -98,5 +99,47 @@ func TestGetEvent_InvalidUUID_Returns400(t *testing.T) {
 	}
 	if errObj["field"] != "id" {
 		t.Errorf("want field=id, got %v", errObj["field"])
+	}
+}
+
+func TestListEvents_ValidCursor_Returns200WithNextCursor(t *testing.T) {
+	opaque := cursor.Encode("ledger:42")
+	req := httptest.NewRequest(http.MethodGet, "/v1/events?cursor="+opaque, nil)
+	rr := httptest.NewRecorder()
+
+	handlers.ListEvents(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	nc, ok := body["next_cursor"].(string)
+	if !ok || nc == "" {
+		t.Errorf("want non-empty next_cursor in response, got %v", body["next_cursor"])
+	}
+}
+
+func TestListEvents_InvalidCursor_Returns400(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/events?cursor=!!!notbase64!!!", nil)
+	rr := httptest.NewRecorder()
+
+	handlers.ListEvents(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("want 400, got %d", rr.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object in body")
+	}
+	if errObj["field"] != "cursor" {
+		t.Errorf("want field=cursor, got %v", errObj["field"])
 	}
 }
