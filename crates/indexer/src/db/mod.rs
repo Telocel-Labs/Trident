@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use trident_common::{EventType, SorobanEvent, TridentError};
@@ -99,4 +102,60 @@ pub async fn insert_ledger_metadata(
     .map_err(|e| TridentError::StorageError(format!("insert_ledger_metadata: {e}")))?;
 
     Ok(())
+}
+
+/// Write indexer health metrics into the `system_state` health columns after
+/// every successful poll cycle (issue #62).
+///
+/// Uses a single `UPDATE` on the known cursor row so there is never a
+/// duplicate-key issue and the write is O(1) regardless of table size.
+pub async fn update_health_stats(
+    pool: &PgPool,
+    last_ledger: i64,
+    events_in_poll: i32,
+    poll_duration: Duration,
+) -> Result<(), TridentError> {
+    let poll_ms = poll_duration.as_millis().min(i32::MAX as u128) as i32;
+
+    sqlx::query(
+        r#"
+        UPDATE system_state
+        SET
+            last_poll_at          = NOW(),
+            last_ledger_indexed   = $1,
+            events_in_last_poll   = $2,
+            poll_duration_ms      = $3,
+            events_indexed_total  = COALESCE(events_indexed_total, 0) + $2,
+            updated_at            = NOW()
+        WHERE key = 'latest_ledger_cursor'
+        "#,
+    )
+    .bind(last_ledger)
+    .bind(events_in_poll)
+    .bind(poll_ms)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::StorageError(format!("update_health_stats: {e}")))?;
+
+    Ok(())
+}
+
+/// Load all contract IDs from `indexed_contracts` for the given network (or
+/// network-agnostic rows where `network IS NULL`).
+///
+/// Returns an empty set if the table has no rows — the caller treats an empty
+/// set as "index all contracts" (issue #47).
+pub async fn load_indexed_contracts(
+    pool: &PgPool,
+    network: &str,
+) -> Result<HashSet<String>, TridentError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT contract_id FROM indexed_contracts WHERE network = $1 OR network IS NULL",
+    )
+    .bind(network)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| TridentError::StorageError(format!("load_indexed_contracts: {e}")))?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }

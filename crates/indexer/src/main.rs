@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_trigger.cancel();
     });
 
-    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn);
+    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn).await?;
     s.run(shutdown).await?;
 
     tracing::info!("Trident indexer stopped");

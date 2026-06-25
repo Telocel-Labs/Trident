@@ -4,13 +4,21 @@ TypeScript client SDK for the [Trident](https://github.com/Telocel-Labs/Trident)
 
 Query historical Soroban contract events and subscribe to real-time updates without running your own infrastructure.
 
-## Install
+## Installation
 
 ```bash
 npm install @trident-indexer/sdk
+# or
+yarn add @trident-indexer/sdk
+# or
+pnpm add @trident-indexer/sdk
 ```
 
-## Usage
+The package ships pre-built CJS + ESM bundles and a `dist/index.d.ts` declaration file for full autocomplete out of the box.
+
+---
+
+## Quick Start
 
 ```typescript
 import { TridentClient } from "@trident-indexer/sdk";
@@ -21,8 +29,8 @@ const client = new TridentClient({
   network: "mainnet",
 });
 
-// Query historical events
-const { events, cursor, hasMore } = await client.queryEvents({
+// 1. Query historical events (cursor-paginated)
+const page1 = await client.queryEvents({
   contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
   topic0: "transfer",
   ledgerFrom: 50000,
@@ -30,17 +38,21 @@ const { events, cursor, hasMore } = await client.queryEvents({
   limit: 50,
 });
 
-// Fetch the next page
-if (hasMore && cursor) {
-  const nextPage = await client.queryEvents({ after: cursor, limit: 50 });
+console.log(`Found ${page1.events.length} events`);
+
+// Fetch the next page using the cursor
+if (page1.hasMore && page1.cursor) {
+  const page2 = await client.queryEvents({ after: page1.cursor, limit: 50 });
+  console.log("Page 2:", page2.events);
 }
 
-// Fetch a single event by UUID
+// 2. Fetch a single event by UUID
 const event = await client.getEventById({
   id: "550e8400-e29b-41d4-a716-446655440000",
 });
+console.log("Event ledger:", event.ledgerSequence);
 
-// Subscribe to real-time events
+// 3. Subscribe to live events (auto-reconnects on disconnect)
 const sub = client.subscribeToContract({
   contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
   topic0: "transfer",
@@ -52,77 +64,283 @@ const sub = client.subscribeToContract({
   },
 });
 
-// Later: clean up the subscription
+// Later, when done:
 sub.unsubscribe();
 ```
 
-## Error handling
+---
 
-All methods throw `TridentError` on failure:
+## Configuration
+
+Pass a `TridentClientConfig` object to the `TridentClient` constructor.
+
+| Field     | Type                                    | Required | Description                                                                                     |
+|-----------|-----------------------------------------|----------|-------------------------------------------------------------------------------------------------|
+| `apiUrl`  | `string`                                | ✅       | Base URL of the Trident REST API (e.g. `https://api.trident.telocel.io`). No trailing slash.   |
+| `apiKey`  | `string`                                | ✅       | API key sent as the `X-API-Key` header on every request.                                        |
+| `network` | `"mainnet" \| "testnet" \| "futurenet"` | ✅       | Stellar network to query. Included in WebSocket subscription frames for server-side routing.    |
+
+---
+
+## API Reference
+
+### `client.queryEvents(params)`
+
+Query historical Soroban events with optional filtering. Results are cursor-paginated.
+
+**Signature**
+
+```typescript
+queryEvents(params: QueryEventsParams): Promise<PaginatedEvents>
+```
+
+**Parameters**
+
+| Parameter    | Type     | Required | Description                                                                 |
+|--------------|----------|----------|-----------------------------------------------------------------------------|
+| `contractId` | `string` |          | Filter by Stellar contract address (C… strkey, 56 chars).                  |
+| `topic0`     | `string` |          | Filter by the first event topic (e.g. `"transfer"`, `"mint"`).             |
+| `topic1`     | `string` |          | Filter by the second event topic.                                           |
+| `ledgerFrom` | `number` |          | Only return events from this ledger sequence onward (inclusive).            |
+| `ledgerTo`   | `number` |          | Only return events up to and including this ledger sequence.                |
+| `after`      | `string` |          | Pagination cursor from a previous response's `cursor` field.               |
+| `limit`      | `number` |          | Maximum events per page. Must be 1–200. Server default: 50.                 |
+
+**Returns:** `Promise<PaginatedEvents>`
+
+**Throws:** `TridentError` on network failure, auth failure, or server error.
+
+---
+
+### `client.getEventById(params)`
+
+Fetch a single Soroban event by its UUID.
+
+**Signature**
+
+```typescript
+getEventById(params: GetEventByIdParams): Promise<SorobanEvent>
+```
+
+**Parameters**
+
+| Parameter | Type     | Required | Description                        |
+|-----------|----------|----------|------------------------------------|
+| `id`      | `string` | ✅       | UUID v4 of the event to retrieve.  |
+
+**Returns:** `Promise<SorobanEvent>`
+
+**Throws:** `TridentError` with `code: "NOT_FOUND"` if the event does not exist.
+
+---
+
+### `client.subscribeToContract(params)`
+
+Open a real-time WebSocket subscription to events from a contract.
+
+The SDK reconnects automatically with exponential backoff (500ms initial, 30s maximum) on unexpected disconnects. Calling `unsubscribe()` cancels any pending reconnect.
+
+**Signature**
+
+```typescript
+subscribeToContract(params: SubscribeToContractParams): Subscription
+```
+
+**Parameters**
+
+| Parameter    | Type                            | Required | Description                                                               |
+|--------------|---------------------------------|----------|---------------------------------------------------------------------------|
+| `contractId` | `string`                        | ✅       | Stellar contract address to subscribe to.                                 |
+| `topic0`     | `string`                        |          | Optional topic filter applied server-side.                                |
+| `onEvent`    | `(event: SorobanEvent) => void` | ✅       | Called for every incoming event matching the filter.                      |
+| `onError`    | `(error: Error) => void`        |          | Called on WebSocket errors; the subscription continues to auto-reconnect. |
+
+**Returns:** `Subscription` — call `.unsubscribe()` to close the connection.
+
+---
+
+## Error Handling
+
+All methods throw `TridentError` on failure. Branch on `error.code` to handle specific cases:
 
 ```typescript
 import { TridentClient, TridentError } from "@trident-indexer/sdk";
 
+const client = new TridentClient({ apiUrl: "...", apiKey: "...", network: "testnet" });
+
 try {
-  const event = await client.getEventById({ id: "unknown-id" });
+  const event = await client.getEventById({ id: "550e8400-e29b-41d4-a716-446655440000" });
 } catch (err) {
   if (err instanceof TridentError) {
     switch (err.code) {
       case "NOT_FOUND":
-        console.log("Event does not exist");
+        console.error("Event not found");
         break;
       case "UNAUTHORIZED":
-        console.log("Invalid API key");
+        console.error("Invalid or missing API key");
         break;
       case "RATE_LIMITED":
-        console.log("Too many requests — back off and retry");
+        console.error("Too many requests — back off and retry");
         break;
       case "INTERNAL":
-        console.log("Server error:", err.message);
-        break;
+      default:
+        console.error("Unexpected error:", err.message);
     }
+  } else {
+    throw err;
   }
 }
 ```
 
-## API
+### Error codes
 
-### `new TridentClient(config)`
+| Code           | HTTP status | When                                                    |
+|----------------|-------------|---------------------------------------------------------|
+| `NOT_FOUND`    | 404         | The requested event or resource does not exist.         |
+| `UNAUTHORIZED` | 401         | The `X-API-Key` header is missing or invalid.           |
+| `RATE_LIMITED` | 429         | Too many requests in a short window.                    |
+| `INTERNAL`     | 5xx / other | Unexpected server error or network failure.             |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `apiUrl` | `string` | Base URL of the Trident REST API |
-| `apiKey` | `string` | Your API key (sent as `X-API-Key` header) |
-| `network` | `"mainnet" \| "testnet" \| "futurenet"` | Stellar network |
+---
 
-### `client.queryEvents(params)` → `Promise<PaginatedEvents>`
+## TypeScript Types
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `contractId?` | `string` | Filter by contract strkey |
-| `topic0?` | `string` | Filter by first topic value |
-| `topic1?` | `string` | Filter by second topic value |
-| `ledgerFrom?` | `number` | Inclusive lower bound on ledger sequence |
-| `ledgerTo?` | `number` | Inclusive upper bound on ledger sequence |
-| `after?` | `string` | Cursor from previous page |
-| `limit?` | `number` | Max events to return (1–200) |
+The SDK exports all types needed to work with indexed Soroban events.
 
-### `client.getEventById(params)` → `Promise<SorobanEvent>`
+```typescript
+import type {
+  SorobanEvent,
+  EventType,
+  PaginatedEvents,
+  Subscription,
+  TridentClientConfig,
+  QueryEventsParams,
+  GetEventByIdParams,
+  SubscribeToContractParams,
+  TridentErrorCode,
+} from "@trident-indexer/sdk";
+```
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `id` | `string` | UUID of the event |
+### `SorobanEvent`
 
-### `client.subscribeToContract(params)` → `Subscription`
+A single indexed Soroban contract event.
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `contractId` | `string` | Contract to subscribe to |
-| `topic0?` | `string` | Optional topic filter |
-| `onEvent` | `(event: SorobanEvent) => void` | Called for each matching event |
-| `onError?` | `(error: Error) => void` | Called on connection errors |
+```typescript
+interface SorobanEvent {
+  /** UUID v4 assigned by the indexer. */
+  id: string;
+  /** Stellar contract address that emitted the event (C… strkey). */
+  contractId: string;
+  /** Ledger sequence number in which the event occurred. */
+  ledgerSequence: number;
+  /** ISO-8601 timestamp of the ledger close. */
+  ledgerTimestamp: string;
+  /** Transaction hash (hex). */
+  transactionHash: string;
+  /** Zero-based index of this event within the transaction. */
+  eventIndex: number;
+  /** Whether this is a contract-emitted, system, or diagnostic event. */
+  eventType: EventType;
+  /** Array of XDR-encoded topic values (as base64 strings). */
+  topics: string[];
+  /** Decoded event data payload. */
+  data: unknown;
+  /** ISO-8601 timestamp when this record was written to the index. */
+  createdAt: string;
+}
 
-Returns a `Subscription` with an `unsubscribe()` method.
+type EventType = "contract" | "system" | "diagnostic";
+```
+
+### `PaginatedEvents`
+
+Returned by `queryEvents`.
+
+```typescript
+interface PaginatedEvents {
+  /** Events matching the query on this page. */
+  events: SorobanEvent[];
+  /** Pass as `after` on the next call to fetch the next page. Null when no more pages exist. */
+  cursor: string | null;
+  /** True when more pages are available. */
+  hasMore: boolean;
+}
+```
+
+### `Subscription`
+
+Returned by `subscribeToContract`.
+
+```typescript
+interface Subscription {
+  /** Close the WebSocket connection and cancel any pending reconnect. */
+  unsubscribe: () => void;
+}
+```
+
+---
+
+## Node.js Compatibility
+
+The SDK uses the global `fetch` (Node 18+) and the standard `WebSocket` API.
+
+**Node 21+:** No polyfills needed.
+
+**Node 18–20:** `fetch` is available but the built-in `WebSocket` was added in Node 21. Install `ws`:
+
+```bash
+npm install ws
+```
+
+Then polyfill before importing the SDK:
+
+```typescript
+import WebSocket from "ws";
+(globalThis as unknown as Record<string, unknown>).WebSocket = WebSocket;
+
+import { TridentClient } from "@trident-indexer/sdk";
+```
+
+---
+
+## Development
+
+```bash
+# Install dependencies
+npm install
+
+# Build CJS + ESM bundles and TypeScript declarations
+npm run build
+
+# Run unit tests
+npm test
+
+# Type-check without emitting files
+npm run lint
+
+# Watch mode — rebuild on every file change
+npm run dev
+```
+
+Build output lives in `dist/`:
+
+```
+dist/
+  index.js      # CommonJS bundle (require)
+  index.mjs     # ESM bundle (import)
+  index.d.ts    # TypeScript declarations
+```
+
+---
+
+## Contributing
+
+1. Fork the repo and create a branch from `main`.
+2. Add or update tests in `tests/` for any changed behaviour.
+3. Run `npm test` and `npm run lint` — both must pass before opening a PR.
+4. Open a pull request against `Telocel-Labs/Trident` and link any relevant issues.
+
+---
 
 ## License
 

@@ -15,7 +15,8 @@
 //!   `SorobanEvent` values to both PostgreSQL (via `db`) and Redis Streams
 //!   (via `redis_stream`).
 
-use std::time::Duration;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
@@ -24,24 +25,70 @@ use trident_common::TridentError;
 
 use crate::{config::Config, db, parser::Parser, redis_stream, rpc::RpcClient};
 
+/// How often (in poll loop iterations) we re-query `indexed_contracts`.
+/// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
+const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
+
 pub struct Streamer {
     config: Config,
     db: PgPool,
     redis: redis::aio::MultiplexedConnection,
     rpc: RpcClient,
     parser: Parser,
+    /// `None`  → index all contracts (empty `indexed_contracts` table).
+    /// `Some`  → allowlist; events from unlisted contracts are skipped.
+    contract_filter: Option<HashSet<String>>,
+    /// Counts poll cycles so we know when to refresh the filter.
+    poll_count: u32,
 }
 
 impl Streamer {
-    pub fn new(config: Config, db: PgPool, redis: redis::aio::MultiplexedConnection) -> Self {
+    pub async fn new(
+        config: Config,
+        db: PgPool,
+        redis: redis::aio::MultiplexedConnection,
+    ) -> Result<Self, TridentError> {
         let rpc = RpcClient::new(config.stellar_rpc_url.clone());
         let parser = Parser::new(config.index_diagnostic);
-        Self {
+        let contract_filter = Self::load_filter(&db, &config.network).await?;
+        Ok(Self {
             config,
             db,
             redis,
             rpc,
             parser,
+            contract_filter,
+            poll_count: 0,
+        })
+    }
+
+    /// Load (or reload) the contract allowlist from DB.
+    /// Returns `None` if the table is empty (index-all mode).
+    async fn load_filter(
+        pool: &PgPool,
+        network: &str,
+    ) -> Result<Option<HashSet<String>>, TridentError> {
+        let set = db::load_indexed_contracts(pool, network).await?;
+        if set.is_empty() {
+            Ok(None)
+        } else {
+            tracing::info!(count = set.len(), "Contract allowlist loaded");
+            Ok(Some(set))
+        }
+    }
+
+    /// Reload the contract filter from DB. Called periodically inside `run`.
+    pub async fn refresh_contract_filter(&mut self) -> Result<(), TridentError> {
+        match Self::load_filter(&self.db, &self.config.network).await {
+            Ok(filter) => {
+                self.contract_filter = filter;
+                Ok(())
+            }
+            Err(e) => {
+                // Non-fatal: keep the existing filter, log the error.
+                tracing::warn!(error = %e, "Failed to refresh contract filter; keeping existing");
+                Ok(())
+            }
         }
     }
 
@@ -62,6 +109,13 @@ impl Streamer {
             // a batch we can't finish atomically.
             if shutdown.is_cancelled() {
                 break;
+            }
+
+            // Periodically refresh the contract allowlist so new contracts
+            // become active without a restart (issue #47).
+            self.poll_count = self.poll_count.wrapping_add(1);
+            if self.poll_count % FILTER_REFRESH_EVERY_N_POLLS == 0 {
+                self.refresh_contract_filter().await?;
             }
 
             match self.poll_once(&mut cursor).await {
@@ -96,6 +150,7 @@ impl Streamer {
     /// starting at `cursor`, persists each event, and advances the cursor.
     /// Returns the total number of events processed in this cycle.
     async fn poll_once(&mut self, cursor: &mut u64) -> Result<usize, TridentError> {
+        let poll_start = Instant::now();
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(30))
             .take(5);
@@ -136,6 +191,17 @@ impl Streamer {
             for raw in &page.events {
                 match self.parser.parse_event(raw) {
                     Ok(Some(event)) => {
+                        // Contract allowlist filtering (issue #47).
+                        // None → index all; Some(set) → only listed contracts.
+                        if let Some(ref filter) = self.contract_filter {
+                            if !filter.contains(&event.contract_id) {
+                                tracing::trace!(
+                                    contract_id = %event.contract_id,
+                                    "Skipping event from unlisted contract"
+                                );
+                                continue;
+                            }
+                        }
                         db::insert_event(&self.db, &event).await?;
                         redis_stream::publish_event(&mut self.redis, &event).await?;
                         total += 1;
@@ -190,6 +256,20 @@ impl Streamer {
             }
 
             page_cursor = last_paging_token;
+        }
+
+        // Write health stats after every successful cycle (issue #62).
+        // Non-fatal: log on failure so a bad health write doesn't stop indexing.
+        let poll_duration = poll_start.elapsed();
+        if let Err(e) = db::update_health_stats(
+            &self.db,
+            *cursor as i64,
+            total as i32,
+            poll_duration,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "Failed to update health stats");
         }
 
         Ok(total)
@@ -292,7 +372,7 @@ mod tests {
             poll_interval: Duration::from_millis(50),
             index_diagnostic: false,
         };
-        Streamer::new(config, db, redis)
+        Streamer::new(config, db, redis).await.unwrap()
     }
 
     async fn reset_db(pool: &sqlx::PgPool) {
