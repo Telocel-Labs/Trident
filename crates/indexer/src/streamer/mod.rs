@@ -23,7 +23,7 @@ use tokio_retry::{strategy::ExponentialBackoff, Retry};
 use tokio_util::sync::CancellationToken;
 use trident_common::TridentError;
 
-use crate::{config::Config, db, parser::Parser, redis_stream, rpc::RpcClient};
+use crate::{config::Config, db, metrics, parser::Parser, redis_stream, rpc::RpcClient};
 
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -114,7 +114,7 @@ impl Streamer {
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
-            if self.poll_count % FILTER_REFRESH_EVERY_N_POLLS == 0 {
+            if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 self.refresh_contract_filter().await?;
             }
 
@@ -128,6 +128,7 @@ impl Streamer {
                 }
                 Err(e) => {
                     // Log but do not crash — the cursor is safe, next poll will retry.
+                    metrics::record_poll_error();
                     tracing::error!(error = %e, "Poll cycle failed, will retry next interval");
                 }
             }
@@ -170,8 +171,13 @@ impl Streamer {
         loop {
             let pc = page_cursor.clone();
             let sl = start_ledger;
-            let page = Retry::start(retry_strategy.clone(), || async {
-                self.rpc.get_events(sl, pc.clone()).await
+            let mut attempt = 0u32;
+            let page = Retry::start(retry_strategy.clone(), || {
+                attempt += 1;
+                if attempt > 1 {
+                    metrics::record_rpc_retry();
+                }
+                self.rpc.get_events(sl, pc.clone())
             })
             .await?;
 
@@ -181,6 +187,8 @@ impl Streamer {
                 "RPC page received"
             );
 
+            metrics::set_ledger_lag(page.latest_ledger.saturating_sub(*cursor) as i64);
+
             if page.events.is_empty() {
                 break;
             }
@@ -188,6 +196,7 @@ impl Streamer {
             let last_paging_token = page.events.last().map(|e| e.paging_token.clone());
 
             let mut events_in_page: i32 = 0;
+            let mut skipped_in_page: u64 = 0;
             for raw in &page.events {
                 match self.parser.parse_event(raw) {
                     Ok(Some(event)) => {
@@ -199,6 +208,7 @@ impl Streamer {
                                     contract_id = %event.contract_id,
                                     "Skipping event from unlisted contract"
                                 );
+                                skipped_in_page += 1;
                                 continue;
                             }
                         }
@@ -207,7 +217,10 @@ impl Streamer {
                         total += 1;
                         events_in_page += 1;
                     }
-                    Ok(None) => {} // diagnostic or failed-call event — intentionally skipped
+                    Ok(None) => {
+                        // diagnostic or failed-call event — intentionally skipped
+                        skipped_in_page += 1;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             tx_hash = %raw.tx_hash,
@@ -217,6 +230,9 @@ impl Streamer {
                     }
                 }
             }
+
+            metrics::record_events_processed(events_in_page as u64);
+            metrics::record_events_skipped(skipped_in_page);
 
             // Advance the persistent cursor and record ledger metadata.
             if let Some(last) = page.events.last() {
@@ -261,13 +277,9 @@ impl Streamer {
         // Write health stats after every successful cycle (issue #62).
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
-        if let Err(e) = db::update_health_stats(
-            &self.db,
-            *cursor as i64,
-            total as i32,
-            poll_duration,
-        )
-        .await
+        metrics::record_poll_duration(poll_duration.as_secs_f64());
+        if let Err(e) =
+            db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
         {
             tracing::warn!(error = %e, "Failed to update health stats");
         }
@@ -371,6 +383,7 @@ mod tests {
             network: "testnet".to_string(),
             poll_interval: Duration::from_millis(50),
             index_diagnostic: false,
+            metrics_port: 0,
         };
         Streamer::new(config, db, redis).await.unwrap()
     }
@@ -511,6 +524,79 @@ mod tests {
         assert!(
             result.is_err(),
             "poll_once should fail after retries exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_increments_metrics_counters() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(500, 3)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(500, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let mut cursor = 0u64;
+        let total = s.poll_once(&mut cursor).await.unwrap();
+        drop(guard);
+
+        assert_eq!(total, 3);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counter_value = |name: &str| {
+            snapshot
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.kind() == MetricKind::Counter && key.key().name() == name
+                })
+                .and_then(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        let gauge_value = |name: &str| {
+            snapshot
+                .iter()
+                .find(|(key, _, _, _)| key.kind() == MetricKind::Gauge && key.key().name() == name)
+                .and_then(|(_, _, _, value)| match value {
+                    DebugValue::Gauge(n) => Some(n.into_inner()),
+                    _ => None,
+                })
+        };
+
+        assert_eq!(
+            counter_value(metrics::EVENTS_TOTAL),
+            3,
+            "events_total should increment by the number of events processed"
+        );
+        assert_eq!(
+            counter_value(metrics::POLL_ERRORS_TOTAL),
+            0,
+            "no poll errors occurred"
+        );
+        assert_eq!(
+            gauge_value(metrics::LEDGER_LAG),
+            Some(0.0),
+            "lag should be zero once the cursor catches up to the chain tip"
         );
     }
 

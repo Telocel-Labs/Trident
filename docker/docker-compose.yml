@@ -29,8 +29,8 @@ services:
 
   indexer:
     build:
-      context: ../crates/indexer
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: crates/indexer/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
@@ -38,7 +38,16 @@ services:
       NETWORK: ${NETWORK}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
+      METRICS_PORT: ${METRICS_PORT}
       LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "${METRICS_PORT}:${METRICS_PORT}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${METRICS_PORT}/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
       postgres:
         condition: service_healthy

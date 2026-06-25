@@ -8,6 +8,7 @@ pub struct Config {
     pub network: String,
     pub poll_interval: Duration,
     pub index_diagnostic: bool,
+    pub metrics_port: u16,
 }
 
 impl Config {
@@ -26,6 +27,10 @@ impl Config {
             index_diagnostic: std::env::var("INDEX_DIAGNOSTIC")
                 .map(|v| v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            metrics_port: std::env::var("METRICS_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9090),
         })
     }
 }

@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod db;
+mod metrics;
 mod parser;
 mod redis_stream;
 mod rpc;
@@ -17,6 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Trident indexer starting");
 
     let cfg = config::Config::from_env()?;
+
+    metrics::install(cfg.metrics_port)?;
 
     let db_pool = sqlx::PgPool::connect(&cfg.database_url).await?;
     tracing::info!("Database connected");

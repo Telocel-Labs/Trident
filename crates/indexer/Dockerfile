@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+
+# ── builder ──────────────────────────────────────────────────────────────────
+FROM rust:1.78-slim AS builder
+
+WORKDIR /app
+
+# Cache dependency fetch separately from source compilation.
+COPY Cargo.toml Cargo.lock ./
+COPY proto/ proto/
+COPY crates/common/Cargo.toml crates/common/Cargo.toml
+COPY crates/api/Cargo.toml    crates/api/Cargo.toml
+COPY crates/indexer/Cargo.toml crates/indexer/Cargo.toml
+
+RUN mkdir -p crates/common/src crates/api/src crates/indexer/src \
+    && echo "pub fn _stub() {}" > crates/common/src/lib.rs \
+    && echo "fn main() {}"      > crates/api/src/main.rs \
+    && echo "fn main() {}"      > crates/indexer/src/main.rs \
+    && cargo build --release -p trident-indexer
+
+COPY . .
+
+RUN cargo build --release -p trident-indexer
+
+# ── runtime ──────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/trident-indexer /usr/local/bin/trident-indexer
+
+EXPOSE 9090
+
+ENTRYPOINT ["/usr/local/bin/trident-indexer"]
