@@ -177,7 +177,6 @@ pub async fn load_indexed_contracts(
 mod tests {
     use super::*;
     use serde_json::json;
-    use sqlx::PgPool;
     use trident_common::{EventType, SorobanEvent};
 
     fn make_event(contract_id: &str, ledger_sequence: u64, event_index: u32) -> SorobanEvent {
@@ -211,12 +210,16 @@ mod tests {
 
     /// Calling `insert_event` twice with the same event must not error and
     /// the row count in `soroban_events` must remain 1.
-    #[sqlx::test(migrations = "../../../database/migrations")]
+    #[sqlx::test(migrations = "../../database/migrations")]
     async fn insert_event_is_idempotent(pool: PgPool) {
         let event = make_event("CABC_CONTRACT_001", 42, 0);
 
-        insert_event(&pool, &event).await.expect("first insert failed");
-        insert_event(&pool, &event).await.expect("second insert must not error");
+        insert_event(&pool, &event)
+            .await
+            .expect("first insert failed");
+        insert_event(&pool, &event)
+            .await
+            .expect("second insert must not error");
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM soroban_events")
             .fetch_one(&pool)

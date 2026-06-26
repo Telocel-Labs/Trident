@@ -114,7 +114,7 @@ impl Streamer {
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
-            if self.poll_count % FILTER_REFRESH_EVERY_N_POLLS == 0 {
+            if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 self.refresh_contract_filter().await?;
             }
 
@@ -261,13 +261,8 @@ impl Streamer {
         // Write health stats after every successful cycle (issue #62).
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
-        if let Err(e) = db::update_health_stats(
-            &self.db,
-            *cursor as i64,
-            total as i32,
-            poll_duration,
-        )
-        .await
+        if let Err(e) =
+            db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
         {
             tracing::warn!(error = %e, "Failed to update health stats");
         }
