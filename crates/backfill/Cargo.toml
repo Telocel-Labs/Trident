@@ -1,0 +1,42 @@
+[package]
+name = "trident-backfill"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+trident-common = { path = "../common" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Database
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "uuid", "chrono", "json"] }
+
+# Progress bar
+indicatif = "0.17"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Stellar RPC and parsing - reuse indexer rpc and parser modules by copying minimal logic
+base64 = "0.22"
+stellar-xdr = { version = "26.0.1", features = ["curr"] }
+stellar-strkey = "0.0.16"
+hex = "0.4"
+
+# UUID
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+# Retry/backoff
+tokio-retry = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
