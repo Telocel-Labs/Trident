@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
@@ -81,9 +82,11 @@ func main() {
 	// WebSocket: /ws — real-time event subscription endpoint (issue #15)
 	mux.HandleFunc("/ws", ws.Handler(hub))
 
+	handler := middleware.NewCORSFromEnv()(mux)
+
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
