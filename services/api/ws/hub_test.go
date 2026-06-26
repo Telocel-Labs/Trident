@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"sync"
 	"testing"
 )
 
@@ -131,13 +132,59 @@ func TestHub_SlowClientDropsMessage(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		// correct — broadcast returned without blocking
-	}
+	<-done
 
 	// Only the pre-filled message should be in the channel.
 	if len(c.send) != 1 {
 		t.Errorf("want 1 message in channel (pre-fill), got %d", len(c.send))
+	}
+}
+
+// TestHub_ConcurrentRegisterUnregister exercises the hub under the race
+// detector (issue #60 AC: concurrent connects/disconnects must be safe under
+// `go test -race`). 50 goroutines each register and immediately unregister a
+// client while a broadcaster runs concurrently. The run is clean when no data
+// race is reported and every client has been removed at the end.
+func TestHub_ConcurrentRegisterUnregister(t *testing.T) {
+	h := NewHub()
+
+	// Drive the broadcast path concurrently with the register/unregister churn.
+	stop := make(chan struct{})
+	broadcasterDone := make(chan struct{})
+	go func() {
+		defer close(broadcasterDone)
+		msg := []byte(`{"event":"transfer"}`)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				h.Broadcast("shared", msg)
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := &client{contractID: "shared", send: make(chan []byte, 8)}
+			h.register(c)
+			h.unregister(c)
+		}()
+	}
+	wg.Wait()
+
+	close(stop)
+	<-broadcasterDone
+
+	// Every client registered above was also unregistered, so the hub must be
+	// empty. No broadcaster is running now, so reading under the lock is safe.
+	h.mu.RLock()
+	remaining := len(h.clients)
+	h.mu.RUnlock()
+	if remaining != 0 {
+		t.Errorf("want 0 clients after concurrent churn, got %d", remaining)
 	}
 }

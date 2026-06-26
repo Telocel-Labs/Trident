@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -46,7 +47,7 @@ type HealthResponse struct {
 func Health(db DBPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
-			writeJSON(w, http.StatusServiceUnavailable, HealthResponse{Status: "degraded"})
+			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "database connection unavailable")
 			return
 		}
 
@@ -62,10 +63,10 @@ func Health(db DBPool) http.HandlerFunc {
 			  WHERE key = 'latest_ledger_cursor'`,
 		)
 
-		// Scan into nullable pointers directly using pgx semantics.
+		// Scan into nullable pointers using pgx semantics.
 		err := row.Scan(&lastLedger, &lastPollAt)
 		if err != nil && err != pgx.ErrNoRows {
-			writeJSON(w, http.StatusServiceUnavailable, HealthResponse{Status: "degraded"})
+			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "database query failed")
 			return
 		}
 

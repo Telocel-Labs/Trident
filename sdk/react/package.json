@@ -34,7 +34,7 @@
     "vitest": "^4.1.8"
   },
   "dependencies": {
-    "@trident-indexer/sdk": "*"
+    "@trident-indexer/sdk": "file:../typescript"
   },
   "engines": {
     "node": ">=20"

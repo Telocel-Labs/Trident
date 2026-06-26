@@ -103,6 +103,7 @@ services:
       REDIS_URL: ${REDIS_URL}
       PORT: ${PORT}
       API_KEY_SALT: ${API_KEY_SALT}
+      API_KEY_HASHES: ${API_KEY_HASHES}
       LOG_LEVEL: ${LOG_LEVEL}
     ports:
       - "${PORT}:${PORT}"
