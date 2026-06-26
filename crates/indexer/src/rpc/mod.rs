@@ -165,15 +165,18 @@ impl RpcClient {
     /// On subsequent calls pass `cursor` (the `paging_token` from the last
     /// event received) to continue pagination. Only one of the two should be
     /// set at a time — the RPC rejects requests that supply both.
+    ///
+    /// `limit` controls the page size; callers should pass `config.max_events_per_poll`.
     pub async fn get_events(
         &self,
         start_ledger: Option<u64>,
         cursor: Option<String>,
+        limit: u32,
     ) -> Result<EventsPage, TridentError> {
         let params = GetEventsParams {
             start_ledger,
             filters: vec![],
-            pagination: Pagination { limit: 200, cursor },
+            pagination: Pagination { limit, cursor },
         };
 
         let req = JsonRpcRequest {

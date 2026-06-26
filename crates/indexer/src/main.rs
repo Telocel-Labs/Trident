@@ -16,10 +16,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Trident indexer starting");
 
-    let cfg = config::Config::from_env()?;
+    let cfg = config::Config::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
 
-    let db_pool = sqlx::PgPool::connect(&cfg.database_url).await?;
-    tracing::info!("Database connected");
+    let db_pool = db::connect_pool(&cfg.database_url, cfg.db_pool_size).await?;
+    tracing::info!(pool_size = cfg.db_pool_size, "Database connected via pool");
 
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
     let redis_conn = redis_client.get_multiplexed_async_connection().await?;

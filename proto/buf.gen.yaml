@@ -1,0 +1,11 @@
+version: v2
+
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.35.2
+    out: ../services/api/gen
+    opt:
+      - module=github.com/Depo-dev/trident/services/api/gen
+  - remote: buf.build/grpc/go:v1.3.0
+    out: ../services/api/gen
+    opt:
+      - module=github.com/Depo-dev/trident/services/api/gen

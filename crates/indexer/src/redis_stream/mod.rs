@@ -1,16 +1,15 @@
-use redis::AsyncCommands;
+use redis::{AsyncCommands, streams::StreamMaxlen};
 use trident_common::{SorobanEvent, TridentError};
 
 const STREAM_KEY: &str = "trident:events";
 
-/// Publish a normalised event onto the Redis Stream. The Go API layer
+/// Publish a normalised event onto the Redis Stream, trimming it to at most
+/// `maxlen` entries (approximate trim — `MAXLEN ~`). The Go API layer
 /// consumes this stream to fan out to WebSocket subscribers.
-///
-/// Each entry is a flat hash of event fields. `topics` and `data` are
-/// JSON-serialised strings so all values are plain Redis strings.
 pub async fn publish_event(
     conn: &mut redis::aio::MultiplexedConnection,
     event: &SorobanEvent,
+    maxlen: u64,
 ) -> Result<(), TridentError> {
     let topics = serde_json::to_string(&event.topics)
         .map_err(|e| TridentError::StorageError(format!("topics serialise: {e}")))?;
@@ -18,8 +17,9 @@ pub async fn publish_event(
     let event_type = format!("{:?}", event.event_type).to_lowercase();
 
     let _: String = conn
-        .xadd(
+        .xadd_maxlen(
             STREAM_KEY,
+            StreamMaxlen::Approx(maxlen as usize),
             "*",
             &[
                 ("contract_id", event.contract_id.as_str()),

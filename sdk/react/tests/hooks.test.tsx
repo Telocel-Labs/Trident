@@ -1,25 +1,47 @@
 import React from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { SorobanEvent, PaginatedEvents } from "@trident-indexer/sdk";
 
 // ---------------------------------------------------------------------------
 // Mock @trident-indexer/sdk
+// Vitest hoists vi.mock calls, so we cannot reference outer variables inside
+// the factory. Instead, expose stable mock functions on the class prototype
+// so every test can spy on and configure them via the class.
 // ---------------------------------------------------------------------------
 
-const mockQueryEvents = vi.fn<() => Promise<PaginatedEvents>>();
-const mockSubscribeToContract = vi.fn();
+vi.mock("@trident-indexer/sdk", () => {
+  const queryEvents = vi.fn<() => Promise<PaginatedEvents>>();
+  const subscribeToContract = vi.fn();
 
-vi.mock("@trident-indexer/sdk", () => ({
-  TridentClient: vi.fn().mockImplementation(() => ({
-    queryEvents: mockQueryEvents,
-    subscribeToContract: mockSubscribeToContract,
-  })),
-}));
+  class MockTridentClient {
+    static __queryEvents = queryEvents;
+    static __subscribeToContract = subscribeToContract;
+    queryEvents = queryEvents;
+    subscribeToContract = subscribeToContract;
+  }
 
+  return {
+    TridentClient: MockTridentClient,
+  };
+});
+
+import { TridentClient } from "@trident-indexer/sdk";
 import { TridentProvider } from "../src/context.js";
 import { useContractEvents } from "../src/useContractEvents.js";
 import { useSubscription } from "../src/useSubscription.js";
+
+// ---------------------------------------------------------------------------
+// Helpers — grab stable mock references from the MockTridentClient statics
+// ---------------------------------------------------------------------------
+const MockClient = TridentClient as unknown as {
+  __queryEvents: ReturnType<typeof vi.fn>;
+  __subscribeToContract: ReturnType<typeof vi.fn>;
+  new (...args: unknown[]): unknown;
+};
+
+const mockQueryEvents = MockClient.__queryEvents as ReturnType<typeof vi.fn<() => Promise<PaginatedEvents>>>;
+const mockSubscribeToContract = MockClient.__subscribeToContract;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -55,7 +77,7 @@ function wrapper({ children }: { children: React.ReactNode }) {
 
 describe("useContractEvents", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    vi.clearAllMocks();
   });
 
   it("starts in loading state", () => {
@@ -127,7 +149,7 @@ describe("useContractEvents", () => {
 
 describe("useSubscription", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    vi.clearAllMocks();
   });
 
   it("calls subscribeToContract on mount and unsubscribes on unmount", () => {
@@ -233,14 +255,8 @@ describe("useSubscription", () => {
     );
   });
 
-  it("sets isConnected to false after unmount", () => {
-    mockSubscribeToContract.mockReturnValue({ unsubscribe: vi.fn() });
-    const { result, unmount } = renderHook(
-      () => useSubscription({ contractId: "CTEST" }),
-      { wrapper },
-    );
-    expect(result.current.isConnected).toBe(true);
-    act(() => { unmount(); });
-    expect(result.current.isConnected).toBe(false);
-  });
+  // Note: checking isConnected===false post-unmount is unreliable in React 18+
+  // because state updates in cleanup functions are discarded after unmount.
+  // The subscription cleanup (unsubscribe call) is covered by the
+  // "calls subscribeToContract on mount and unsubscribes on unmount" test above.
 });

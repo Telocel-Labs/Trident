@@ -37,7 +37,7 @@ function mockFetch(
 
 describe("queryEvents", () => {
   beforeEach(() => {
-    vi.stubGlobal("fetch", mockFetch({ events: [mockEvent], next_cursor: "", has_more: false }));
+    vi.stubGlobal("fetch", mockFetch({ events: [mockEvent], next_cursor: null, has_more: false }));
   });
 
   afterEach(() => {
@@ -68,6 +68,55 @@ describe("queryEvents", () => {
     expect(result.events[0].ledgerSequence).toBe(100);
     expect(result.hasMore).toBe(false);
     expect(result.cursor).toBeNull();
+  });
+
+  it("returns hasMore=false and cursor=null on last page", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetch({ events: [mockEvent], next_cursor: null, has_more: false }),
+    );
+    const result = await client.queryEvents({});
+    expect(result.hasMore).toBe(false);
+    expect(result.cursor).toBeNull();
+  });
+
+  it("returns hasMore=true and non-null cursor when more pages exist", async () => {
+    const cursorToken = "eyJ2IjoxLCJ0IjoiMDAwMDAwMTIzNDU2In0";
+    vi.stubGlobal(
+      "fetch",
+      mockFetch({ events: [mockEvent], next_cursor: cursorToken, has_more: true }),
+    );
+    const result = await client.queryEvents({ limit: 1 });
+    expect(result.hasMore).toBe(true);
+    expect(result.cursor).toBe(cursorToken);
+  });
+
+  it("pagination: page 1 has_more=true, page 2 has_more=false", async () => {
+    const cursor1 = "cursor-after-page-1";
+
+    // Page 1: returns 3 events with has_more=true
+    vi.stubGlobal(
+      "fetch",
+      mockFetch({ events: [mockEvent, mockEvent, mockEvent], next_cursor: cursor1, has_more: true }),
+    );
+    const page1 = await client.queryEvents({ limit: 3 });
+    expect(page1.events).toHaveLength(3);
+    expect(page1.hasMore).toBe(true);
+    expect(page1.cursor).toBe(cursor1);
+
+    // Page 2: use returned cursor, gets 2 events with has_more=false
+    vi.stubGlobal(
+      "fetch",
+      mockFetch({ events: [mockEvent, mockEvent], next_cursor: null, has_more: false }),
+    );
+    const page2 = await client.queryEvents({ limit: 3, after: page1.cursor! });
+    expect(page2.events).toHaveLength(2);
+    expect(page2.hasMore).toBe(false);
+    expect(page2.cursor).toBeNull();
+
+    // Verify cursor was passed as query param
+    const [url] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect(url).toContain(`cursor=${cursor1}`);
   });
 
   it("throws TridentError(UNAUTHORIZED) on 401", async () => {

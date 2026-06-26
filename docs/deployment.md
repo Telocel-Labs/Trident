@@ -316,3 +316,65 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml lo
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml logs -f postgres
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml logs -f nginx
 ```
+
+---
+
+## Connection Topology
+
+Trident runs three database clients:
+
+| Service              | Role                         | Pool env var            | Default |
+| -------------------- | ---------------------------- | ----------------------- | ------- |
+| Indexer (Rust)       | single writer, low write QPS | `INDEXER_DB_POOL_SIZE`  | 3       |
+| gRPC API (Rust)      | read-heavy, moderate QPS     | `GRPC_API_DB_POOL_SIZE` | 10      |
+| REST API (Go)        | per-replica request handler  | `GO_API_DB_POOL_SIZE`   | 5       |
+
+In production every service connects to **PgBouncer**, never to Postgres
+directly. PgBouncer (transaction pooling mode) multiplexes the many short-lived
+application connections over a small set of real Postgres connections, so
+Postgres never approaches its `max_connections` limit even as the Go API scales
+to multiple replicas.
+
+```
+indexer  ─┐
+gRPC API ─┼─▶  PgBouncer (pgbouncer:6432, transaction mode)  ─▶  Postgres :5432
+Go API   ─┘        default_pool_size = 20
+(N replicas)
+```
+
+### PgBouncer Transaction Mode: Common Pitfalls
+
+Transaction pooling is efficient but means **no session state survives across transaction boundaries**. The following do **not** work in transaction mode:
+
+1. **Named/server-side prepared statements** — A prepared statement lives on one server connection; the next transaction may land on another.
+2. **`SET SESSION` variables** — Not preserved across transactions.
+3. **Session-level advisory locks** — Behave unexpectedly because the "session" is not stable.
+
+Trident's clients are configured to avoid (1):
+
+- **Rust (sqlx):** `PgConnectOptions::statement_cache_capacity(0)`
+- **Go (pgx v5):** `cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol`
+
+### Schema Migrations
+
+Run migrations against a **direct** Postgres connection, not the transaction-mode pooler. Keep a direct DSN available for that purpose; do not point your migration tool at `pgbouncer:6432`.
+
+## Admin Stats Endpoint
+
+The Go API exposes `GET /v1/admin/db` for capacity planning. Set `ADMIN_API_KEY` and `PGBOUNCER_ADMIN_URL` in `.env`, then:
+
+```bash
+curl -H "X-Admin-Key: $ADMIN_API_KEY" http://localhost:3000/v1/admin/db
+```
+
+A missing or wrong key returns `401`; an unreachable PgBouncer returns `502`.
+
+## Load Testing
+
+`load-tests/pgbouncer-validation.js` is a [k6](https://k6.io) script that drives
+100 concurrent clients, each issuing 10 requests to `GET /v1/events`, and asserts
+no `too many connections` errors with p99 latency under 500ms.
+
+```bash
+BASE_URL=http://localhost:3000 k6 run load-tests/pgbouncer-validation.js
+```

@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
 	// streamKey is the Redis Stream written by the Rust indexer.
 	streamKey = "trident:events"
+	groupName = "trident-api"
 )
 
 // streamEntry is the JSON structure expected in each Redis Stream message value.
@@ -19,23 +23,57 @@ type streamEntry struct {
 	Payload    json.RawMessage `json:"payload"`
 }
 
-// StartConsumer begins a blocking XREAD loop against the Redis Stream at
-// trident:events, deserialises each entry, and fans the raw JSON payload
-// out to connected WebSocket clients via hub.Broadcast.
-//
-// It runs until ctx is cancelled, at which point it returns cleanly.
-// Intended to be launched as a goroutine: go StartConsumer(ctx, redisClient, hub).
+// StartConsumer begins a Redis Streams consumer group reader. It creates the
+// consumer group idempotently, uses a unique consumer name per process, and
+// reads messages using XREADGROUP. Each message is acknowledged (XACK) after
+// successful broadcast to the hub. PEL recovery via XAUTOCLAIM runs on startup
+// and every 30s.
 func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
-	lastID := "$" // only deliver messages that arrive after startup
+	// Consumer name: prefer HOSTNAME, fall back to UUID if unavailable.
+	consumerName, _ := os.Hostname()
+	if consumerName == "" {
+		consumerName = uuid.NewString()
+	}
 
-	slog.Info("ws: Redis Streams consumer starting", "stream", streamKey)
+	slog.Info("ws: Redis Streams consumer starting (consumer group)", "stream", streamKey, "group", groupName, "consumer", consumerName)
+
+	// Create consumer group idempotently: MKSTREAM ensures stream exists.
+	if err := rdb.XGroupCreateMkStream(ctx, streamKey, groupName, "$").Err(); err != nil {
+		// BUSYGROUP means group already exists — ignore.
+		if err.Error() == "BUSYGROUP Consumer Group name already exists" || err == redis.ErrGroupExists {
+			slog.Info("ws: consumer group already exists, continuing")
+		} else {
+			slog.Error("ws: failed to create consumer group", "err", err)
+			// Not fatal — continue and attempt to consume; downstream errors will surface.
+		}
+	}
+
+	// Run PEL recovery (XAUTOCLAIM) once at startup.
+	recoverPending(ctx, rdb, hub, consumerName)
+
+	// Periodic PEL recovery every 30 seconds in background.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				recoverPending(ctx, rdb, hub, consumerName)
+			case <-ctx.Done():
+				slog.Info("ws: PEL recovery goroutine stopping")
+				return
+			}
+		}
+	}()
 
 	for {
-		// Block until at least one new message arrives or the context is cancelled.
-		entries, err := rdb.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{streamKey, lastID},
-			Block:   0, // block indefinitely
-			Count:   100,
+		// Block until messages are available or the context is cancelled.
+		entries, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    groupName,
+			Consumer: consumerName,
+			Streams:  []string{streamKey, ">"},
+			Count:    100,
+			Block:    5000 * time.Millisecond,
 		}).Result()
 
 		if err != nil {
@@ -44,45 +82,122 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 				slog.Info("ws: Redis Streams consumer stopped")
 				return
 			}
-			slog.Error("ws: XRead error", "err", err)
+			slog.Error("ws: XReadGroup error", "err", err)
 			// Back off briefly on transient errors to avoid a tight error loop.
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-time.After(1 * time.Second):
 			}
 			continue
 		}
 
 		for _, stream := range entries {
 			for _, msg := range stream.Messages {
-				lastID = msg.ID
-
+				// msg.ID is the message id we must XACK after processing.
 				raw, ok := msg.Values["data"]
 				if !ok {
 					slog.Warn("ws: stream message missing 'data' field", "id", msg.ID)
+					// Acknowledge to avoid stuck messages, since we can't process it.
+					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
+						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
+					}
 					continue
 				}
 
 				rawStr, ok := raw.(string)
 				if !ok {
 					slog.Warn("ws: stream message 'data' is not a string", "id", msg.ID)
+					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
+						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
+					}
 					continue
 				}
 
 				var entry streamEntry
 				if err := json.Unmarshal([]byte(rawStr), &entry); err != nil {
 					slog.Warn("ws: failed to unmarshal stream entry", "id", msg.ID, "err", err)
+					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
+						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
+					}
 					continue
 				}
 
 				if entry.ContractID == "" {
 					slog.Warn("ws: stream entry missing contract_id", "id", msg.ID)
+					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
+						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
+					}
 					continue
 				}
 
 				hub.Broadcast(entry.ContractID, entry.Payload)
+
+				// Acknowledge the message after successful broadcast.
+				if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
+					slog.Warn("ws: failed to XACK message", "id", msg.ID, "err", err)
+				}
 			}
+		}
+	}
+}
+
+// recoverPending claims pending messages older than 30s using XAUTOCLAIM and
+// reprocesses them locally so no messages stay stuck in the PEL.
+func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, consumerName string) {
+	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	minIdle := 30 * time.Second
+	autoRes, err := rdb.XAutoClaim(ctx2, streamKey, groupName, consumerName, minIdle, "0-0").Result()
+	if err != nil {
+		// If no entries, Redis may return empty result — treat as non-fatal.
+		if err != redis.Nil {
+			slog.Warn("ws: XAUTOCLAIM failed", "err", err)
+		}
+		return
+	}
+
+	for _, msg := range autoRes.Messages {
+		raw, ok := msg.Values["data"]
+		if !ok {
+			slog.Warn("ws: recovered message missing 'data'", "id", msg.ID)
+			// Acknowledge to avoid loops.
+			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
+				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
+			}
+			continue
+		}
+
+		rawStr, ok := raw.(string)
+		if !ok {
+			slog.Warn("ws: recovered message 'data' not string", "id", msg.ID)
+			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
+				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
+			}
+			continue
+		}
+
+		var entry streamEntry
+		if err := json.Unmarshal([]byte(rawStr), &entry); err != nil {
+			slog.Warn("ws: failed to unmarshal recovered entry", "id", msg.ID, "err", err)
+			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
+				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
+			}
+			continue
+		}
+
+		if entry.ContractID == "" {
+			slog.Warn("ws: recovered entry missing contract_id", "id", msg.ID)
+			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
+				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
+			}
+			continue
+		}
+
+		hub.Broadcast(entry.ContractID, entry.Payload)
+		if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
+			slog.Warn("ws: failed to XACK recovered message", "id", msg.ID, "err", err)
 		}
 	}
 }

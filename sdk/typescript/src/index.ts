@@ -92,8 +92,8 @@ const ApiEventSchema = z.object({
 
 const ApiListEventsResponseSchema = z.object({
   events: z.array(ApiEventSchema),
-  next_cursor: z.string().optional().default(""),
-  has_more: z.boolean().optional().default(false),
+  next_cursor: z.string().nullable(),
+  has_more: z.boolean(),
 });
 
 function apiEventToSorobanEvent(
@@ -183,8 +183,8 @@ export class TridentClient {
 
     return {
       events: resp.events.map(apiEventToSorobanEvent),
-      cursor: resp.next_cursor || null,
-      hasMore: resp.has_more ?? false,
+      cursor: resp.next_cursor,
+      hasMore: resp.has_more,
     };
   }
 

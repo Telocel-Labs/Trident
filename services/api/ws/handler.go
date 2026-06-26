@@ -50,7 +50,11 @@ func Handler(hub *Hub) http.HandlerFunc {
 			slog.Error("ws: upgrade failed", "err", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				slog.Debug("ws: connection close failed", "err", err)
+			}
+		}()
 
 		c := &client{
 			contractID: contractID,
@@ -61,7 +65,10 @@ func Handler(hub *Hub) http.HandlerFunc {
 
 		// Set initial read deadline. It is refreshed on every successful write
 		// so that an active connection is never incorrectly timed out.
-		conn.SetDeadline(time.Now().Add(readDeadline))
+		if err := conn.SetDeadline(time.Now().Add(readDeadline)); err != nil {
+			slog.Warn("ws: failed to set initial deadline", "err", err)
+			return
+		}
 
 		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
@@ -78,7 +85,10 @@ func Handler(hub *Hub) http.HandlerFunc {
 					return
 				}
 				// Refresh deadline after a successful write.
-				conn.SetDeadline(time.Now().Add(readDeadline))
+				if err := conn.SetDeadline(time.Now().Add(readDeadline)); err != nil {
+					slog.Warn("ws: failed to refresh deadline", "err", err)
+					return
+				}
 
 			case <-ticker.C:
 				if err := writePingFrame(bufrw); err != nil {
@@ -87,7 +97,10 @@ func Handler(hub *Hub) http.HandlerFunc {
 				}
 				// Refresh deadline: if no pong or data arrives within readDeadline
 				// the next I/O call will return a timeout error and exit the loop.
-				conn.SetDeadline(time.Now().Add(readDeadline))
+				if err := conn.SetDeadline(time.Now().Add(readDeadline)); err != nil {
+					slog.Warn("ws: failed to refresh deadline", "err", err)
+					return
+				}
 			}
 		}
 	}
@@ -122,11 +135,11 @@ func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
 	if _, err := bufrw.WriteString(resp); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, nil, err
 	}
 	if err := bufrw.Flush(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, nil, err
 	}
 

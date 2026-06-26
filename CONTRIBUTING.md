@@ -12,17 +12,25 @@ The most useful thing you can do right now is engage with the design while it ca
 
 ## Getting Set Up
 
-You'll need Rust via [rustup](https://rustup.rs), Node.js 20 LTS for the TypeScript SDK, and Docker with Compose v2. Once those are in place, getting a local environment running should take under ten minutes.
+You'll need Rust, Go, Node.js, and Docker with Compose v2. Once those are in place, getting a local environment running is simple:
 
 ```bash
 git clone https://github.com/trident-build/trident.git
 cd trident
 cp .env.example .env
-docker compose -f docker/docker-compose.dev.yml up -d
-cargo build
+make dev
 ```
 
-The dev Compose file starts PostgreSQL and Redis only. You run the indexer and API locally so changes reflect immediately without rebuilding containers. To work with real data, set `STELLAR_RPC_URL` and `NETWORK=testnet` in your `.env`. Full setup details will live in [`docs/development.md`](./docs/development.md) once the repo is scaffolded.
+This starts all dependencies and services locally. If you only want the infrastructure (Postgres and Redis) to run the services separately, run:
+
+```bash
+make db
+make migrate
+make indexer       # runs the indexer in a separate shell
+make grpc-api     # runs the gRPC server in a separate shell
+make go-api       # runs the Go REST API in a separate shell
+```
+
 
 ---
 

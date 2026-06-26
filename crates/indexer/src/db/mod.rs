@@ -1,10 +1,32 @@
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use trident_common::{EventType, SorobanEvent, TridentError};
 use uuid::Uuid;
+
+/// Build a bounded Postgres connection pool sized for this service.
+///
+/// `statement_cache_capacity(0)` disables sqlx's named-prepared-statement cache.
+/// This is mandatory when connecting through PgBouncer in transaction pooling
+/// mode: a cached prepared statement is bound to one server connection, but in
+/// transaction mode the next transaction may be routed to a different server
+/// connection where that statement does not exist, which makes the query fail.
+/// See docs/deployment.md (issue #87).
+pub async fn connect_pool(database_url: &str, pool_size: u32) -> Result<PgPool, TridentError> {
+    let connect_options = PgConnectOptions::from_str(database_url)
+        .map_err(|e| TridentError::ConfigError(format!("invalid DATABASE_URL: {e}")))?
+        .statement_cache_capacity(0);
+
+    PgPoolOptions::new()
+        .max_connections(pool_size)
+        .connect_with(connect_options)
+        .await
+        .map_err(|e| TridentError::StorageError(format!("connect_pool: {e}")))
+}
 
 // Stable namespace for deterministic event UUIDs (UUIDv5).
 // Using the DNS namespace is arbitrary; what matters is that it is fixed.
@@ -177,7 +199,6 @@ pub async fn load_indexed_contracts(
 mod tests {
     use super::*;
     use serde_json::json;
-    use sqlx::PgPool;
     use trident_common::{EventType, SorobanEvent};
 
     fn make_event(contract_id: &str, ledger_sequence: u64, event_index: u32) -> SorobanEvent {
@@ -211,12 +232,16 @@ mod tests {
 
     /// Calling `insert_event` twice with the same event must not error and
     /// the row count in `soroban_events` must remain 1.
-    #[sqlx::test(migrations = "../../../database/migrations")]
+    #[sqlx::test(migrations = "../../database/migrations")]
     async fn insert_event_is_idempotent(pool: PgPool) {
         let event = make_event("CABC_CONTRACT_001", 42, 0);
 
-        insert_event(&pool, &event).await.expect("first insert failed");
-        insert_event(&pool, &event).await.expect("second insert must not error");
+        insert_event(&pool, &event)
+            .await
+            .expect("first insert failed");
+        insert_event(&pool, &event)
+            .await
+            .expect("second insert must not error");
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM soroban_events")
             .fetch_one(&pool)
