@@ -31,8 +31,10 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return rw.ResponseWriter.Write(b)
 }
 
-// Timeout returns middleware that enforces a per-request context deadline.
-// duration is the timeout; excluded is a list of path prefixes to skip.
+// Timeout returns middleware that cancels the request context after duration.
+// Handlers must respect ctx.Done() for cancellation to take effect; the
+// middleware detects deadline exceeded only after ServeHTTP returns.
+// Paths matching any prefix in excluded are passed through without a timeout.
 func Timeout(duration time.Duration, excluded []string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

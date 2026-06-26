@@ -64,6 +64,14 @@ The nginx service expects certificates in the `nginx_certs` Docker volume.
 
 ```bash
 docker volume create trident_nginx_certs
+```
+
+> **Note**: Docker Compose prefixes volume names with the project name (directory name by default).
+> If your working directory is not named `trident`, use
+> `docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml config --volumes`
+> to find the actual volume name, then substitute it in the `docker volume create` and `docker run` commands above.
+
+```bash
 docker run --rm \
   -v trident_nginx_certs:/certs \
   -v $(pwd)/certs:/src \

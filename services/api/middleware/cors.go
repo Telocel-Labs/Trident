@@ -30,6 +30,7 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 	}
 
 	setCORSHeaders := func(w http.ResponseWriter, origin string) {
+		w.Header().Add("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", corsAllowMethods)
 		w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)

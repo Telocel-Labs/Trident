@@ -23,6 +23,8 @@ func TestCORS(t *testing.T) {
 		wantStatus     int
 		wantOrigin     string
 		wantMaxAge     string
+		wantMethods    string
+		wantHeaders    string
 		wantNextCalled bool
 	}{
 		{
@@ -33,6 +35,8 @@ func TestCORS(t *testing.T) {
 			wantStatus:     http.StatusOK,
 			wantOrigin:     "https://example.com",
 			wantMaxAge:     "86400",
+			wantMethods:    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+			wantHeaders:    "Authorization, Content-Type, X-Request-ID",
 			wantNextCalled: true,
 		},
 		{
@@ -43,6 +47,8 @@ func TestCORS(t *testing.T) {
 			wantStatus:     http.StatusOK,
 			wantOrigin:     "https://allowed.com",
 			wantMaxAge:     "86400",
+			wantMethods:    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+			wantHeaders:    "Authorization, Content-Type, X-Request-ID",
 			wantNextCalled: true,
 		},
 		{
@@ -62,6 +68,8 @@ func TestCORS(t *testing.T) {
 			wantStatus:     http.StatusNoContent,
 			wantOrigin:     "https://example.com",
 			wantMaxAge:     "86400",
+			wantMethods:    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+			wantHeaders:    "Authorization, Content-Type, X-Request-ID",
 			wantNextCalled: false,
 		},
 		{
@@ -114,6 +122,23 @@ func TestCORS(t *testing.T) {
 				got := rr.Header().Get("Access-Control-Allow-Origin")
 				if got != tc.wantOrigin {
 					t.Errorf("Access-Control-Allow-Origin: got %q, want %q", got, tc.wantOrigin)
+				}
+				vary := rr.Header().Get("Vary")
+				if vary != "Origin" {
+					t.Errorf("Vary: got %q, want Origin", vary)
+				}
+			}
+
+			if tc.wantMethods != "" {
+				got := rr.Header().Get("Access-Control-Allow-Methods")
+				if got != tc.wantMethods {
+					t.Errorf("Access-Control-Allow-Methods: got %q, want %q", got, tc.wantMethods)
+				}
+			}
+			if tc.wantHeaders != "" {
+				got := rr.Header().Get("Access-Control-Allow-Headers")
+				if got != tc.wantHeaders {
+					t.Errorf("Access-Control-Allow-Headers: got %q, want %q", got, tc.wantHeaders)
 				}
 			}
 
