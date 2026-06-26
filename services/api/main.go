@@ -86,6 +86,7 @@ func main() {
 	mux.HandleFunc("/ws", ws.Handler(hub))
 
 	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
+	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),

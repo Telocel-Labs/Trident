@@ -105,6 +105,38 @@ Full historical event storage with no enforced retention limit, so a query again
 
 ---
 
+## Production Deployment
+
+Trident ships a docker-compose overlay for production that terminates TLS at nginx and hides the API port from the host.
+
+### Prerequisites
+
+TLS certificates must be placed in the `nginx_certs` Docker volume before starting the stack. The nginx service expects:
+
+- `/etc/nginx/certs/fullchain.pem`
+- `/etc/nginx/certs/privkey.pem`
+
+Populate the volume once (e.g. via Certbot or your own certificate pipeline) before the first `up`.
+
+### Start the stack
+
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d
+```
+
+This command merges the base compose (postgres, redis, indexer, api) with the production overlay (nginx, port hiding). The API is reachable only through nginx — direct access on port 3000 is disabled in production.
+
+### What the overlay changes
+
+| Service | Base | Prod overlay |
+|---------|------|--------------|
+| `nginx` | — | Added: ports 80 + 443, TLS termination |
+| `api` | `${PORT}:${PORT}` exposed | `ports: []` — no direct host access |
+
+nginx proxies all traffic to `api:3000` on the internal Docker network, upgrades WebSocket connections at `/ws`, and disables response buffering for the SSE stream at `/v1/events/stream`.
+
+---
+
 ## Contributing
 
 All branches come off `dev`. Before opening a pull request, make sure all three CI checks pass locally — the pipeline will block merge if any of them fail.
