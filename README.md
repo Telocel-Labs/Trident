@@ -17,7 +17,34 @@
 
 ---
 
+## Quick Start
+
+### Prerequisites
+Before running Trident locally, make sure you have the following installed:
+- **Docker** with Compose v2
+- **Rust** (via [rustup](https://rustup.rs))
+- **Go** (1.21+)
+- **Node.js** (20 LTS+)
+
+### Setup & Run
+Get the entire development stack running in seconds:
+```bash
+cp .env.example .env
+make dev
+```
+
+This command will:
+1. Start Postgres and Redis via Docker Compose.
+2. Wait for Postgres to be healthy.
+3. Apply all database migrations automatically.
+4. Compile and start the Rust indexer, the Rust gRPC API, and the Go REST API.
+
+Use `Ctrl+C` or `make stop` to cleanly shut down all services.
+
+---
+
 ## The Problem
+
 
 Soroban's RPC node is intentionally thin — no long-term event storage, no historical queries, no filtering. That's a reasonable protocol decision, but it forces every developer building on Stellar to solve the same infrastructure problem before they can build their actual product. Every serious team ends up writing their own event streaming pipeline, their own database schema, their own parser — in isolation, with no shared guarantees, and no easy recovery when something breaks.
 

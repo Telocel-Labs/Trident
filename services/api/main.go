@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/handlers"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/ws"
@@ -22,6 +23,22 @@ func main() {
 	if port == "" {
 		port = "3000"
 	}
+
+	// ---------------------------------------------------------------------------
+	// gRPC client connection
+	// ---------------------------------------------------------------------------
+	grpcAddr := os.Getenv("GRPC_ADDR")
+	if grpcAddr == "" {
+		grpcAddr = "localhost:5000"
+	}
+
+	grpcClient, err := grpc.NewClient(context.Background(), grpcAddr)
+	if err != nil {
+		slog.Error("failed to connect to gRPC backend", "err", err)
+		os.Exit(1)
+	}
+	defer grpcClient.Close()
+	handlers.SetEventsClient(grpcClient)
 
 	// ---------------------------------------------------------------------------
 	// Postgres connection (health endpoint)
@@ -70,7 +87,7 @@ func main() {
 	go ws.StartConsumer(ctx, redisClient, hub)
 
 	// ---------------------------------------------------------------------------
-	// HTTP router
+	// HTTP router with middleware
 	// ---------------------------------------------------------------------------
 	mux := http.NewServeMux()
 
@@ -88,7 +105,12 @@ func main() {
 	// WebSocket: /ws — real-time event subscription endpoint (issue #15)
 	mux.HandleFunc("/ws", ws.Handler(hub))
 
-	handler := middleware.APIKey(mux)
+	// Apply middleware chain: request ID → structured logging
+	handler := middleware.Chain(
+		mux,
+		middleware.StructuredLogging,
+		middleware.RequestID,
+	)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
