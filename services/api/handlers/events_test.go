@@ -239,13 +239,106 @@ func TestGetEvent_InvalidUUID_Returns400(t *testing.T) {
 	}
 }
 
-func TestListEvents_ValidCursor_ReturnsNextCursor(t *testing.T) {
+// TestListEvents_HasMoreField verifies the response always contains has_more.
+func TestListEvents_HasMoreField_PresentInResponse(t *testing.T) {
+	mock := &MockEventsClient{
+		ListEventsFunc: func(ctx context.Context, req *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return &gen.ListEventsResponse{Events: []*gen.Event{}, HasMore: false, NextCursor: ""}, nil
+		},
+	}
+	handlers.SetEventsClient(mock)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	rr := httptest.NewRecorder()
+
+	handlers.ListEvents(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := body["has_more"]; !ok {
+		t.Error("response must contain has_more field")
+	}
+}
+
+// TestListEvents_EmptyPage_HasMoreFalseAndNullCursor checks the last-page contract.
+// gRPC returning HasMore=false and empty NextCursor → has_more=false, next_cursor=null.
+func TestListEvents_EmptyPage_HasMoreFalseAndNullCursor(t *testing.T) {
+	mock := &MockEventsClient{
+		ListEventsFunc: func(ctx context.Context, req *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return &gen.ListEventsResponse{Events: []*gen.Event{}, HasMore: false, NextCursor: ""}, nil
+		},
+	}
+	handlers.SetEventsClient(mock)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	rr := httptest.NewRecorder()
+
+	handlers.ListEvents(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	hasMore, ok := body["has_more"].(bool)
+	if !ok {
+		t.Fatalf("has_more must be a boolean, got %T", body["has_more"])
+	}
+	if hasMore {
+		t.Error("has_more must be false when no events returned")
+	}
+	if body["next_cursor"] != nil {
+		t.Errorf("next_cursor must be null on last page, got %v", body["next_cursor"])
+	}
+}
+
+// TestListEvents_ValidCursor_Returns200WithNullCursor verifies that when gRPC
+// returns HasMore=false, next_cursor is null even if the request included a cursor.
+func TestListEvents_ValidCursor_Returns200WithNullCursor(t *testing.T) {
+	mock := &MockEventsClient{
+		ListEventsFunc: func(ctx context.Context, req *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return &gen.ListEventsResponse{Events: []*gen.Event{}, HasMore: false, NextCursor: ""}, nil
+		},
+	}
+	handlers.SetEventsClient(mock)
+
+	opaque := cursor.Encode("ledger:42")
+	req := httptest.NewRequest(http.MethodGet, "/v1/events?cursor="+opaque, nil)
+	rr := httptest.NewRecorder()
+
+	handlers.ListEvents(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["next_cursor"] != nil {
+		t.Errorf("want next_cursor=null, got %v", body["next_cursor"])
+	}
+	hasMore, _ := body["has_more"].(bool)
+	if hasMore {
+		t.Error("has_more must be false when gRPC returns HasMore=false")
+	}
+}
+
+// TestListEvents_HasMore_NonNullCursor verifies has_more=true yields a non-null next_cursor.
+func TestListEvents_HasMore_NonNullCursor(t *testing.T) {
 	mock := &MockEventsClient{
 		ListEventsFunc: func(ctx context.Context, req *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
 			return &gen.ListEventsResponse{
 				Events:     []*gen.Event{},
-				NextCursor: "ledger:100",
 				HasMore:    true,
+				NextCursor: "ledger:100",
 			}, nil
 		},
 	}
@@ -263,9 +356,12 @@ func TestListEvents_ValidCursor_ReturnsNextCursor(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	nc, ok := body["next_cursor"].(string)
-	if !ok || nc == "" {
-		t.Errorf("want non-empty next_cursor in response, got %v", body["next_cursor"])
+	hasMore, _ := body["has_more"].(bool)
+	if !hasMore {
+		t.Error("has_more must be true when gRPC returns HasMore=true")
+	}
+	if body["next_cursor"] == nil {
+		t.Error("next_cursor must be non-null when has_more=true")
 	}
 }
 

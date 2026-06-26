@@ -15,7 +15,8 @@ import (
 // ListEventsResponse is the response envelope for GET /v1/events.
 type ListEventsResponse struct {
 	Events     []*EventJSON `json:"events"`
-	NextCursor string       `json:"next_cursor"`
+	HasMore    bool         `json:"has_more"`
+	NextCursor *string      `json:"next_cursor"`
 }
 
 // EventJSON is the JSON representation of an event
@@ -40,10 +41,11 @@ func SetEventsClient(client gen.EventsClient) {
 	eventsClient = client
 }
 
-// ListEvents handles GET /v1/events (issues #42, #44).
+// ListEvents handles GET /v1/events (issues #42, #44, #143).
 //
 // Validates query parameters and decodes the opaque pagination cursor before
 // forwarding to the gRPC backend. Returns 400 on any validation failure.
+// The response always includes has_more and next_cursor per issue #143.
 func ListEvents(w http.ResponseWriter, r *http.Request) {
 	if eventsClient == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
@@ -102,15 +104,22 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert proto events to JSON
 	events := make([]*EventJSON, len(resp.Events))
 	for i, event := range resp.Events {
 		events[i] = protoEventToJSON(event)
 	}
 
+	hasMore := resp.HasMore
+	var nextCursor *string
+	if resp.NextCursor != "" {
+		encoded := cursor.Encode(resp.NextCursor)
+		nextCursor = &encoded
+	}
+
 	writeJSON(w, http.StatusOK, ListEventsResponse{
 		Events:     events,
-		NextCursor: cursor.Encode(resp.NextCursor),
+		HasMore:    hasMore,
+		NextCursor: nextCursor,
 	})
 }
 

@@ -95,11 +95,9 @@ impl Streamer {
     /// Start the polling loop. Runs until `shutdown` is cancelled, always
     /// finishing the current `poll_once` before stopping (never mid-batch).
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
-        tracing::info!(
-            network = %self.config.network,
-            poll_interval_ms = %self.config.poll_interval.as_millis(),
-            "Streamer started"
-        );
+        tracing::info!(network = %self.config.network, "Streamer started");
+        tracing::info!("[indexer] poll interval: {}ms", self.config.poll_interval.as_millis());
+        tracing::info!("[indexer] max events per poll: {}", self.config.max_events_per_poll);
 
         let mut cursor = db::get_cursor(&self.db).await?;
         tracing::info!(cursor, "Resuming from ledger cursor");
@@ -170,8 +168,9 @@ impl Streamer {
         loop {
             let pc = page_cursor.clone();
             let sl = start_ledger;
+            let limit = self.config.max_events_per_poll;
             let page = Retry::start(retry_strategy.clone(), || async {
-                self.rpc.get_events(sl, pc.clone()).await
+                self.rpc.get_events(sl, pc.clone(), limit).await
             })
             .await?;
 
@@ -251,7 +250,7 @@ impl Streamer {
             }
 
             // An incomplete page means we have caught up to the chain tip.
-            if page.events.len() < 200 {
+            if page.events.len() < self.config.max_events_per_poll as usize {
                 break;
             }
 
@@ -362,10 +361,13 @@ mod tests {
         let config = Config {
             stellar_rpc_url: rpc_url,
             database_url: db_url.to_string(),
+            db_pool_size: 3,
             redis_url: redis_url.to_string(),
             network: "testnet".to_string(),
             poll_interval: Duration::from_millis(50),
             index_diagnostic: false,
+            max_events_per_poll: 200,
+            redis_stream_maxlen: 10_000,
         };
         Streamer::new(config, db, redis).await.unwrap()
     }

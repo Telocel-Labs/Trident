@@ -8,6 +8,7 @@ pub mod trident {
     tonic::include_proto!("trident");
 }
 
+mod config;
 mod services;
 
 /// Read-heavy service with moderate concurrency, so a moderate pool is correct.
@@ -19,7 +20,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+    let cfg = config::Config::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+
     let pool_size = std::env::var("GRPC_API_DB_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -28,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // statement_cache_capacity(0) disables named prepared statements so the pool
     // is safe behind PgBouncer in transaction mode. See docs/deployment.md (#87).
-    let connect_options = PgConnectOptions::from_str(&database_url)?.statement_cache_capacity(0);
+    let connect_options = PgConnectOptions::from_str(&cfg.database_url)?.statement_cache_capacity(0);
     let db_pool = PgPoolOptions::new()
         .max_connections(pool_size)
         .connect_with(connect_options)
@@ -41,9 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     tracing::info!("Redis connected");
 
-    let addr: SocketAddr = std::env::var("GRPC_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:50051".into())
-        .parse()?;
+    let addr: SocketAddr = cfg.grpc_addr.parse()?;
 
     tracing::info!(%addr, "Trident gRPC server listening");
 
