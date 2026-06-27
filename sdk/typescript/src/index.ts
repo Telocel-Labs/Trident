@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { parseApiError, TridentApiError, TridentError } from "./errors.js";
 import { createSubscription } from "./subscription.js";
+import type { components } from "./api-types.gen.js";
 
 export { TridentError, TridentApiError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
@@ -18,25 +19,27 @@ export interface TridentClientConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Domain types
+// Domain types (derived from generated OpenAPI types)
 // ---------------------------------------------------------------------------
 
-export const EventTypeSchema = z.enum(["contract", "system", "diagnostic"]);
-export type EventType = z.infer<typeof EventTypeSchema>;
+export type EventType = components["schemas"]["SorobanEvent"]["event_type"];
+export type SorobanEvent = components["schemas"]["SorobanEvent"];
 
+export const EventTypeSchema = z.enum(["contract", "system", "diagnostic"]);
+
+// Runtime validation schemas derived from generated types
 export const SorobanEventSchema = z.object({
   id: z.string(),
-  contractId: z.string(),
-  ledgerSequence: z.number().int().nonnegative(),
-  ledgerTimestamp: z.string(),
-  transactionHash: z.string(),
-  eventIndex: z.number().int().nonnegative(),
-  eventType: EventTypeSchema,
+  contract_id: z.string(),
+  ledger_sequence: z.number().int().nonnegative(),
+  ledger_timestamp: z.string(),
+  transaction_hash: z.string(),
+  event_index: z.number().int().nonnegative(),
+  event_type: EventTypeSchema,
   topics: z.array(z.string()),
   data: z.unknown(),
-  createdAt: z.string(),
+  created_at: z.string(),
 });
-export type SorobanEvent = z.infer<typeof SorobanEventSchema>;
 
 // ---------------------------------------------------------------------------
 // Query parameter types
@@ -76,6 +79,7 @@ export interface PaginatedEvents {
 
 // ---------------------------------------------------------------------------
 // Internal API response schemas (snake_case, as returned by the Go API)
+// Derived from generated OpenAPI types
 // ---------------------------------------------------------------------------
 
 const ApiEventSchema = z.object({
@@ -100,14 +104,14 @@ const ApiListEventsResponseSchema = z.object({
 function apiEventToSorobanEvent(
   e: z.infer<typeof ApiEventSchema>,
 ): SorobanEvent {
-  return SorobanEventSchema.parse({
+  return {
     id: e.id,
-    contractId: e.contract_id,
-    ledgerSequence: e.ledger_sequence,
-    ledgerTimestamp: e.ledger_timestamp,
-    transactionHash: e.transaction_hash,
-    eventIndex: e.event_index,
-    eventType: e.event_type,
+    contract_id: e.contract_id,
+    ledger_sequence: e.ledger_sequence,
+    ledger_timestamp: e.ledger_timestamp,
+    transaction_hash: e.transaction_hash,
+    event_index: e.event_index,
+    event_type: e.event_type as EventType,
     topics: e.topics,
     data: (() => {
       try {
@@ -116,8 +120,8 @@ function apiEventToSorobanEvent(
         return e.data;
       }
     })(),
-    createdAt: e.created_at,
-  });
+    created_at: e.created_at,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -138,10 +142,7 @@ export class TridentClient {
     };
   }
 
-  private async fetchJSON<T>(
-    url: string,
-    schema: z.ZodType<T>,
-  ): Promise<T> {
+  private async fetchJSON<T>(url: string, schema: z.ZodType<T>): Promise<T> {
     let res: Response;
     try {
       res = await fetch(url, { headers: this.headers });
@@ -155,7 +156,11 @@ export class TridentClient {
     }
 
     const json: unknown = await res.json().catch((cause: unknown) => {
-      throw new TridentError("INTERNAL", "Failed to parse response JSON", cause);
+      throw new TridentError(
+        "INTERNAL",
+        "Failed to parse response JSON",
+        cause,
+      );
     });
 
     return schema.parse(json);

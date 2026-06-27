@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -41,6 +42,7 @@ func main() {
 	handlers.SetEventsClient(grpcClient)
 
 	var pool *pgxpool.Pool
+	var sqlDB *sql.DB
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		p, err := newDBPool(ctx, dsn, dbPoolSizeFromEnv())
@@ -50,6 +52,13 @@ func main() {
 		} else {
 			pool = p
 			defer pool.Close()
+			// Also create a sql.DB connection for stats handler (uses sql.DB instead of pgxpool)
+			sqlDB, err = sql.Open("postgres", dsn)
+			if err != nil {
+				slog.Warn("could not create sql.DB connection for stats handler", "err", err)
+			} else {
+				defer sqlDB.Close()
+			}
 		}
 	} else {
 		slog.Warn("DATABASE_URL not set; DB-backed endpoints will return 503")
@@ -82,11 +91,13 @@ func main() {
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
+	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(sqlDB, redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminConfig()))
 	mux.HandleFunc("/ws", ws.Handler(hub))
 
 	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
+	handler = middleware.APIKey(handler)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),

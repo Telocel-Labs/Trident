@@ -10,6 +10,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE TABLE IF NOT EXISTS soroban_events (
     id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     contract_id         TEXT        NOT NULL,
+    network             TEXT        NOT NULL DEFAULT 'testnet',
     ledger_sequence     BIGINT      NOT NULL,
     ledger_timestamp    TIMESTAMPTZ NOT NULL,
     transaction_hash    TEXT        NOT NULL,
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS soroban_events (
 );
 
 -- Single-column indexes
+CREATE INDEX IF NOT EXISTS idx_soroban_events_network          ON soroban_events (network);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_id       ON soroban_events (contract_id);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_sequence   ON soroban_events (ledger_sequence);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp  ON soroban_events (ledger_timestamp);
@@ -32,6 +34,11 @@ CREATE INDEX IF NOT EXISTS idx_soroban_events_topic_1           ON soroban_event
 -- Composite index covering the most common query pattern: events for a
 -- contract filtered by primary topic (e.g. all "transfer" events for token X)
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic_0  ON soroban_events (contract_id, topic_0);
+
+-- Compound index for network-scoped analytics queries (#65, analytics)
+-- Critical for stats/contracts GROUP BY query performance
+CREATE INDEX IF NOT EXISTS idx_soroban_events_network_contract_ledger
+    ON soroban_events (network, contract_id, ledger_sequence DESC);
 
 -- GIN index for arbitrary topic containment queries
 CREATE INDEX IF NOT EXISTS idx_soroban_events_topics_gin        ON soroban_events USING GIN (topics);

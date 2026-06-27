@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { SorobanEventSchema } from "./index.js";
-import type { SorobanEvent, SubscribeToContractParams, Subscription } from "./index.js";
+import type {
+  SorobanEvent,
+  SubscribeToContractParams,
+  Subscription,
+  EventType,
+} from "./index.js";
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 30_000;
@@ -31,12 +36,12 @@ function parseWsMessage(raw: unknown): SorobanEvent | null {
 
   const parsed = SorobanEventSchema.safeParse({
     id: "",
-    contractId: m.contract_id,
-    ledgerSequence: parseInt(m.ledger_sequence, 10),
-    ledgerTimestamp: m.ledger_timestamp,
-    transactionHash: m.transaction_hash,
-    eventIndex: parseInt(m.event_index, 10),
-    eventType: m.event_type,
+    contract_id: m.contract_id,
+    ledger_sequence: parseInt(m.ledger_sequence, 10),
+    ledger_timestamp: m.ledger_timestamp,
+    transaction_hash: m.transaction_hash,
+    event_index: parseInt(m.event_index, 10),
+    event_type: m.event_type,
     topics,
     data: (() => {
       try {
@@ -45,7 +50,7 @@ function parseWsMessage(raw: unknown): SorobanEvent | null {
         return m.data;
       }
     })(),
-    createdAt: m.ledger_timestamp,
+    created_at: m.ledger_timestamp,
   });
 
   return parsed.success ? parsed.data : null;
