@@ -39,7 +39,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features postgres
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: sqlx-cli
+          version: latest
+          features: postgres
+          args: --no-default-features
 
       - name: Run migrations
         run: |
