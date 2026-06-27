@@ -113,12 +113,13 @@ jobs:
         run: npm ci
 
       - name: Generate SDK types
-        run: make generate-sdk-types
+        working-directory: sdk/typescript
+        run: npm run generate:types
 
       - name: Check SDK types are committed
         run: |
           if ! git diff --quiet sdk/typescript/src/api-types.gen.ts; then
-            echo "✗ SDK types are stale. Run 'make generate-sdk-types' and commit."
+            echo "✗ SDK types are stale. Run 'npm run generate:types' in sdk/typescript and commit."
             git diff sdk/typescript/src/api-types.gen.ts
             exit 1
           fi
