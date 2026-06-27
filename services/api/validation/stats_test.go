@@ -26,26 +26,34 @@ func TestValidateQueryStats_ValidParams(t *testing.T) {
 
 func TestValidateQueryStats_InvalidFromLedger_NegativeNumber(t *testing.T) {
 	_, err := ValidateQueryStats("-1", "", "", "")
-	assert.Error(t, err)
-	assert.Equal(t, "from_ledger", err.(*ValidationError).Field)
+	if assert.Error(t, err) {
+		ve := err.(*ValidationError)
+		assert.Equal(t, "from_ledger", ve.Field)
+	}
 }
 
 func TestValidateQueryStats_InvalidToLedger_NotInteger(t *testing.T) {
 	_, err := ValidateQueryStats("", "abc", "", "")
-	assert.Error(t, err)
-	assert.Equal(t, "to_ledger", err.(*ValidationError).Field)
+	if assert.Error(t, err) {
+		ve := err.(*ValidationError)
+		assert.Equal(t, "to_ledger", ve.Field)
+	}
 }
 
 func TestValidateQueryStats_ToLedgerLessThanFromLedger(t *testing.T) {
 	_, err := ValidateQueryStats("5000", "1000", "", "")
-	assert.Error(t, err)
-	assert.Equal(t, "to_ledger", err.(*ValidationError).Field)
+	if assert.Error(t, err) {
+		ve := err.(*ValidationError)
+		assert.Equal(t, "to_ledger", ve.Field)
+	}
 }
 
 func TestValidateQueryStats_InvalidNetwork(t *testing.T) {
 	_, err := ValidateQueryStats("", "", "invalidnet", "")
-	assert.Error(t, err)
-	assert.Equal(t, "network", err.(*ValidationError).Field)
+	if assert.Error(t, err) {
+		ve := err.(*ValidationError)
+		assert.Equal(t, "network", ve.Field)
+	}
 }
 
 func TestValidateQueryStats_NetworkCaseInsensitive(t *testing.T) {
@@ -60,20 +68,26 @@ func TestValidateQueryStats_NetworkCaseInsensitive(t *testing.T) {
 
 func TestValidateQueryStats_InvalidLimit_TooSmall(t *testing.T) {
 	_, err := ValidateQueryStats("", "", "", "0")
-	assert.Error(t, err)
-	assert.Equal(t, "limit", err.(*ValidationError).Field)
+	if assert.Error(t, err) {
+		ve := err.(*ValidationError)
+		assert.Equal(t, "limit", ve.Field)
+	}
 }
 
 func TestValidateQueryStats_InvalidLimit_TooLarge(t *testing.T) {
 	_, err := ValidateQueryStats("", "", "", "101")
-	assert.Error(t, err)
-	assert.Equal(t, "limit", err.(*ValidationError).Field)
+	if assert.Error(t, err) {
+		ve := err.(*ValidationError)
+		assert.Equal(t, "limit", ve.Field)
+	}
 }
 
 func TestValidateQueryStats_InvalidLimit_NotInteger(t *testing.T) {
 	_, err := ValidateQueryStats("", "", "", "abc")
-	assert.Error(t, err)
-	assert.Equal(t, "limit", err.(*ValidationError).Field)
+	if assert.Error(t, err) {
+		ve := err.(*ValidationError)
+		assert.Equal(t, "limit", ve.Field)
+	}
 }
 
 func TestValidateQueryStats_LimitBoundary_Min(t *testing.T) {
