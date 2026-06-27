@@ -27,6 +27,7 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -47,15 +48,14 @@ jobs:
           args: --no-default-features
 
       - name: Run migrations
-        run: |
-          DATABASE_URL=postgres://trident:password@localhost:5432/trident sqlx migrate run
         env:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
+        run: sqlx migrate run
 
       - name: Run sqlx prepare
-        run: cargo sqlx prepare --workspace
         env:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
+        run: cargo sqlx prepare --workspace
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -75,6 +75,7 @@ jobs:
     defaults:
       run:
         working-directory: services/api
+
     steps:
       - uses: actions/checkout@v4
 
@@ -105,6 +106,7 @@ jobs:
     defaults:
       run:
         working-directory: sdk/typescript
+
     steps:
       - uses: actions/checkout@v4
 
@@ -183,6 +185,7 @@ jobs:
   docker:
     name: Docker build
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
