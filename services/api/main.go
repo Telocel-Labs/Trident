@@ -77,13 +77,32 @@ func main() {
 	defer stop()
 	go ws.StartConsumer(ctx, redisClient, hub)
 
+	// Start API-key usage tracker (issue #139). Flushes request_count /
+	// last_used_at to postgres in batches every 5s so auth never blocks.
+	var usageTrack chan<- string
+	var usageStop func()
+	if pool != nil {
+		usageTrack, usageStop = handlers.NewAPIKeyUsageTracker(pool, 5*time.Second)
+		defer usageStop()
+	}
+
+	apiKeyCfg := handlers.APIKeyConfig{
+		AdminKey: os.Getenv("ADMIN_API_KEY"),
+		DB:       pool,
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminConfig()))
+	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
+	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
+	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("/ws", ws.Handler(hub))
+
+	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
 	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
