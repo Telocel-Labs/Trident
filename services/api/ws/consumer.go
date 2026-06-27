@@ -40,7 +40,7 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 	// Create consumer group idempotently: MKSTREAM ensures stream exists.
 	if err := rdb.XGroupCreateMkStream(ctx, streamKey, groupName, "$").Err(); err != nil {
 		// BUSYGROUP means group already exists — ignore.
-		if err.Error() == "BUSYGROUP Consumer Group name already exists" || err == redis.ErrGroupExists {
+		if err.Error() == "BUSYGROUP Consumer Group name already exists" {
 			slog.Info("ws: consumer group already exists, continuing")
 		} else {
 			slog.Error("ws: failed to create consumer group", "err", err)
@@ -149,7 +149,13 @@ func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, consumerNa
 	defer cancel()
 
 	minIdle := 30 * time.Second
-	autoRes, err := rdb.XAutoClaim(ctx2, streamKey, groupName, consumerName, minIdle, "0-0").Result()
+	autoRes, err := rdb.XAutoClaim(ctx2, &redis.XAutoClaimArgs{
+		Stream:   streamKey,
+		Group:    groupName,
+		Consumer: consumerName,
+		MinIdle:  minIdle,
+		Start:    "0-0",
+	}).Result()
 	if err != nil {
 		// If no entries, Redis may return empty result — treat as non-fatal.
 		if err != redis.Nil {

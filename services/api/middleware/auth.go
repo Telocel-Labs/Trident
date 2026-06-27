@@ -52,12 +52,12 @@ func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 
 		key := r.Header.Get("X-API-Key")
 		if key == "" {
-			http.Error(w, , http.StatusUnauthorized)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
 		if _, ok := validHashes[hashKey(key)]; !ok {
-			http.Error(w, , http.StatusUnauthorized)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
