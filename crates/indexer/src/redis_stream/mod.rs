@@ -1,4 +1,4 @@
-use redis::{AsyncCommands, streams::StreamMaxlen};
+use redis::{streams::StreamMaxlen, AsyncCommands};
 use trident_common::{SorobanEvent, TridentError};
 
 const STREAM_KEY: &str = "trident:events";

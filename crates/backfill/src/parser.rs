@@ -1,8 +1,8 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value as Json;
 use stellar_strkey::{ed25519, Contract};
-use stellar_xdr::curr::{AccountId, ContractId, Limited, Limits, PublicKey, ScAddress, ScVal};
+use stellar_xdr::curr::{AccountId, ContractId, Limited, Limits, PublicKey, ReadXdr, ScAddress, ScVal};
 use trident_common::{EventType, SorobanEvent, TridentError};
 
 #[derive(Deserialize, Debug, Clone)]
@@ -94,7 +94,9 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
         "contract" => Ok(EventType::Contract),
         "system" => Ok(EventType::System),
         "diagnostic" => Ok(EventType::Diagnostic),
-        other => Err(TridentError::ParseError(format!("unknown event type: {other}"))),
+        other => Err(TridentError::ParseError(format!(
+            "unknown event type: {other}"
+        ))),
     }
 }
 

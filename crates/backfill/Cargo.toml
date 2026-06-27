@@ -32,6 +32,9 @@ stellar-xdr = { version = "26.0.1", features = ["curr"] }
 stellar-strkey = "0.0.16"
 hex = "0.4"
 
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
 # UUID
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 

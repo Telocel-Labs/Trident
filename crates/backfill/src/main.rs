@@ -7,9 +7,9 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
-mod rpc_client;
-mod parser;
 mod db;
+mod parser;
+mod rpc_client;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,9 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    tracing::info!(from = args.from_ledger, to = args.to_ledger, workers = args.workers, "Starting backfill");
+    tracing::info!(
+        from = args.from_ledger,
+        to = args.to_ledger,
+        workers = args.workers,
+        "Starting backfill"
+    );
 
-    let db = PgPool::connect(&std::env::var("DATABASE_URL")?) .await?;
+    let db = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 
     let total_ledgers = args.to_ledger - args.from_ledger + 1;
     let pb = ProgressBar::new(total_ledgers);
@@ -54,7 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ProgressStyle::with_template("{msg} {bar:40.cyan/blue} {pos}/{len} ({percent}%) {eta}")?
             .progress_chars("=> "),
     );
-    pb.set_message(format!("Backfilling ledgers {}–{}:", args.from_ledger, args.to_ledger));
+    pb.set_message(format!(
+        "Backfilling ledgers {}–{}:",
+        args.from_ledger, args.to_ledger
+    ));
 
     let (tx, mut rx) = mpsc::channel::<(u64, u64)>(args.workers * 2);
 
@@ -71,7 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events_indexed = Arc::new(AtomicU64::new(0));
     let duplicates_skipped = Arc::new(AtomicU64::new(0));
 
-    let rpc = Arc::new(rpc_client::RpcClient::new(std::env::var("STELLAR_RPC_URL")?));
+    let rpc = Arc::new(rpc_client::RpcClient::new(std::env::var(
+        "STELLAR_RPC_URL",
+    )?));
 
     let mut handles = vec![];
     for _ in 0..args.workers {
@@ -122,7 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     events_indexed.fetch_add(1, Ordering::Relaxed);
                                                 }
                                                 Err(_) => {
-                                                    duplicates_skipped.fetch_add(1, Ordering::Relaxed);
+                                                    duplicates_skipped
+                                                        .fetch_add(1, Ordering::Relaxed);
                                                 }
                                             }
                                         }

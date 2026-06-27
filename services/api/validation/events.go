@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // Validation limits for GET /v1/events.
@@ -14,6 +15,13 @@ const (
 	LimitMax     = 200
 	LimitDefault = 50
 )
+
+// validEventTypes holds the accepted values for the ?event_type filter.
+var validEventTypes = map[string]bool{
+	"contract":   true,
+	"system":     true,
+	"diagnostic": true,
+}
 
 // stellarContractRE matches a Stellar contract strkey: C followed by 55
 // uppercase base32 characters (total 56 chars).
@@ -36,25 +44,27 @@ func (e *ValidationError) Error() string {
 
 // QueryEventsParams holds validated parameters for GET /v1/events.
 type QueryEventsParams struct {
-	Limit       int
-	LedgerFrom  *int64
-	LedgerTo    *int64
-	ContractID  string
-	Cursor      string
+	Limit      int
+	LedgerFrom *int64
+	LedgerTo   *int64
+	ContractID string
+	Cursor     string
+	EventType  string // empty = no filter; otherwise "contract", "system", or "diagnostic"
 }
 
 // ValidateQueryEvents parses and validates query-string values for GET /v1/events.
 // It returns populated QueryEventsParams on success, or a *ValidationError on the
 // first validation failure.
 //
-// Validation rules (from issue #42):
+// Validation rules:
 //   - limit:      integer in [1, 200]; defaults to 50 if absent
 //   - ledgerFrom: non-negative integer if present
 //   - ledgerTo:   non-negative integer if present; must be >= ledgerFrom when both present
 //   - contractId: valid Stellar contract strkey (C…, 56 chars) if present
 //   - cursor:     non-empty string if present (opaque; no further validation)
+//   - eventType:  one of "contract", "system", "diagnostic" (case-insensitive) if present
 func ValidateQueryEvents(
-	limitStr, ledgerFromStr, ledgerToStr, contractID, cursor string,
+	limitStr, ledgerFromStr, ledgerToStr, contractID, cursor, eventTypeStr string,
 ) (*QueryEventsParams, *ValidationError) {
 	p := &QueryEventsParams{
 		Limit:      LimitDefault,
@@ -116,6 +126,18 @@ func ValidateQueryEvents(
 
 	// cursor non-empty check (presence already checked by caller via non-empty string)
 	// The query string "cursor=" with no value arrives here as "" and is simply ignored.
+
+	// eventType
+	if eventTypeStr != "" {
+		lower := strings.ToLower(eventTypeStr)
+		if !validEventTypes[lower] {
+			return nil, &ValidationError{
+				Field:   "event_type",
+				Message: "must be one of: contract, system, diagnostic",
+			}
+		}
+		p.EventType = lower
+	}
 
 	return p, nil
 }

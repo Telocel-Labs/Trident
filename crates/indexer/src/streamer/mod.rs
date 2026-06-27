@@ -218,7 +218,12 @@ impl Streamer {
                             }
                         }
                         db::insert_event(&self.db, &event).await?;
-                        redis_stream::publish_event(&mut self.redis, &event, self.config.redis_stream_maxlen).await?;
+                        redis_stream::publish_event(
+                            &mut self.redis,
+                            &event,
+                            self.config.redis_stream_maxlen,
+                        )
+                        .await?;
                         total += 1;
                         events_in_page += 1;
                     }
