@@ -1,7 +1,11 @@
+import { z } from "zod";
+
 export type TridentErrorCode =
   | "NOT_FOUND"
   | "UNAUTHORIZED"
   | "RATE_LIMITED"
+  | "INVALID_ARGUMENT"
+  | "TIMEOUT"
   | "INTERNAL";
 
 export class TridentError extends Error {
@@ -16,7 +20,48 @@ export class TridentError extends Error {
   }
 }
 
-/** Map an HTTP status code to a TridentError. */
+/**
+ * Structured error thrown by SDK methods on all non-2xx API responses.
+ * Carries the HTTP status code, machine-readable error code, human-readable
+ * message, and the optional field that caused a validation failure.
+ */
+export class TridentApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly field?: string;
+
+  constructor(status: number, code: string, message: string, field?: string) {
+    super(message);
+    this.name = "TridentApiError";
+    this.status = status;
+    this.code = code;
+    this.field = field;
+  }
+}
+
+const ApiErrorEnvelopeSchema = z.object({
+  error: z.object({
+    code: z.string(),
+    message: z.string(),
+    field: z.string().optional(),
+  }),
+});
+
+/**
+ * Parse a non-2xx response body into a TridentApiError.
+ * Falls back to code="INTERNAL" when the body is not a valid error envelope.
+ */
+export function parseApiError(status: number, body: string): TridentApiError {
+  try {
+    const parsed = ApiErrorEnvelopeSchema.parse(JSON.parse(body));
+    const { code, message, field } = parsed.error;
+    return new TridentApiError(status, code, message, field);
+  } catch {
+    return new TridentApiError(status, "INTERNAL", body || `HTTP ${status}`);
+  }
+}
+
+/** @deprecated Use parseApiError for structured errors from the API. */
 export function httpStatusToError(
   status: number,
   body: string,

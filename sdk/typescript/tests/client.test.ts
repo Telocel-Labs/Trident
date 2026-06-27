@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TridentClient, TridentError } from "../src/index.js";
+import { TridentApiError, TridentClient, TridentError } from "../src/index.js";
 
 const BASE_URL = "http://localhost:3000";
 const API_KEY = "test-key";
@@ -32,6 +32,16 @@ function mockFetch(
     status,
     json: () => Promise.resolve(body),
     text: () => Promise.resolve(String(body)),
+  });
+}
+
+function mockApiErrorFetch(status: number, code: string, message: string, field?: string) {
+  const body = JSON.stringify({ error: { code, message, ...(field ? { field } : {}) } });
+  return vi.fn().mockResolvedValue({
+    ok: false,
+    status,
+    text: () => Promise.resolve(body),
+    json: () => Promise.resolve({}),
   });
 }
 
@@ -119,20 +129,22 @@ describe("queryEvents", () => {
     expect(url).toContain(`cursor=${cursor1}`);
   });
 
-  it("throws TridentError(UNAUTHORIZED) on 401", async () => {
-    vi.stubGlobal("fetch", mockFetch("Unauthorized", 401));
+  it("throws TridentApiError on 401 with status and code", async () => {
+    vi.stubGlobal("fetch", mockApiErrorFetch(401, "UNAUTHORIZED", "Unauthorized"));
 
-    await expect(client.queryEvents({})).rejects.toMatchObject({
-      code: "UNAUTHORIZED",
-    });
+    const err = await client.queryEvents({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TridentApiError);
+    expect((err as TridentApiError).status).toBe(401);
+    expect((err as TridentApiError).code).toBe("UNAUTHORIZED");
   });
 
-  it("throws TridentError(RATE_LIMITED) on 429", async () => {
-    vi.stubGlobal("fetch", mockFetch("Too many requests", 429));
+  it("throws TridentApiError on 429", async () => {
+    vi.stubGlobal("fetch", mockApiErrorFetch(429, "RATE_LIMITED", "Too many requests"));
 
-    await expect(client.queryEvents({})).rejects.toMatchObject({
-      code: "RATE_LIMITED",
-    });
+    const err = await client.queryEvents({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TridentApiError);
+    expect((err as TridentApiError).status).toBe(429);
+    expect((err as TridentApiError).code).toBe("RATE_LIMITED");
   });
 });
 
@@ -152,28 +164,171 @@ describe("getEventById", () => {
     expect(event).toBeInstanceOf(Object);
   });
 
-  it("throws TridentError(NOT_FOUND) on 404", async () => {
-    vi.stubGlobal("fetch", mockFetch("Not found", 404));
-
-    await expect(
-      client.getEventById({ id: "00000000-0000-0000-0000-000000000099" }),
-    ).rejects.toMatchObject({
-      code: "NOT_FOUND",
-    });
+  it("throws TridentApiError(NOT_FOUND) on 404", async () => {
+    vi.stubGlobal("fetch", mockApiErrorFetch(404, "NOT_FOUND", "Not found"));
 
     const err = await client
       .getEventById({ id: "00000000-0000-0000-0000-000000000099" })
       .catch((e: unknown) => e);
 
-    expect(err).toBeInstanceOf(TridentError);
-    expect((err as TridentError).code).toBe("NOT_FOUND");
+    expect(err).toBeInstanceOf(TridentApiError);
+    expect((err as TridentApiError).status).toBe(404);
+    expect((err as TridentApiError).code).toBe("NOT_FOUND");
   });
 
-  it("throws TridentError(UNAUTHORIZED) on 401", async () => {
-    vi.stubGlobal("fetch", mockFetch("Unauthorized", 401));
+  it("throws TridentApiError(UNAUTHORIZED) on 401", async () => {
+    vi.stubGlobal("fetch", mockApiErrorFetch(401, "UNAUTHORIZED", "Unauthorized"));
 
-    await expect(
-      client.getEventById({ id: "some-id" }),
-    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    const err = await client
+      .getEventById({ id: "some-id" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TridentApiError);
+    expect((err as TridentApiError).status).toBe(401);
+    expect((err as TridentApiError).code).toBe("UNAUTHORIZED");
+  });
+});
+
+// ── TridentApiError envelope parsing (#133) ───────────────────────────────────
+
+describe("TridentApiError", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("parses structured error envelope — 422 with field", async () => {
+    vi.stubGlobal("fetch", mockApiErrorFetch(422, "INVALID_ARGUMENT", "bad cursor", "cursor"));
+
+    const err = await client.queryEvents({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TridentApiError);
+    expect((err as TridentApiError).status).toBe(422);
+    expect((err as TridentApiError).code).toBe("INVALID_ARGUMENT");
+    expect((err as TridentApiError).field).toBe("cursor");
+    expect((err as TridentApiError).message).toBe("bad cursor");
+  });
+
+  it("parses structured error envelope — 500", async () => {
+    vi.stubGlobal("fetch", mockApiErrorFetch(500, "INTERNAL", "unexpected error"));
+
+    const err = await client.queryEvents({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TridentApiError);
+    expect((err as TridentApiError).status).toBe(500);
+    expect((err as TridentApiError).code).toBe("INTERNAL");
+  });
+
+  it("falls back to INTERNAL when body is not JSON", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: () => Promise.resolve("<html>Service Unavailable</html>"),
+      json: () => Promise.reject(new Error("not json")),
+    }));
+
+    const err = await client.queryEvents({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TridentApiError);
+    expect((err as TridentApiError).status).toBe(503);
+    expect((err as TridentApiError).code).toBe("INTERNAL");
+  });
+
+  it("instanceof TridentApiError works correctly", async () => {
+    vi.stubGlobal("fetch", mockApiErrorFetch(401, "UNAUTHORIZED", "bad key"));
+
+    const err = await client.queryEvents({}).catch((e: unknown) => e);
+    expect(err instanceof TridentApiError).toBe(true);
+  });
+});
+
+// ── event_type URL param (#157) ───────────────────────────────────────────────
+
+describe("queryEvents event_type param", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", mockFetch({ events: [], next_cursor: "", has_more: false }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("includes event_type in URL when provided", async () => {
+    await client.queryEvents({ eventType: "contract" });
+
+    const [url] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("event_type=contract");
+  });
+
+  it("omits event_type from URL when not provided", async () => {
+    await client.queryEvents({});
+
+    const [url] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain("event_type");
+  });
+});
+
+// ── subscribeToContract topic0 (#142) ────────────────────────────────────────
+
+describe("subscribeToContract", () => {
+  it("includes topic0 in WebSocket URL when provided", () => {
+    let capturedUrl = "";
+    const MockWS = class {
+      constructor(url: string) { capturedUrl = url; }
+      onopen = null; onmessage = null; onerror = null; onclose = null;
+      close() {}
+    };
+    vi.stubGlobal("WebSocket", MockWS);
+
+    client.subscribeToContract({
+      contractId: "CTEST",
+      topic0: "transfer",
+      onEvent: () => {},
+    });
+
+    expect(capturedUrl).toContain("contractId=CTEST");
+    expect(capturedUrl).toContain("topic0=transfer");
+    vi.unstubAllGlobals();
+  });
+
+  it("omits topic0 from URL when not provided", () => {
+    let capturedUrl = "";
+    const MockWS = class {
+      constructor(url: string) { capturedUrl = url; }
+      onopen = null; onmessage = null; onerror = null; onclose = null;
+      close() {}
+    };
+    vi.stubGlobal("WebSocket", MockWS);
+
+    client.subscribeToContract({ contractId: "CTEST", onEvent: () => {} });
+
+    expect(capturedUrl).toContain("contractId=CTEST");
+    expect(capturedUrl).not.toContain("topic0");
+    vi.unstubAllGlobals();
+  });
+
+  it("URL-encodes special characters in topic0", () => {
+    let capturedUrl = "";
+    const MockWS = class {
+      constructor(url: string) { capturedUrl = url; }
+      onopen = null; onmessage = null; onerror = null; onclose = null;
+      close() {}
+    };
+    vi.stubGlobal("WebSocket", MockWS);
+
+    client.subscribeToContract({
+      contractId: "CTEST",
+      topic0: "transfer/swap",
+      onEvent: () => {},
+    });
+
+    expect(capturedUrl).toContain("topic0=transfer%2Fswap");
+    vi.unstubAllGlobals();
+  });
+
+  it("throws TridentApiError(INVALID_ARGUMENT) for empty topic0", () => {
+    expect(() =>
+      client.subscribeToContract({ contractId: "CTEST", topic0: "", onEvent: () => {} }),
+    ).toThrow(TridentApiError);
+
+    expect(() =>
+      client.subscribeToContract({ contractId: "CTEST", topic0: "", onEvent: () => {} }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
   });
 });
