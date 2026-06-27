@@ -51,8 +51,13 @@ tokio-retry = "0.3"
 # CancellationToken for graceful shutdown
 tokio-util = "0.7"
 
+# Prometheus /metrics endpoint
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
 [dev-dependencies]
 # Mock HTTP server for RPC integration tests
 wiremock = "0.6"
 # Database integration tests
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "uuid", "chrono", "json", "macros"] }
+metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }

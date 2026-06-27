@@ -9,7 +9,7 @@ import (
 // ── ValidateQueryEvents ───────────────────────────────────────────────────────
 
 func TestValidateQueryEvents_Defaults(t *testing.T) {
-	p, err := validation.ValidateQueryEvents("", "", "", "", "")
+	p, err := validation.ValidateQueryEvents("", "", "", "", "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -19,6 +19,9 @@ func TestValidateQueryEvents_Defaults(t *testing.T) {
 	if p.LedgerFrom != nil || p.LedgerTo != nil {
 		t.Error("want nil ledger bounds when not provided")
 	}
+	if p.EventType != "" {
+		t.Errorf("want empty EventType when not provided, got %q", p.EventType)
+	}
 }
 
 func TestValidateQueryEvents_ValidLimit(t *testing.T) {
@@ -27,7 +30,7 @@ func TestValidateQueryEvents_ValidLimit(t *testing.T) {
 		{"50", 50},
 		{"200", 200},
 	} {
-		p, err := validation.ValidateQueryEvents(tc.input, "", "", "", "")
+		p, err := validation.ValidateQueryEvents(tc.input, "", "", "", "", "")
 		if err != nil {
 			t.Errorf("limit=%q: unexpected error: %v", tc.input, err)
 			continue
@@ -40,7 +43,7 @@ func TestValidateQueryEvents_ValidLimit(t *testing.T) {
 
 func TestValidateQueryEvents_InvalidLimit(t *testing.T) {
 	for _, bad := range []string{"0", "201", "-1", "abc", "1.5"} {
-		_, err := validation.ValidateQueryEvents(bad, "", "", "", "")
+		_, err := validation.ValidateQueryEvents(bad, "", "", "", "", "")
 		if err == nil {
 			t.Errorf("limit=%q: expected validation error", bad)
 		} else if err.Field != "limit" {
@@ -50,7 +53,7 @@ func TestValidateQueryEvents_InvalidLimit(t *testing.T) {
 }
 
 func TestValidateQueryEvents_ValidLedgerRange(t *testing.T) {
-	p, err := validation.ValidateQueryEvents("", "100", "200", "", "")
+	p, err := validation.ValidateQueryEvents("", "100", "200", "", "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -60,7 +63,7 @@ func TestValidateQueryEvents_ValidLedgerRange(t *testing.T) {
 }
 
 func TestValidateQueryEvents_LedgerFromGreaterThanLedgerTo(t *testing.T) {
-	_, err := validation.ValidateQueryEvents("", "500", "100", "", "")
+	_, err := validation.ValidateQueryEvents("", "500", "100", "", "", "")
 	if err == nil {
 		t.Fatal("expected validation error for ledgerFrom > ledgerTo")
 	}
@@ -70,11 +73,11 @@ func TestValidateQueryEvents_LedgerFromGreaterThanLedgerTo(t *testing.T) {
 }
 
 func TestValidateQueryEvents_NegativeLedger(t *testing.T) {
-	for field, args := range map[string][5]string{
-		"ledgerFrom": {"", "-1", "", "", ""},
-		"ledgerTo":   {"", "", "-5", "", ""},
+	for field, args := range map[string][6]string{
+		"ledgerFrom": {"", "-1", "", "", "", ""},
+		"ledgerTo":   {"", "", "-5", "", "", ""},
 	} {
-		_, err := validation.ValidateQueryEvents(args[0], args[1], args[2], args[3], args[4])
+		_, err := validation.ValidateQueryEvents(args[0], args[1], args[2], args[3], args[4], args[5])
 		if err == nil {
 			t.Errorf("%s: expected error for negative value", field)
 		} else if err.Field != field {
@@ -86,7 +89,7 @@ func TestValidateQueryEvents_NegativeLedger(t *testing.T) {
 func TestValidateQueryEvents_ValidContractID(t *testing.T) {
 	// 56-char strkey starting with C
 	validID := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
-	_, err := validation.ValidateQueryEvents("", "", "", validID, "")
+	_, err := validation.ValidateQueryEvents("", "", "", validID, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error for valid contractId: %v", err)
 	}
@@ -99,7 +102,7 @@ func TestValidateQueryEvents_InvalidContractID(t *testing.T) {
 		"C123",        // too short
 		"cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // lowercase c
 	} {
-		_, err := validation.ValidateQueryEvents("", "", "", bad, "")
+		_, err := validation.ValidateQueryEvents("", "", "", bad, "", "")
 		if err == nil {
 			t.Errorf("contractId=%q: expected validation error", bad)
 		} else if err.Field != "contractId" {
@@ -110,7 +113,7 @@ func TestValidateQueryEvents_InvalidContractID(t *testing.T) {
 
 func TestValidateQueryEvents_ValidInputsPassThrough(t *testing.T) {
 	contractID := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
-	p, err := validation.ValidateQueryEvents("10", "1", "100", contractID, "some-cursor")
+	p, err := validation.ValidateQueryEvents("10", "1", "100", contractID, "some-cursor", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -122,6 +125,52 @@ func TestValidateQueryEvents_ValidInputsPassThrough(t *testing.T) {
 	}
 	if p.Cursor != "some-cursor" {
 		t.Errorf("cursor not forwarded")
+	}
+}
+
+// ── event_type (#157) ─────────────────────────────────────────────────────────
+
+func TestValidateQueryEvents_ValidEventType(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  string
+	}{
+		{"contract", "contract"},
+		{"system", "system"},
+		{"diagnostic", "diagnostic"},
+		{"CONTRACT", "contract"},
+		{"SYSTEM", "system"},
+		{"Diagnostic", "diagnostic"},
+	} {
+		p, err := validation.ValidateQueryEvents("", "", "", "", "", tc.input)
+		if err != nil {
+			t.Errorf("event_type=%q: unexpected error: %v", tc.input, err)
+			continue
+		}
+		if p.EventType != tc.want {
+			t.Errorf("event_type=%q: want %q, got %q", tc.input, tc.want, p.EventType)
+		}
+	}
+}
+
+func TestValidateQueryEvents_InvalidEventType(t *testing.T) {
+	for _, bad := range []string{"unknown", "transfer", "CONTRACT_EVENT", "sys"} {
+		_, err := validation.ValidateQueryEvents("", "", "", "", "", bad)
+		if err == nil {
+			t.Errorf("event_type=%q: expected validation error", bad)
+		} else if err.Field != "event_type" {
+			t.Errorf("event_type=%q: wrong field %q", bad, err.Field)
+		}
+	}
+}
+
+func TestValidateQueryEvents_AbsentEventTypeReturnsAll(t *testing.T) {
+	p, err := validation.ValidateQueryEvents("", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.EventType != "" {
+		t.Errorf("want empty EventType when absent, got %q", p.EventType)
 	}
 }
 

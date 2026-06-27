@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod db;
+mod metrics;
 mod parser;
 mod redis_stream;
 mod rpc;
@@ -20,6 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{e}");
         std::process::exit(1);
     });
+
+    metrics::install(cfg.metrics_port)?;
 
     let db_pool = db::connect_pool(&cfg.database_url, cfg.db_pool_size).await?;
     tracing::info!(pool_size = cfg.db_pool_size, "Database connected via pool");

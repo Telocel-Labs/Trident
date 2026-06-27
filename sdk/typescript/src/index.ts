@@ -1,8 +1,8 @@
 import { z } from "zod";
-import { httpStatusToError, TridentError } from "./errors.js";
+import { parseApiError, TridentApiError, TridentError } from "./errors.js";
 import { createSubscription } from "./subscription.js";
 
-export { TridentError } from "./errors.js";
+export { TridentError, TridentApiError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
 
 // ---------------------------------------------------------------------------
@@ -50,6 +50,7 @@ export interface QueryEventsParams {
   ledgerTo?: number;
   after?: string;
   limit?: number;
+  eventType?: "contract" | "system" | "diagnostic";
 }
 
 export interface GetEventByIdParams {
@@ -150,7 +151,7 @@ export class TridentClient {
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw httpStatusToError(res.status, body);
+      throw parseApiError(res.status, body);
     }
 
     const json: unknown = await res.json().catch((cause: unknown) => {
@@ -177,6 +178,7 @@ export class TridentClient {
       qs.set("ledgerTo", String(params.ledgerTo));
     if (params.after) qs.set("cursor", params.after);
     if (params.limit !== undefined) qs.set("limit", String(params.limit));
+    if (params.eventType) qs.set("event_type", params.eventType);
 
     const url = `${this.config.apiUrl}/v1/events?${qs.toString()}`;
     const resp = await this.fetchJSON(url, ApiListEventsResponseSchema);
@@ -208,6 +210,14 @@ export class TridentClient {
    * closes the socket and cancels any pending reconnect.
    */
   subscribeToContract(params: SubscribeToContractParams): Subscription {
+    if (params.topic0 !== undefined && params.topic0 === "") {
+      throw new TridentApiError(
+        400,
+        "INVALID_ARGUMENT",
+        "topic0 must not be an empty string; omit the field to receive all events",
+      );
+    }
+
     const wsBase = this.config.apiUrl
       .replace(/^https:\/\//, "wss://")
       .replace(/^http:\/\//, "ws://");

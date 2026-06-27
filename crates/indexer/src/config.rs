@@ -12,6 +12,7 @@ pub struct Config {
     pub index_diagnostic: bool,
     pub max_events_per_poll: u32,
     pub redis_stream_maxlen: u64,
+    pub metrics_port: u16,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -55,6 +56,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10_000),
+            metrics_port: std::env::var("METRICS_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9090),
         })
     }
 }

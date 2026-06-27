@@ -70,8 +70,8 @@ services:
 
   indexer:
     build:
-      context: ../crates/indexer
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: crates/indexer/Dockerfile
     environment:
       # Route through PgBouncer, never postgres:5432 directly.
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
@@ -81,7 +81,16 @@ services:
       NETWORK: ${NETWORK}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
+      METRICS_PORT: ${METRICS_PORT}
       LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "${METRICS_PORT}:${METRICS_PORT}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${METRICS_PORT}/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
       pgbouncer:
         condition: service_started

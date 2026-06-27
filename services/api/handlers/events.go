@@ -59,6 +59,7 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		q.Get("ledgerTo"),
 		q.Get("contractId"),
 		q.Get("cursor"),
+		q.Get("event_type"),
 	)
 	if verr != nil {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
