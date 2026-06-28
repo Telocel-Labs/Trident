@@ -1,8 +1,10 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
+﻿use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::Value as Json;
 use stellar_strkey::{ed25519, Contract};
-use stellar_xdr::curr::{AccountId, ContractId, Limited, Limits, PublicKey, ReadXdr, ScAddress, ScVal};
+use stellar_xdr::curr::{
+    AccountId, ContractId, Limited, Limits, PublicKey, ReadXdr, ScAddress, ScVal,
+};
 use trident_common::{EventType, SorobanEvent, TridentError};
 
 #[derive(Deserialize, Debug, Clone)]
@@ -27,6 +29,7 @@ pub struct RawEvent {
 
 pub struct EventsPage {
     pub events: Vec<RawEvent>,
+    #[allow(dead_code)]
     pub latest_ledger: u64,
 }
 

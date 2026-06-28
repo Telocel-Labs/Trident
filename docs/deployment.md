@@ -1,4 +1,4 @@
-# Trident Production Deployment Runbook
+﻿# Trident Production Deployment Runbook
 
 Trident is a Stellar blockchain event indexer. The production stack runs four services under Docker Compose: `postgres`, `redis`, `indexer` (Rust), and `api` (Go), with `nginx` providing TLS termination via a prod overlay.
 
@@ -377,4 +377,137 @@ no `too many connections` errors with p99 latency under 500ms.
 
 ```bash
 BASE_URL=http://localhost:3000 k6 run load-tests/pgbouncer-validation.js
+```
+
+---
+
+## Fly.io Deployment
+
+Trident can be deployed to [Fly.io](https://fly.io) as three separate apps sharing a private network (6PN). Configuration files live in `fly/`.
+
+### Prerequisites
+
+- [flyctl](https://fly.io/docs/flyctl/installing/) installed and authenticated (`fly auth login`)
+- A Fly.io organization with Fly Postgres and Fly Redis provisioned
+
+### App topology
+
+| App name | Config | Description |
+|---|---|---|
+| `trident-grpc-api` | `fly/grpc-api.toml` | Rust gRPC API — event query backend |
+| `trident-indexer` | `fly/indexer.toml` | Rust Stellar event indexer |
+| `trident-api` | `fly/api.toml` | Go REST API — public-facing |
+
+Services communicate over Fly's private 6PN network:
+- Go API → gRPC API at `trident-grpc-api.internal:50051`
+- Indexer → database and Redis directly (no external exposure needed)
+
+### First-time setup
+
+#### 1. Create the Fly apps
+
+```bash
+fly apps create trident-grpc-api
+fly apps create trident-indexer
+fly apps create trident-api
+```
+
+#### 2. Provision Fly Postgres
+
+```bash
+fly postgres create --name trident-db --region iad
+fly postgres attach trident-db -a trident-grpc-api
+fly postgres attach trident-db -a trident-indexer
+fly postgres attach trident-db -a trident-api
+```
+
+`fly postgres attach` automatically sets `DATABASE_URL` as a secret on each app.
+
+#### 3. Provision Fly Redis
+
+```bash
+fly redis create --name trident-redis --region iad
+```
+
+Note the Redis URL from the output, then set it on the apps that need it:
+
+```bash
+fly secrets set -a trident-indexer REDIS_URL="redis://..."
+fly secrets set -a trident-api     REDIS_URL="redis://..."
+```
+
+#### 4. Set required secrets
+
+**gRPC API** (`trident-grpc-api`):
+```bash
+# DATABASE_URL already set by postgres attach
+```
+
+**Indexer** (`trident-indexer`):
+```bash
+fly secrets set -a trident-indexer \
+  STELLAR_RPC_URL="https://soroban-testnet.stellar.org" \
+  NETWORK="testnet"
+```
+
+**Go REST API** (`trident-api`):
+```bash
+fly secrets set -a trident-api \
+  API_KEY_SALT="$(openssl rand -hex 32)" \
+  ADMIN_API_KEY="$(openssl rand -hex 32)"
+```
+
+#### 5. Run database migrations
+
+Attach to a temporary machine in the Trident private network and run migrations directly against Postgres (not through PgBouncer):
+
+```bash
+fly ssh console -a trident-grpc-api -C \
+  "psql \$DATABASE_URL -f /path/to/migrations/0001_init.sql"
+```
+
+Or use a local `psql` with the direct Postgres URL (bypassing PgBouncer).
+
+#### 6. Deploy
+
+```bash
+make deploy
+```
+
+This deploys in dependency order: gRPC API → Indexer → Go REST API.
+
+To deploy a single service:
+
+```bash
+fly deploy -c fly/grpc-api.toml --remote-only
+fly deploy -c fly/indexer.toml --remote-only
+fly deploy -c fly/api.toml     --remote-only
+```
+
+### Scaling
+
+```bash
+fly scale count 2 -a trident-api       # scale Go API to 2 instances
+fly scale vm shared-cpu-2x -a trident-indexer  # upgrade indexer VM
+```
+
+### Monitoring
+
+- **Indexer metrics**: accessible on the 6PN at `trident-indexer.internal:9090/metrics`
+- **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
+- **Health check**: `GET /v1/health` (used by Fly's HTTP service check)
+
+### Updating secrets
+
+```bash
+fly secrets set -a <app-name> KEY=new_value
+```
+
+Fly automatically redeploys the app when secrets change.
+
+### Rollback
+
+```bash
+fly releases -a trident-api          # list releases
+fly deploy --image-label <version> -a trident-api  # roll back to a specific release
 ```

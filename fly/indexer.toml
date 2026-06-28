@@ -1,0 +1,33 @@
+﻿# fly/indexer.toml — Trident Stellar event indexer (Rust)
+app = "trident-indexer"
+primary_region = "iad"
+
+[build]
+  dockerfile = "crates/indexer/Dockerfile"
+
+[env]
+  POLL_INTERVAL_MS  = "5000"
+  INDEX_DIAGNOSTIC  = "false"
+  METRICS_PORT      = "9090"
+  LOG_LEVEL         = "info"
+
+# Secrets (set via: fly secrets set -a trident-indexer KEY=value)
+# Required: DATABASE_URL, REDIS_URL, STELLAR_RPC_URL, NETWORK
+
+# No public HTTP — indexer is a worker process.
+# Prometheus metrics are available on the private network only.
+[[services]]
+  protocol      = "tcp"
+  internal_port = 9090
+
+  [[services.ports]]
+    port = 9090
+
+  [[services.tcp_checks]]
+    interval     = "15s"
+    timeout      = "2s"
+    grace_period = "30s"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "512mb"

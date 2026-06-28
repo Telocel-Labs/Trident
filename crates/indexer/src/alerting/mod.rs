@@ -1,4 +1,4 @@
-//! # Alerting
+﻿//! # Alerting
 //!
 //! Fires an outbound webhook when the indexer falls behind the chain tip by
 //! more than `ALERT_LAG_THRESHOLD` ledgers, and sends a recovery webhook when
@@ -70,7 +70,7 @@ struct RecoveryPayload {
 
 /// The alerting subsystem. Constructed once in `main` and passed to
 /// `Streamer`. When `webhook_url` is `None` every method is a no-op.
- pub struct Alerter {
+pub struct Alerter {
     webhook_url: Option<String>,
     #[allow(dead_code)]
     lag_threshold: u64,
@@ -93,9 +93,7 @@ impl Alerter {
                 reqwest::Client::builder()
                     .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECS))
                     .build()
-                    .map_err(|e| {
-                        TridentError::ConfigError(format!("alerting HTTP client: {e}"))
-                    })?,
+                    .map_err(|e| TridentError::ConfigError(format!("alerting HTTP client: {e}")))?,
             )
         } else {
             None
@@ -122,18 +120,12 @@ impl Alerter {
     ///
     /// Never returns an error — failures are logged at WARN level so the poll
     /// cycle is never affected.
-    pub async fn evaluate(
-        &self,
-        ctx: &AlertContext,
-        state: &mut AlertState,
-    ) {
+    pub async fn evaluate(&self, ctx: &AlertContext, state: &mut AlertState) {
         if self.webhook_url.is_none() {
             return;
         }
 
-        let lag = ctx
-            .chain_tip_ledger
-            .saturating_sub(ctx.last_ledger_indexed);
+        let lag = ctx.chain_tip_ledger.saturating_sub(ctx.last_ledger_indexed);
 
         if lag > ctx.lag_threshold {
             self.maybe_fire_alert(ctx, state, lag).await;
@@ -143,12 +135,7 @@ impl Alerter {
     }
 
     /// Fire an alert if outside the cooldown window.
-    async fn maybe_fire_alert(
-        &self,
-        ctx: &AlertContext,
-        state: &mut AlertState,
-        lag: u64,
-    ) {
+    async fn maybe_fire_alert(&self, ctx: &AlertContext, state: &mut AlertState, lag: u64) {
         let now = Utc::now();
 
         // Cooldown check: suppress if we fired recently.
@@ -192,21 +179,13 @@ impl Alerter {
     }
 
     /// Send a recovery webhook if we previously fired an alert.
-    async fn maybe_resolve(
-        &self,
-        ctx: &AlertContext,
-        state: &mut AlertState,
-        lag: u64,
-    ) {
+    async fn maybe_resolve(&self, ctx: &AlertContext, state: &mut AlertState, lag: u64) {
         if !state.alert_fired {
             return;
         }
 
         let timestamp = Utc::now().to_rfc3339();
-        let message = format!(
-            "Trident indexer has recovered. Lag is now {} ledgers.",
-            lag
-        );
+        let message = format!("Trident indexer has recovered. Lag is now {} ledgers.", lag);
 
         let payload = RecoveryPayload {
             alert: "indexer_lag_resolved",
@@ -280,12 +259,7 @@ mod tests {
     use chrono::Duration as CDuration;
 
     fn make_alerter(url: Option<&str>, threshold: u64, cooldown_minutes: u64) -> Alerter {
-        Alerter::from_config(
-            url.map(|s| s.to_string()),
-            threshold,
-            cooldown_minutes,
-        )
-        .unwrap()
+        Alerter::from_config(url.map(|s| s.to_string()), threshold, cooldown_minutes).unwrap()
     }
 
     fn make_ctx(last_indexed: u64, chain_tip: u64, threshold: u64) -> AlertContext {
@@ -462,7 +436,10 @@ mod tests {
         alerter.evaluate(&ctx, &mut state).await;
 
         // Delivery failed — state must not be updated.
-        assert!(!state.alert_fired, "state must not change on failed delivery");
+        assert!(
+            !state.alert_fired,
+            "state must not change on failed delivery"
+        );
         assert!(state.last_alert_at.is_none());
     }
 

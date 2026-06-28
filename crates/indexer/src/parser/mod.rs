@@ -21,6 +21,8 @@ use trident_common::{EventType, SorobanEvent, TridentError};
 
 use crate::rpc::RawEvent;
 
+pub mod token_events;
+
 pub struct Parser {
     pub index_diagnostic: bool,
 }
@@ -101,7 +103,7 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
     }
 }
 
-fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
+pub(crate) fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
     let bytes = STANDARD
         .decode(b64)
         .map_err(|e| TridentError::ParseError(format!("base64 decode: {e}")))?;
@@ -188,7 +190,7 @@ pub fn scval_to_json(val: &ScVal) -> Json {
     }
 }
 
-fn scaddress_to_string(addr: &ScAddress) -> String {
+pub(crate) fn scaddress_to_string(addr: &ScAddress) -> String {
     match addr {
         ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(bytes))) => {
             // stellar-strkey 0.0.16+ returns heapless::String — convert to std::String

@@ -1,9 +1,9 @@
-use clap::Parser;
+﻿use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
@@ -64,10 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.from_ledger, args.to_ledger
     ));
 
-    let (tx, mut rx) = mpsc::channel::<(u64, u64)>(args.workers * 2);
+    let (tx, rx) = mpsc::channel::<(u64, u64)>(args.workers * 2);
 
     // Split range into chunks for workers
-    let chunk_size = (total_ledgers as usize + args.workers - 1) / args.workers;
+    let chunk_size = (total_ledgers as usize).div_ceil(args.workers);
     let mut start = args.from_ledger;
     while start <= args.to_ledger {
         let end = std::cmp::min(start + chunk_size as u64 - 1, args.to_ledger);
@@ -83,14 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "STELLAR_RPC_URL",
     )?));
 
+    let rx = Arc::new(Mutex::new(rx));
     let mut handles = vec![];
-    for _ in 0..args.workers {
-        let mut rx = rx.recv();
-    }
 
     // Spawn worker tasks
     for _ in 0..args.workers {
-        let mut rx = rx.clone();
+        let rx = Arc::clone(&rx);
         let rpc = rpc.clone();
         let db = db.clone();
         let parser = parser::Parser::new(false);
@@ -102,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rpc_delay = args.rpc_delay_ms;
 
         let handle = tokio::spawn(async move {
-            while let Some((s, e)) = rx.recv().await {
+            while let Some((s, e)) = rx.lock().await.recv().await {
                 tracing::info!(start = s, end = e, "Worker got range");
                 let mut page_cursor: Option<String> = None;
                 let mut seq = s;
@@ -112,8 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if page.events.is_empty() {
                                 break;
                             }
-                            for raw in page.events {
-                                match parser.parse_event(&raw) {
+                            for raw in &page.events {
+                                match parser.parse_event(raw) {
                                     Ok(Some(ev)) => {
                                         if let Some(ref c) = contract {
                                             if &ev.contract_id != c {
@@ -147,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(last) = page.events.last() {
                                 if let Ok(last_seq) = last.ledger.parse::<u64>() {
                                     seq = last_seq + 1;
-                                    pb.inc((last_seq - s + 1) as u64);
+                                    pb.inc(last_seq - s + 1);
                                 } else {
                                     seq += 1;
                                     pb.inc(1);

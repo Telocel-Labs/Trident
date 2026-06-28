@@ -46,7 +46,7 @@ impl Config {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-            let alert_webhook_url = std::env::var("ALERT_WEBHOOK_URL")
+        let alert_webhook_url = std::env::var("ALERT_WEBHOOK_URL")
             .ok()
             .filter(|s| !s.is_empty());
         let alert_lag_threshold = parse_bounded_u64("ALERT_LAG_THRESHOLD", 200, 1, 1_000_000)?;

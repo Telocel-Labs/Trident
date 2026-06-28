@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/Depo-dev/trident/services/api/middleware"
 )
@@ -97,17 +99,21 @@ func TestAuth_InvalidKey(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRateLimit_ExceedBurst_Returns429(t *testing.T) {
-	os.Setenv("RATE_LIMIT_RPS", "1")
-	os.Setenv("RATE_LIMIT_BURST", "2")
-	t.Cleanup(func() {
-		os.Unsetenv("RATE_LIMIT_RPS")
-		os.Unsetenv("RATE_LIMIT_BURST")
-	})
+	calls := 0
+	sliderFn := func(_ context.Context, _ string, limit, _ int64) (bool, int64, error) {
+		calls++
+		if calls > 2 {
+			return false, 0, nil
+		}
+		return true, limit - int64(calls), nil
+	}
+	cfg := middleware.RateLimitConfig{
+		SliderFn: sliderFn,
+		Tiers:    map[string]middleware.TierConfig{"free": {RPS: 2, Window: time.Second}},
+	}
+	h := middleware.TieredRateLimit(cfg)(noop)
 
-	// RateLimit reads env at construction time.
 	const key = "burst-test-key"
-	h := middleware.RateLimit(noop)
-
 	got429 := false
 	for i := 0; i < 10; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
@@ -122,7 +128,6 @@ func TestRateLimit_ExceedBurst_Returns429(t *testing.T) {
 			break
 		}
 	}
-
 	if !got429 {
 		t.Error("expected a 429 after exceeding burst, got none")
 	}

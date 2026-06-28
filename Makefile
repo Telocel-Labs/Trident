@@ -1,4 +1,4 @@
-.PHONY: all dev stop db migrate indexer grpc-api go-api sdk-build test lint help
+﻿.PHONY: all dev stop db migrate indexer grpc-api go-api sdk-build test lint help
 
 # Load environment variables from .env if it exists
 ifneq (,$(wildcard .env))
@@ -26,6 +26,7 @@ help: ## Show this help message
 	@echo "  sdk-build  Build the TypeScript and React SDKs"
 	@echo "  test       Run all unit tests (integration tests require TEST_DATABASE_URL)"
 	@echo "  lint       Run all linters (cargo fmt, clippy, go vet, tsc)"
+	@echo "  deploy     Deploy all services to Fly.io (requires flyctl)"
 	@echo "  help       Show this help message"
 	@echo ""
 
@@ -80,6 +81,15 @@ test:
 	cd services/api && go test ./...
 	cd sdk/typescript && npm install && npm run test
 	cd sdk/react && npm install && npm run test
+
+deploy: ## Deploy all services to Fly.io in dependency order (requires flyctl)
+	@echo "Deploying gRPC API..."
+	fly deploy -c fly/grpc-api.toml --remote-only
+	@echo "Deploying Indexer..."
+	fly deploy -c fly/indexer.toml --remote-only
+	@echo "Deploying Go REST API..."
+	fly deploy -c fly/api.toml --remote-only
+	@echo "All services deployed."
 
 lint:
 	cargo fmt --all -- --check
