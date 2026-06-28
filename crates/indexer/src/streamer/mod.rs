@@ -1,4 +1,4 @@
-//! # Streamer
+﻿//! # Streamer
 //!
 //! Owns the RPC polling loop. Responsibilities:
 //!
@@ -51,7 +51,6 @@ pub struct Streamer {
     alerter: Alerter,
     /// Chain tip ledger from the most recent RPC response (issue #75).
     last_chain_tip: u64,
-
 }
 
 impl Streamer {
@@ -63,7 +62,7 @@ impl Streamer {
         let rpc = RpcClient::new(config.stellar_rpc_url.clone());
         let parser = Parser::new(config.index_diagnostic);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
-       let alerter = Alerter::from_config(
+        let alerter = Alerter::from_config(
             config.alert_webhook_url.clone(),
             config.alert_lag_threshold,
             config.alert_cooldown_minutes,
@@ -212,9 +211,9 @@ impl Streamer {
                 "RPC page received"
             );
 
-           metrics::set_ledger_lag(page.latest_ledger.saturating_sub(*cursor) as i64);
+            metrics::set_ledger_lag(page.latest_ledger.saturating_sub(*cursor) as i64);
             self.last_chain_tip = page.latest_ledger;
-            
+
             if page.events.is_empty() {
                 break;
             }
@@ -304,7 +303,7 @@ impl Streamer {
 
             page_cursor = last_paging_token;
         }
-// Write health stats after every successful cycle (issue #62).
+        // Write health stats after every successful cycle (issue #62).
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
         metrics::record_poll_duration(poll_duration.as_secs_f64());
@@ -427,7 +426,7 @@ mod tests {
             .get_multiplexed_async_connection()
             .await
             .unwrap();
-       let config = Config {
+        let config = Config {
             stellar_rpc_url: rpc_url,
             database_url: db_url.to_string(),
             db_pool_size: 3,
@@ -442,7 +441,7 @@ mod tests {
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
         };
-        
+
         Streamer::new(config, db, redis).await.unwrap()
     }
 

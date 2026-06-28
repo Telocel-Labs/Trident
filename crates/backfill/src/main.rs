@@ -110,8 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if page.events.is_empty() {
                                 break;
                             }
-                            for raw in page.events {
-                                match parser.parse_event(&raw) {
+                            for raw in &page.events {
+                                match parser.parse_event(raw) {
                                     Ok(Some(ev)) => {
                                         if let Some(ref c) = contract {
                                             if &ev.contract_id != c {
