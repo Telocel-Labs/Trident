@@ -101,6 +101,8 @@ func main() {
 	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
+	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
+	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.HandleFunc("/ws", ws.Handler(hub))
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
