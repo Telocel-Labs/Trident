@@ -13,6 +13,9 @@ pub struct Config {
     pub max_events_per_poll: u32,
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
+    pub alert_webhook_url: Option<String>,
+    pub alert_lag_threshold: u64,
+    pub alert_cooldown_minutes: u64,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -43,6 +46,12 @@ impl Config {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+            let alert_webhook_url = std::env::var("ALERT_WEBHOOK_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let alert_lag_threshold = parse_bounded_u64("ALERT_LAG_THRESHOLD", 200, 1, 1_000_000)?;
+        let alert_cooldown_minutes = parse_bounded_u64("ALERT_COOLDOWN_MINUTES", 30, 1, 10_080)?;
+
         Ok(Self {
             database_url: database_url.unwrap(),
             db_pool_size: parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE)?,
@@ -60,6 +69,9 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(9090),
+            alert_webhook_url,
+            alert_lag_threshold,
+            alert_cooldown_minutes,
         })
     }
 }

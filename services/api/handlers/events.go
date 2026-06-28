@@ -80,8 +80,8 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 	// Build gRPC request
 	grpcReq := &gen.ListEventsRequest{
 		ContractId: params.ContractID,
-		Topic0:     q.Get("topic0"),
-		Topic1:     q.Get("topic1"),
+		Topic_0:     q.Get("topic0"),
+		Topic_1:     q.Get("topic1"),
 		Cursor:     pagingToken,
 		Limit:      uint32(params.Limit),
 	}

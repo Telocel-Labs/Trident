@@ -195,6 +195,44 @@ pub async fn load_indexed_contracts(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
+/// Read alert state (last_alert_at, alert_fired) from system_state (issue #75).
+pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertState, TridentError> {
+    let row: (Option<chrono::DateTime<chrono::Utc>>, bool) = sqlx::query_as(
+        "SELECT last_alert_at, alert_fired FROM system_state WHERE key = 'latest_ledger_cursor'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| TridentError::StorageError(format!("get_alert_state: {e}")))?;
+
+    Ok(crate::alerting::AlertState {
+        last_alert_at: row.0,
+        alert_fired: row.1,
+    })
+}
+
+/// Persist alert state back to system_state after an alerting evaluation (issue #75).
+pub async fn set_alert_state(
+    pool: &PgPool,
+    state: &crate::alerting::AlertState,
+) -> Result<(), TridentError> {
+    sqlx::query(
+        r#"
+        UPDATE system_state
+        SET last_alert_at = $1,
+            alert_fired   = $2,
+            updated_at    = NOW()
+        WHERE key = 'latest_ledger_cursor'
+        "#,
+    )
+    .bind(state.last_alert_at)
+    .bind(state.alert_fired)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::StorageError(format!("set_alert_state: {e}")))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
