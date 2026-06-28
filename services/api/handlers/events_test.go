@@ -10,6 +10,7 @@ import (
 	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/gen"
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"google.golang.org/grpc"
 )
 
 // MockEventsClient is a mock implementation of gen.EventsClient
@@ -18,21 +19,21 @@ type MockEventsClient struct {
 	GetEventFunc   func(context.Context, *gen.GetEventRequest) (*gen.Event, error)
 }
 
-func (m *MockEventsClient) ListEvents(ctx context.Context, req *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+func (m *MockEventsClient) ListEvents(ctx context.Context, req *gen.ListEventsRequest, opts ...grpc.CallOption) (*gen.ListEventsResponse, error) {
 	if m.ListEventsFunc != nil {
 		return m.ListEventsFunc(ctx, req)
 	}
 	return &gen.ListEventsResponse{}, nil
 }
 
-func (m *MockEventsClient) GetEvent(ctx context.Context, req *gen.GetEventRequest) (*gen.Event, error) {
+func (m *MockEventsClient) GetEvent(ctx context.Context, req *gen.GetEventRequest, opts ...grpc.CallOption) (*gen.Event, error) {
 	if m.GetEventFunc != nil {
 		return m.GetEventFunc(ctx, req)
 	}
 	return &gen.Event{}, nil
 }
 
-func (m *MockEventsClient) StreamEvents(ctx context.Context, req *gen.StreamEventsRequest) (gen.Events_StreamEventsClient, error) {
+func (m *MockEventsClient) StreamEvents(ctx context.Context, req *gen.StreamEventsRequest, opts ...grpc.CallOption) (gen.Events_StreamEventsClient, error) {
 	return nil, nil
 }
 

@@ -23,8 +23,15 @@ use tokio_retry::{strategy::ExponentialBackoff, Retry};
 use tokio_util::sync::CancellationToken;
 use trident_common::TridentError;
 
-use crate::{config::Config, db, metrics, parser::Parser, redis_stream, rpc::RpcClient};
-
+use crate::{
+    alerting::{AlertContext, Alerter},
+    config::Config,
+    db,
+    metrics,
+    parser::Parser,
+    redis_stream,
+    rpc::RpcClient,
+};
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
 const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
@@ -40,6 +47,11 @@ pub struct Streamer {
     contract_filter: Option<HashSet<String>>,
     /// Counts poll cycles so we know when to refresh the filter.
     poll_count: u32,
+    /// Outbound webhook alerter (issue #75). No-op when URL is not configured.
+    alerter: Alerter,
+    /// Chain tip ledger from the most recent RPC response (issue #75).
+    last_chain_tip: u64,
+
 }
 
 impl Streamer {
@@ -51,6 +63,12 @@ impl Streamer {
         let rpc = RpcClient::new(config.stellar_rpc_url.clone());
         let parser = Parser::new(config.index_diagnostic);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
+       let alerter = Alerter::from_config(
+            config.alert_webhook_url.clone(),
+            config.alert_lag_threshold,
+            config.alert_cooldown_minutes,
+        )?;
+
         Ok(Self {
             config,
             db,
@@ -59,6 +77,8 @@ impl Streamer {
             parser,
             contract_filter,
             poll_count: 0,
+            alerter,
+            last_chain_tip: 0,
         })
     }
 
@@ -192,8 +212,9 @@ impl Streamer {
                 "RPC page received"
             );
 
-            metrics::set_ledger_lag(page.latest_ledger.saturating_sub(*cursor) as i64);
-
+           metrics::set_ledger_lag(page.latest_ledger.saturating_sub(*cursor) as i64);
+            self.last_chain_tip = page.latest_ledger;
+            
             if page.events.is_empty() {
                 break;
             }
@@ -283,8 +304,7 @@ impl Streamer {
 
             page_cursor = last_paging_token;
         }
-
-        // Write health stats after every successful cycle (issue #62).
+// Write health stats after every successful cycle (issue #62).
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
         metrics::record_poll_duration(poll_duration.as_secs_f64());
@@ -292,6 +312,27 @@ impl Streamer {
             db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
         {
             tracing::warn!(error = %e, "Failed to update health stats");
+        }
+
+        // Alerting (issue #75) — best-effort, never aborts the poll cycle.
+        if self.alerter.is_enabled() {
+            match db::get_alert_state(&self.db).await {
+                Ok(mut alert_state) => {
+                    let ctx = AlertContext {
+                        last_ledger_indexed: *cursor,
+                        chain_tip_ledger: self.last_chain_tip,
+                        lag_threshold: self.config.alert_lag_threshold,
+                        network: self.config.network.clone(),
+                    };
+                    self.alerter.evaluate(&ctx, &mut alert_state).await;
+                    if let Err(e) = db::set_alert_state(&self.db, &alert_state).await {
+                        tracing::warn!(error = %e, "Failed to persist alert state");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read alert state");
+                }
+            }
         }
 
         Ok(total)
@@ -386,7 +427,7 @@ mod tests {
             .get_multiplexed_async_connection()
             .await
             .unwrap();
-        let config = Config {
+       let config = Config {
             stellar_rpc_url: rpc_url,
             database_url: db_url.to_string(),
             db_pool_size: 3,
@@ -397,7 +438,11 @@ mod tests {
             max_events_per_poll: 200,
             redis_stream_maxlen: 10_000,
             metrics_port: 0,
+            alert_webhook_url: None,
+            alert_lag_threshold: 200,
+            alert_cooldown_minutes: 30,
         };
+        
         Streamer::new(config, db, redis).await.unwrap()
     }
 

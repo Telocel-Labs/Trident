@@ -52,7 +52,7 @@ func (c *eventsClient) GetEvent(ctx context.Context, in *GetEventRequest, opts .
 }
 
 func (c *eventsClient) StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (Events_StreamEventsClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Events_StreamDesc.Streams[0], Events_StreamEvents_FullMethodName, opts...)
+	stream, err := c.cc.NewStream(ctx, &Events_ServiceDesc.Streams[0], Events_StreamEvents_FullMethodName, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +86,7 @@ func (x *eventsStreamEventsClient) Recv() (*Event, error) {
 type EventsServer interface {
 	ListEvents(context.Context, *ListEventsRequest) (*ListEventsResponse, error)
 	GetEvent(context.Context, *GetEventRequest) (*Event, error)
-	StreamEvents(*StreamEventsRequest, Events_StreamServer) error
+	StreamEvents(*StreamEventsRequest, Events_StreamEventsServer) error
 }
 
 type UnimplementedEventsServer struct{}
@@ -99,7 +99,7 @@ func (UnimplementedEventsServer) GetEvent(context.Context, *GetEventRequest) (*E
 	return nil, status.Errorf(codes.Unimplemented, "method GetEvent not implemented")
 }
 
-func (UnimplementedEventsServer) StreamEvents(*StreamEventsRequest, Events_StreamServer) error {
+func (UnimplementedEventsServer) StreamEvents(*StreamEventsRequest, Events_StreamEventsServer) error {
 	return status.Errorf(codes.Unimplemented, "method StreamEvents not implemented")
 }
 

@@ -13,7 +13,7 @@ func TestHealth_NilDB_Returns503(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
 	rr := httptest.NewRecorder()
 
-	handlers.Health(nil, nil)(rr, req)
+	handlers.Health(nil)(rr, req)
 
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Errorf("want 503, got %d", rr.Code)
