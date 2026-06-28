@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -103,11 +103,17 @@ func main() {
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
-	mux.HandleFunc("/ws", ws.Handler(hub))
+	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
+	var rlDB middleware.TierDB
+	if pool != nil {
+		rlDB = pool
+	}
+	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB}
 	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
+	handler = middleware.TieredRateLimit(rlCfg)(handler)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
 
 	server := &http.Server{
