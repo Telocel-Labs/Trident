@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.from_ledger, args.to_ledger
     ));
 
-    let (tx, mut rx) = mpsc::channel::<(u64, u64)>(args.workers * 2);
+    let (tx, _rx) = tokio::sync::broadcast::channel::<(u64, u64)>(args.workers * 2);
 
     // Split range into chunks for workers
     let chunk_size = (total_ledgers as usize + args.workers - 1) / args.workers;
@@ -84,13 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?));
 
     let mut handles = vec![];
-    for _ in 0..args.workers {
-        let mut rx = rx.recv();
-    }
 
     // Spawn worker tasks
     for _ in 0..args.workers {
-        let mut rx = rx.clone();
+        let mut rx = tx.subscribe();
         let rpc = rpc.clone();
         let db = db.clone();
         let parser = parser::Parser::new(false);
