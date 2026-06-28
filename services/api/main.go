@@ -80,6 +80,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
+	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminConfig()))
