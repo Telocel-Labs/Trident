@@ -1,6 +1,7 @@
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+mod alerting;
 mod config;
 mod db;
 mod metrics;
