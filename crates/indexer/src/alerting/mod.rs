@@ -95,7 +95,6 @@ impl Alerter {
                     .build()
                     .map_err(|e| TridentError::ConfigError(format!("alerting HTTP client: {e}")))?,
             )
-            )
         } else {
             None
         };
