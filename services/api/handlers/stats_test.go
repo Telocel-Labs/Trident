@@ -27,6 +27,10 @@ func (m *mockStatsDB) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
 	return &mockStatsRow{m: m}
 }
 
+func (m *mockStatsDB) Ping(_ context.Context) error {
+	return nil
+}
+
 type mockStatsRow struct{ m *mockStatsDB }
 
 func (r *mockStatsRow) Scan(dest ...any) error {
