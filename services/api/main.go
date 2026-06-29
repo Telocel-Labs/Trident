@@ -104,6 +104,8 @@ func main() {
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
+	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
+	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
