@@ -97,16 +97,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install Spectral CLI
         run: npm install -g @stoplight/spectral-cli
 
       - name: Lint OpenAPI specification
         run: spectral lint api/openapi.yaml --ruleset @stoplight/spectral-oas
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
 
       - name: Install openapi-typescript
         run: npm install -g openapi-typescript
