@@ -1,4 +1,4 @@
-﻿.PHONY: all dev stop db migrate indexer grpc-api go-api sdk-build test lint help
+﻿.PHONY: all dev stop db migrate indexer grpc-api go-api sdk-build test lint lint-openapi help
 
 # Load environment variables from .env if it exists
 ifneq (,$(wildcard .env))
@@ -26,6 +26,7 @@ help: ## Show this help message
 	@echo "  sdk-build  Build the TypeScript and React SDKs"
 	@echo "  test       Run all unit tests (integration tests require TEST_DATABASE_URL)"
 	@echo "  lint       Run all linters (cargo fmt, clippy, go vet, tsc)"
+	@echo "  lint-openapi Run Spectral linter on OpenAPI spec"
 	@echo "  deploy     Deploy all services to Fly.io (requires flyctl)"
 	@echo "  help       Show this help message"
 	@echo ""
@@ -92,11 +93,20 @@ deploy: ## Deploy all services to Fly.io in dependency order (requires flyctl)
 	@echo "All services deployed."
 
 lint:
-	cargo fmt --all -- --check
-	cargo clippy --all-targets --all-features -- -D warnings
-	cd services/api && go vet ./...
+	@cargo fmt --all -- --check
+	@cargo clippy --all-targets --all-features -- -D warnings
+	@cd services/api && go vet ./...
 	@if command -v golangci-lint >/dev/null 2>&1; then \
 		cd services/api && golangci-lint run; \
 	fi
-	cd sdk/typescript && npm install && npm run lint
-	cd sdk/react && npm install && npm run lint
+	@cd sdk/typescript && npm install && npm run lint
+	@cd sdk/react && npm install && npm run lint
+
+lint-openapi: ## Lint the OpenAPI specification
+	@if command -v spectral >/dev/null 2>&1; then \
+		spectral lint api/openapi.yaml --ruleset @stoplight/spectral-oas; \
+	else \
+		echo "spectral CLI not found. Install with: npm install -g @stoplight/spectral-cli"; \
+		exit 1; \
+	fi
+	fi
