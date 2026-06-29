@@ -13,25 +13,13 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     transaction_hash    TEXT        NOT NULL,
     event_index         INTEGER     NOT NULL,
     event_type          TEXT        NOT NULL CHECK (event_type IN ('contract', 'system', 'diagnostic')),
+    network             TEXT        NOT NULL DEFAULT 'testnet',
     topics              JSONB       NOT NULL DEFAULT '[]',
     topic_0             TEXT        GENERATED ALWAYS AS (topics ->> 0) STORED,
     topic_1             TEXT        GENERATED ALWAYS AS (topics ->> 1) STORED,
     data                JSONB       NOT NULL DEFAULT '{}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- ---------------------------------------------------------------------------
--- system_state
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS system_state (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-INSERT INTO system_state (key, value)
-VALUES ('latest_ledger_cursor', '0')
-ON CONFLICT (key) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- system_state
