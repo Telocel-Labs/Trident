@@ -124,6 +124,21 @@ jobs:
         run: npm run lint
 
   # ---------------------------------------------------------------------------
+  # OpenAPI specification — Spectral linting
+  # ---------------------------------------------------------------------------
+  openapi:
+    name: OpenAPI Spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Spectral CLI
+        run: npm install -g @stoplight/spectral-cli
+
+      - name: Lint OpenAPI specification
+        run: spectral lint api/openapi.yaml --ruleset @stoplight/spectral-oas
+
+  # ---------------------------------------------------------------------------
   # Rust integration tests — real Postgres + Redis
   # Runs integration tests that are silently skipped when TEST_DATABASE_URL
   # and TEST_REDIS_URL are absent. Scoped to push/PR against main and dev.
