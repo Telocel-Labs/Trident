@@ -67,7 +67,7 @@ func Timeout(duration time.Duration, excluded []string) func(http.Handler) http.
 // Default is 30000ms. Excluded paths are /ws and /v1/events/stream.
 func NewTimeoutFromEnv() func(http.Handler) http.Handler {
 	const defaultMS = 30000
-	excluded := []string{"/ws", "/v1/events/stream"}
+	excluded := []string{"/ws", "/graphql", "/v1/events/stream"}
 
 	ms := defaultMS
 	if raw := os.Getenv("REQUEST_TIMEOUT_MS"); raw != "" {

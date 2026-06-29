@@ -70,3 +70,15 @@ func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 func APIKey(next http.Handler) http.Handler {
 	return Auth(ParseKeyHashes(os.Getenv("API_KEY_HASHES")), next)
 }
+
+// Validator returns a closure that validates a raw API key against validHashes.
+// When validHashes is empty all keys pass (auth disabled — suitable for local dev).
+func Validator(validHashes map[string]struct{}) func(string) bool {
+	return func(key string) bool {
+		if len(validHashes) == 0 {
+			return true
+		}
+		_, ok := validHashes[hashKey(key)]
+		return ok
+	}
+}
