@@ -282,23 +282,28 @@ interface Subscription {
 
 ## Node.js Compatibility
 
-The SDK uses the global `fetch` (Node 18+) and the standard `WebSocket` API.
+The SDK works seamlessly in both browser and Node.js environments.
 
-**Node 21+:** No polyfills needed.
+- **Browsers & Node.js 21+:** Uses the native global `WebSocket` (no extra configuration required).
+- **Node.js 18 & 20:** The SDK will automatically and dynamically import the `ws` library at runtime if the global `WebSocket` is not found. Ensure `ws` is installed in your project:
+  ```bash
+  npm install ws
+  ```
 
-**Node 18–20:** `fetch` is available but the built-in `WebSocket` was added in Node 21. Install `ws`:
+### Custom WebSocket Implementation
 
-```bash
-npm install ws
-```
-
-Then polyfill before importing the SDK:
+If you want to provide a specific custom WebSocket implementation (e.g., for unit testing or to force a specific client), you can pass it to the `TridentClient` constructor via the `webSocketImpl` option:
 
 ```typescript
-import WebSocket from "ws";
-(globalThis as unknown as Record<string, unknown>).WebSocket = WebSocket;
-
 import { TridentClient } from "@trident-indexer/sdk";
+import CustomWebSocket from "ws";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.io",
+  apiKey: "your-api-key",
+  network: "mainnet",
+  webSocketImpl: CustomWebSocket,
+});
 ```
 
 ---
