@@ -9,9 +9,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
     label            TEXT        NOT NULL DEFAULT '',
     network          TEXT        NOT NULL DEFAULT 'mainnet',
     rate_limit_tier  TEXT        NOT NULL DEFAULT 'standard',
+    created_by       TEXT,                           -- optional creator identifier
     last_used_at     TIMESTAMPTZ,
     request_count    BIGINT      NOT NULL DEFAULT 0,
+    revoked_at       TIMESTAMPTZ,                    -- NULL means active; set to revoke
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);
+
+-- Partial index covering only active (non-revoked) keys for fast auth lookups.
+CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (key_hash)
+    WHERE revoked_at IS NULL;
