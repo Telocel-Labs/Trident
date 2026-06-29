@@ -102,6 +102,7 @@ func main() {
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
+	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 

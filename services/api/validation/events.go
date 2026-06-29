@@ -153,3 +153,104 @@ func ValidateEventID(id string) *ValidationError {
 	}
 	return nil
 }
+
+// Validation limits for GET /v1/stats/contracts.
+const (
+	StatsLimitMin     = 1
+	StatsLimitMax     = 100
+	StatsLimitDefault = 50
+)
+
+// validNetworks holds the accepted values for the ?network filter.
+var validNetworks = map[string]bool{
+	"testnet":  true,
+	"mainnet":  true,
+}
+
+// QueryStatsParams holds validated parameters for GET /v1/stats/contracts.
+type QueryStatsParams struct {
+	FromLedger    int64
+	FromLedgerPtr *int64 // nil if not specified (for SQL NULL handling)
+	ToLedger      int64
+	ToLedgerPtr   *int64 // nil if not specified (for SQL NULL handling)
+	Network       string
+	Limit         int64
+}
+
+// ValidateQueryStats parses and validates query-string values for GET /v1/stats/contracts.
+// It returns populated QueryStatsParams on success, or a *ValidationError on the
+// first validation failure.
+//
+// Validation rules:
+//   - from_ledger: non-negative integer if present; default 0 (all time)
+//   - to_ledger:   non-negative integer if present; default latest indexed
+//   - network:     one of "testnet", "mainnet"; default "testnet"
+//   - limit:       integer in [1, 100]; default 50
+func ValidateQueryStats(
+	fromLedgerStr, toLedgerStr, networkStr, limitStr string,
+) (*QueryStatsParams, *ValidationError) {
+	p := &QueryStatsParams{
+		Network: "testnet",
+		Limit:   int64(StatsLimitDefault),
+	}
+
+	// from_ledger
+	if fromLedgerStr != "" {
+		n, err := strconv.ParseInt(fromLedgerStr, 10, 64)
+		if err != nil || n < 0 {
+			return nil, &ValidationError{
+				Field:   "from_ledger",
+				Message: "must be a non-negative integer",
+			}
+		}
+		p.FromLedger = n
+		p.FromLedgerPtr = &n
+	}
+
+	// to_ledger
+	if toLedgerStr != "" {
+		n, err := strconv.ParseInt(toLedgerStr, 10, 64)
+		if err != nil || n < 0 {
+			return nil, &ValidationError{
+				Field:   "to_ledger",
+				Message: "must be a non-negative integer",
+			}
+		}
+		p.ToLedger = n
+		p.ToLedgerPtr = &n
+	}
+
+	// from_ledger <= to_ledger when both are present
+	if p.FromLedgerPtr != nil && p.ToLedgerPtr != nil && *p.ToLedgerPtr < *p.FromLedgerPtr {
+		return nil, &ValidationError{
+			Field:   "to_ledger",
+			Message: "must be >= from_ledger",
+		}
+	}
+
+	// network
+	if networkStr != "" {
+		lower := strings.ToLower(networkStr)
+		if !validNetworks[lower] {
+			return nil, &ValidationError{
+				Field:   "network",
+				Message: "must be one of: testnet, mainnet",
+			}
+		}
+		p.Network = lower
+	}
+
+	// limit
+	if limitStr != "" {
+		n, err := strconv.ParseInt(limitStr, 10, 64)
+		if err != nil || n < int64(StatsLimitMin) || n > int64(StatsLimitMax) {
+			return nil, &ValidationError{
+				Field:   "limit",
+				Message: fmt.Sprintf("must be an integer between %d and %d", StatsLimitMin, StatsLimitMax),
+			}
+		}
+		p.Limit = n
+	}
+
+	return p, nil
+}
