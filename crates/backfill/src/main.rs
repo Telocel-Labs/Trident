@@ -66,16 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, _rx) = tokio::sync::broadcast::channel::<(u64, u64)>(args.workers * 2);
 
-    // Split range into chunks for workers
-    let chunk_size = (total_ledgers as usize + args.workers - 1) / args.workers;
-    let mut start = args.from_ledger;
-    while start <= args.to_ledger {
-        let end = std::cmp::min(start + chunk_size as u64 - 1, args.to_ledger);
-        tx.send((start, end)).await?;
-        start = end + 1;
-    }
-    drop(tx);
-
     let events_indexed = Arc::new(AtomicU64::new(0));
     let duplicates_skipped = Arc::new(AtomicU64::new(0));
 
@@ -85,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = vec![];
 
-    // Spawn worker tasks
+    // Spawn worker tasks BEFORE sending data
     for _ in 0..args.workers {
         let mut rx = tx.subscribe();
         let rpc = rpc.clone();
@@ -178,6 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         handles.push(handle);
     }
+
+    // Now send work to all subscribed workers
+    let chunk_size = (total_ledgers as usize + args.workers - 1) / args.workers;
+    let mut start = args.from_ledger;
+    while start <= args.to_ledger {
+        let end = std::cmp::min(start + chunk_size as u64 - 1, args.to_ledger);
+        tx.send((start, end)).await?;
+        start = end + 1;
+    }
+    drop(tx);
 
     let start_time = Instant::now();
     for h in handles {
