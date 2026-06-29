@@ -1,0 +1,24 @@
+[package]
+name = "trident-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Rust client for the Trident Soroban event indexer"
+license = "MIT"
+repository = "https://github.com/Telocel-Labs/Trident"
+documentation = "https://docs.rs/trident-sdk"
+keywords = ["stellar", "soroban", "blockchain", "indexer", "events"]
+categories = ["api-bindings", "web-programming::http-client"]
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+futures = "0.3"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+mockito = "1"
+tokio-test = "0.4"

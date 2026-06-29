@@ -4,5 +4,6 @@ members = [
     "crates/api",
     "crates/common",
     "crates/backfill",
+    "sdk/rust",
 ]
 resolver = "2"
