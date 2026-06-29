@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     transaction_hash    TEXT        NOT NULL,
     event_index         INTEGER     NOT NULL,
     event_type          TEXT        NOT NULL CHECK (event_type IN ('contract', 'system', 'diagnostic')),
+    network             TEXT        NOT NULL DEFAULT 'testnet',
     topics              JSONB       NOT NULL DEFAULT '[]',
     topic_0             TEXT        GENERATED ALWAYS AS (topics ->> 0) STORED,
     topic_1             TEXT        GENERATED ALWAYS AS (topics ->> 1) STORED,
@@ -26,12 +27,15 @@ CREATE TABLE IF NOT EXISTS soroban_events (
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_id       ON soroban_events (contract_id);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_sequence   ON soroban_events (ledger_sequence);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp  ON soroban_events (ledger_timestamp);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_network           ON soroban_events (network);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_topic_0           ON soroban_events (topic_0);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_topic_1           ON soroban_events (topic_1);
 
--- Composite index covering the most common query pattern: events for a
+-- Composite indexes covering the most common query patterns: events for a
 -- contract filtered by primary topic (e.g. all "transfer" events for token X)
+-- or events for a contract in a specific network (e.g. analytics queries)
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic_0  ON soroban_events (contract_id, topic_0);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_network  ON soroban_events (contract_id, network);
 
 -- GIN index for arbitrary topic containment queries
 CREATE INDEX IF NOT EXISTS idx_soroban_events_topics_gin        ON soroban_events USING GIN (topics);
