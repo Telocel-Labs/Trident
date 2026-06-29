@@ -375,7 +375,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		}
 
 		// Cache in Redis for 60 seconds (best-effort; ignore errors)
-		_ = rdb.SetEX(r.Context(), cacheKey, body, 60*time.Second).Err()
+		_ = rdb.Set(r.Context(), cacheKey, body, 60*time.Second).Err()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "public, max-age=60")
