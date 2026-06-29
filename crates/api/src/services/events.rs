@@ -1,16 +1,50 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use opentelemetry::propagation::Extractor;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::trident::{
     events_server::Events, Event, GetEventRequest, ListEventsRequest, ListEventsResponse,
     StreamEventsRequest,
 };
+
+// ---------------------------------------------------------------------------
+// W3C TraceContext extraction from tonic metadata
+// ---------------------------------------------------------------------------
+
+struct MetadataCarrier<'a>(&'a tonic::metadata::MetadataMap);
+
+impl<'a> Extractor for MetadataCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .filter_map(|k| {
+                if let tonic::metadata::KeyRef::Ascii(k) = k {
+                    Some(k.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+fn extract_context(metadata: &tonic::metadata::MetadataMap) -> opentelemetry::Context {
+    opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.extract(&MetadataCarrier(metadata))
+    })
+}
 
 const REDIS_STREAM_KEY: &str = "trident:events";
 const STREAM_CHANNEL_BUF: usize = 128;
@@ -85,22 +119,67 @@ impl Events for EventsServiceImpl {
         &self,
         request: Request<ListEventsRequest>,
     ) -> Result<Response<ListEventsResponse>, Status> {
+        let parent_cx = extract_context(request.metadata());
+        let span = tracing::info_span!("list_events", "rpc.system" = "grpc");
+        span.set_parent(parent_cx);
+
+        let db = self.db.clone();
         let req = request.into_inner();
+        let contract_id_attr = req.contract_id.clone();
+        span.record("contract_id", contract_id_attr.as_str());
 
-        let limit = req.limit.clamp(1, 200) as i64;
-        let network = resolve_network(&req.network);
+        async move {
+            let limit = req.limit.clamp(1, 200) as i64;
+            let network = resolve_network(&req.network);
 
-        let (cursor_seq, cursor_idx): (Option<i64>, Option<i32>) = if req.cursor.is_empty() {
-            (None, None)
-        } else {
-            let cursor_id = Uuid::parse_str(&req.cursor)
-                .map_err(|_| Status::invalid_argument("cursor must be a valid UUID"))?;
+            let (cursor_seq, cursor_idx): (Option<i64>, Option<i32>) = if req.cursor.is_empty() {
+                (None, None)
+            } else {
+                let cursor_id = Uuid::parse_str(&req.cursor)
+                    .map_err(|_| Status::invalid_argument("cursor must be a valid UUID"))?;
 
-            let row: Option<(i64, i32)> = sqlx::query_as(
-                "SELECT ledger_sequence, event_index FROM soroban_events WHERE id = $1",
+                let row: Option<(i64, i32)> = sqlx::query_as(
+                    "SELECT ledger_sequence, event_index FROM soroban_events WHERE id = $1",
+                )
+                .bind(cursor_id)
+                .fetch_optional(&db)
+                .await
+                .map_err(db_err)?;
+
+                match row {
+                    Some((seq, idx)) => (Some(seq), Some(idx)),
+                    None => return Err(Status::invalid_argument("cursor references unknown event")),
+                }
+            };
+
+            let rows: Vec<EventRow> = sqlx::query_as(
+                r#"
+                SELECT id, contract_id, ledger_sequence, ledger_timestamp,
+                       transaction_hash, event_index, event_type, topics, data, created_at
+                FROM soroban_events
+                WHERE
+                    ($1::text = '' OR contract_id = $1)
+                    AND ($2::text = '' OR topic_0 = $2)
+                    AND ($3::text = '' OR topic_1 = $3)
+                    AND ($4::bigint = 0 OR ledger_sequence >= $4)
+                    AND ($5::bigint = 0 OR ledger_sequence <= $5)
+                    AND (
+                        $6::bigint IS NULL
+                        OR (ledger_sequence, event_index) > ($6, $7)
+                    )
+                ORDER BY ledger_sequence ASC, event_index ASC
+                LIMIT $8
+                "#,
             )
-            .bind(cursor_id)
-            .fetch_optional(&self.db)
+            .bind(&req.contract_id)
+            .bind(&req.topic_0)
+            .bind(&req.topic_1)
+            .bind(req.ledger_from as i64)
+            .bind(req.ledger_to as i64)
+            .bind(cursor_seq)
+            .bind(cursor_idx)
+            .bind(limit)
+            .fetch_all(&db)
             .await
             .map_err(db_err)?;
 
@@ -150,23 +229,32 @@ impl Events for EventsServiceImpl {
             String::new()
         };
 
-        let events: Vec<Event> = rows.into_iter().map(row_to_event).collect();
+            let events: Vec<Event> = rows.into_iter().map(row_to_event).collect();
 
-        Ok(Response::new(ListEventsResponse {
-            events,
-            next_cursor,
-            has_more,
-        }))
+            Ok(Response::new(ListEventsResponse {
+                events,
+                next_cursor,
+                has_more,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn get_event(
         &self,
         request: Request<GetEventRequest>,
     ) -> Result<Response<Event>, Status> {
+        let parent_cx = extract_context(request.metadata());
+        let span = tracing::info_span!("get_event", "rpc.system" = "grpc");
+        span.set_parent(parent_cx);
+
+        let db = self.db.clone();
         let req = request.into_inner();
 
-        let id = Uuid::parse_str(&req.id)
-            .map_err(|_| Status::invalid_argument("id must be a valid UUID"))?;
+        async move {
+            let id = Uuid::parse_str(&req.id)
+                .map_err(|_| Status::invalid_argument("id must be a valid UUID"))?;
 
         let network = resolve_network(&req.network);
 
@@ -185,10 +273,13 @@ impl Events for EventsServiceImpl {
         .await
         .map_err(db_err)?;
 
-        match row {
-            Some(r) => Ok(Response::new(row_to_event(r))),
-            None => Err(Status::not_found(format!("event {id} not found"))),
+            match row {
+                Some(r) => Ok(Response::new(row_to_event(r))),
+                None => Err(Status::not_found(format!("event {id} not found"))),
+            }
         }
+        .instrument(span)
+        .await
     }
 
     type StreamEventsStream = tokio_stream::wrappers::ReceiverStream<Result<Event, Status>>;
@@ -197,6 +288,11 @@ impl Events for EventsServiceImpl {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        let parent_cx = extract_context(request.metadata());
+        let span = tracing::info_span!("stream_events", "rpc.system" = "grpc");
+        span.set_parent(parent_cx);
+        let _entered = span.entered();
+
         let req = request.into_inner();
 
         if req.contract_id.is_empty() {

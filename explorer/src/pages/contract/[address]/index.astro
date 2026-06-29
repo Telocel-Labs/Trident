@@ -1,0 +1,358 @@
+---
+import Base from '../../../layouts/Base.astro';
+import { listEvents } from '../../../lib/api';
+import { truncate, relativeTime, stellarExpertBase, tryFormatJson } from '../../../lib/format';
+import type { Network, SorobanEvent } from '../../../lib/types';
+
+const { address } = Astro.params as { address: string };
+const rawNetwork = Astro.url.searchParams.get('network');
+const network: Network = rawNetwork === 'mainnet' ? 'mainnet' : 'testnet';
+const topic0Filter = Astro.url.searchParams.get('topic0') ?? '';
+const ledgerFrom = Astro.url.searchParams.get('ledgerFrom') ?? '';
+const ledgerTo = Astro.url.searchParams.get('ledgerTo') ?? '';
+const cursor = Astro.url.searchParams.get('cursor') ?? '';
+
+let events: SorobanEvent[] = [];
+let hasMore = false;
+let nextCursor: string | null = null;
+let fetchError = '';
+
+try {
+  const result = await listEvents({
+    contractId: address,
+    network,
+    topic0: topic0Filter || undefined,
+    ledgerFrom: ledgerFrom ? Number(ledgerFrom) : undefined,
+    ledgerTo: ledgerTo ? Number(ledgerTo) : undefined,
+    cursor: cursor || undefined,
+    limit: 25,
+  });
+  events = result.events;
+  hasMore = result.has_more;
+  nextCursor = result.next_cursor;
+} catch (err) {
+  fetchError = err instanceof Error ? err.message : 'Failed to fetch events';
+}
+
+// Collect distinct topic_0 values for the filter dropdown
+const distinctTypes = [...new Set(events.map((e) => e.topics[0] ?? e.event_type))].sort();
+
+// OG meta
+const shortAddr = truncate(address);
+const ogTitle = `Events for ${shortAddr} on Stellar ${network.charAt(0).toUpperCase() + network.slice(1)}`;
+const latestEvent = events[0];
+const ogDescription = latestEvent
+  ? `Events indexed for this contract. Latest: ${latestEvent.topics[0] ?? latestEvent.event_type} at ledger ${latestEvent.ledger_sequence}.`
+  : `Soroban contract events on Stellar ${network}.`;
+
+const expertBase = stellarExpertBase(network);
+
+// Build filter URL helper
+function filterUrl(overrides: Record<string, string>): string {
+  const params = new URLSearchParams({
+    network,
+    ...(topic0Filter ? { topic0: topic0Filter } : {}),
+    ...(ledgerFrom ? { ledgerFrom } : {}),
+    ...(ledgerTo ? { ledgerTo } : {}),
+  });
+  for (const [k, v] of Object.entries(overrides)) {
+    if (v) params.set(k, v);
+    else params.delete(k);
+  }
+  return `?${params.toString()}`;
+}
+---
+
+<Base
+  title={`Events — ${shortAddr}`}
+  description={ogDescription}
+  ogTitle={ogTitle}
+  ogDescription={ogDescription}
+>
+  <!-- Breadcrumb -->
+  <nav class="text-xs text-gray-500 mb-6 flex items-center gap-1.5" aria-label="Breadcrumb">
+    <a href={`/?network=${network}`} class="hover:text-white">Home</a>
+    <span>/</span>
+    <span class="text-gray-300 font-mono" title={address}>{shortAddr}</span>
+  </nav>
+
+  <!-- Contract header -->
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center gap-3">
+    <div class="flex-1 min-w-0">
+      <h1 class="text-xl font-bold text-white flex items-center gap-2 flex-wrap">
+        <span class="font-mono text-indigo-300 break-all" id="contract-address">{address}</span>
+      </h1>
+      <div class="mt-1 flex gap-3 text-xs text-gray-400">
+        <a
+          href={`${expertBase}/contract/${address}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          class="hover:text-white underline underline-offset-2"
+        >
+          Stellar Expert ↗
+        </a>
+        <span
+          class={`px-2 py-0.5 rounded-full text-xs font-medium ${
+            network === 'mainnet'
+              ? 'bg-amber-900/40 text-amber-400'
+              : 'bg-blue-900/40 text-blue-400'
+          }`}
+        >
+          {network}
+        </span>
+      </div>
+    </div>
+
+    <button
+      id="copy-address"
+      class="text-xs px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white transition-colors shrink-0"
+      data-address={address}
+    >
+      Copy address
+    </button>
+  </div>
+
+  <!-- Filters -->
+  <form method="get" class="mb-5 flex flex-wrap gap-3 items-end text-sm">
+    <input type="hidden" name="network" value={network} />
+
+    <div class="flex flex-col gap-1">
+      <label for="topic0-filter" class="text-xs text-gray-400">Event type</label>
+      <select
+        id="topic0-filter"
+        name="topic0"
+        class="px-3 py-1.5 rounded bg-gray-800 border border-gray-700 text-white focus:outline-none focus:border-indigo-500"
+      >
+        <option value="">All types</option>
+        {distinctTypes.map((t) => (
+          <option value={t} selected={t === topic0Filter}>{t}</option>
+        ))}
+      </select>
+    </div>
+
+    <div class="flex flex-col gap-1">
+      <label for="ledger-from" class="text-xs text-gray-400">Ledger from</label>
+      <input
+        id="ledger-from"
+        type="number"
+        name="ledgerFrom"
+        value={ledgerFrom}
+        min="1"
+        placeholder="e.g. 55000"
+        class="w-32 px-3 py-1.5 rounded bg-gray-800 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500"
+      />
+    </div>
+
+    <div class="flex flex-col gap-1">
+      <label for="ledger-to" class="text-xs text-gray-400">Ledger to</label>
+      <input
+        id="ledger-to"
+        type="number"
+        name="ledgerTo"
+        value={ledgerTo}
+        min="1"
+        placeholder="e.g. 56000"
+        class="w-32 px-3 py-1.5 rounded bg-gray-800 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500"
+      />
+    </div>
+
+    <button
+      type="submit"
+      class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-white font-medium transition-colors"
+    >
+      Apply
+    </button>
+
+    {(topic0Filter || ledgerFrom || ledgerTo) && (
+      <a
+        href={filterUrl({ topic0: '', ledgerFrom: '', ledgerTo: '' })}
+        class="px-4 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
+      >
+        Clear
+      </a>
+    )}
+  </form>
+
+  <!-- Events table -->
+  {fetchError ? (
+    <div class="rounded-lg bg-red-900/30 border border-red-800 px-4 py-3 text-sm text-red-300">
+      Failed to load events: {fetchError}
+    </div>
+  ) : events.length === 0 ? (
+    <div class="text-center py-16 text-gray-500">
+      No events found for this contract{topic0Filter ? ` with type "${topic0Filter}"` : ''}.
+    </div>
+  ) : (
+    <div>
+      <div class="overflow-x-auto rounded-lg border border-gray-800">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-900 text-xs text-gray-400 uppercase tracking-wide">
+            <tr>
+              <th class="px-4 py-3 text-left">Time</th>
+              <th class="px-4 py-3 text-left">Ledger</th>
+              <th class="px-4 py-3 text-left">Type</th>
+              <th class="px-4 py-3 text-left hidden md:table-cell">Topic 1</th>
+              <th class="px-4 py-3 text-left hidden lg:table-cell">Tx Hash</th>
+              <th class="px-4 py-3 text-left hidden xl:table-cell">Data</th>
+            </tr>
+          </thead>
+          <tbody id="events-tbody" class="divide-y divide-gray-800">
+            {events.map((e) => (
+              <tr
+                class="hover:bg-gray-900/60 cursor-pointer transition-colors"
+                data-href={`/contract/${address}/event/${e.id}?network=${network}`}
+              >
+                <td class="px-4 py-3 text-gray-400 whitespace-nowrap text-xs" title={e.ledger_timestamp}>
+                  {relativeTime(e.ledger_timestamp)}
+                </td>
+                <td class="px-4 py-3 font-mono text-gray-300 text-xs">
+                  <a
+                    href={`?${new URLSearchParams({ network, ledgerFrom: String(e.ledger_sequence), ledgerTo: String(e.ledger_sequence) })}`}
+                    class="hover:text-indigo-300"
+                  >
+                    {e.ledger_sequence}
+                  </a>
+                </td>
+                <td class="px-4 py-3">
+                  <span class="px-2 py-0.5 rounded-full text-xs bg-indigo-900/50 text-indigo-300 font-medium">
+                    {e.topics[0] ?? e.event_type}
+                  </span>
+                </td>
+                <td class="px-4 py-3 font-mono text-gray-400 text-xs truncate max-w-[180px] hidden md:table-cell" title={e.topics[1]}>
+                  {e.topics[1] ? truncate(e.topics[1], 12, 8) : '—'}
+                </td>
+                <td class="px-4 py-3 hidden lg:table-cell">
+                  <a
+                    href={`${expertBase}/tx/${e.transaction_hash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="font-mono text-xs text-gray-400 hover:text-indigo-300"
+                    title={e.transaction_hash}
+                  >
+                    {truncate(e.transaction_hash, 8, 6)}
+                  </a>
+                </td>
+                <td class="px-4 py-3 hidden xl:table-cell font-mono text-xs text-gray-500 max-w-[200px] truncate" title={e.data}>
+                  {e.data ? tryFormatJson(e.data).slice(0, 60) : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Pagination -->
+      <div class="mt-4 flex items-center justify-between">
+        {cursor ? (
+          <a
+            href={filterUrl({ cursor: '' })}
+            class="text-sm text-gray-400 hover:text-white"
+          >
+            ← Back to first page
+          </a>
+        ) : <span />}
+
+        {hasMore && nextCursor && (
+          <div>
+            <!-- No-JS: navigate to next page with cursor -->
+            <a
+              id="load-more-link"
+              href={filterUrl({ cursor: nextCursor })}
+              class="px-5 py-2 rounded bg-gray-800 hover:bg-gray-700 text-white text-sm font-medium transition-colors"
+              data-cursor={nextCursor}
+            >
+              Load more
+            </a>
+          </div>
+        )}
+      </div>
+    </div>
+  )}
+</Base>
+
+<script>
+  // Row click → navigate to event detail
+  document.querySelectorAll<HTMLTableRowElement>('tr[data-href]').forEach((row) => {
+    row.addEventListener('click', (e) => {
+      const target = e.target as HTMLElement;
+      if (target.closest('a') || target.closest('button')) return;
+      window.location.href = row.dataset.href!;
+    });
+  });
+
+  // Copy address button
+  const copyBtn = document.getElementById('copy-address') as HTMLButtonElement | null;
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      const addr = copyBtn.dataset.address ?? '';
+      try {
+        await navigator.clipboard.writeText(addr);
+        const orig = copyBtn.textContent;
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = orig; }, 1500);
+      } catch { /* clipboard unavailable */ }
+    });
+  }
+
+  // JS "Load more" — appends rows instead of navigating
+  const loadMoreLink = document.getElementById('load-more-link') as HTMLAnchorElement | null;
+  if (loadMoreLink) {
+    loadMoreLink.addEventListener('click', async (e) => {
+      e.preventDefault();
+      loadMoreLink.textContent = 'Loading…';
+      loadMoreLink.setAttribute('disabled', '');
+
+      const params = new URLSearchParams(window.location.search);
+      const network = params.get('network') ?? 'testnet';
+      const contractId = window.location.pathname.split('/')[2];
+      const apiParams = new URLSearchParams({ network, contractId });
+      if (params.get('topic0')) apiParams.set('topic0', params.get('topic0')!);
+      if (params.get('ledgerFrom')) apiParams.set('ledgerFrom', params.get('ledgerFrom')!);
+      if (params.get('ledgerTo')) apiParams.set('ledgerTo', params.get('ledgerTo')!);
+      apiParams.set('cursor', loadMoreLink.dataset.cursor!);
+
+      try {
+        const res = await fetch(`/api/events.json?${apiParams}`);
+        if (!res.ok) throw new Error('fetch failed');
+        const data: { events: any[]; has_more: boolean; next_cursor: string | null } = await res.json();
+
+        const tbody = document.getElementById('events-tbody');
+        if (tbody && data.events.length) {
+          for (const ev of data.events) {
+            const tr = document.createElement('tr');
+            tr.className = 'hover:bg-gray-900/60 cursor-pointer transition-colors';
+            tr.dataset.href = `/contract/${ev.contract_id}/event/${ev.id}?network=${network}`;
+            tr.innerHTML = `
+              <td class="px-4 py-3 text-gray-400 whitespace-nowrap text-xs">${new Date(ev.ledger_timestamp).toLocaleTimeString()}</td>
+              <td class="px-4 py-3 font-mono text-gray-300 text-xs">${ev.ledger_sequence}</td>
+              <td class="px-4 py-3"><span class="px-2 py-0.5 rounded-full text-xs bg-indigo-900/50 text-indigo-300 font-medium">${ev.topics?.[0] ?? ev.event_type}</span></td>
+              <td class="px-4 py-3 font-mono text-gray-400 text-xs truncate max-w-[180px] hidden md:table-cell">${ev.topics?.[1] ? ev.topics[1].slice(0, 20) + '...' : '—'}</td>
+              <td class="px-4 py-3 hidden lg:table-cell"><a href="${network === 'mainnet' ? 'https://stellar.expert/explorer/public' : 'https://stellar.expert/explorer/testnet'}/tx/${ev.transaction_hash}" target="_blank" rel="noopener noreferrer" class="font-mono text-xs text-gray-400 hover:text-indigo-300">${ev.transaction_hash.slice(0, 8)}...${ev.transaction_hash.slice(-6)}</a></td>
+              <td class="px-4 py-3 hidden xl:table-cell font-mono text-xs text-gray-500 max-w-[200px] truncate">${ev.data ? ev.data.slice(0, 60) : '—'}</td>
+            `;
+            tr.addEventListener('click', (e) => {
+              if ((e.target as HTMLElement).closest('a')) return;
+              window.location.href = tr.dataset.href!;
+            });
+            tbody.appendChild(tr);
+          }
+        }
+
+        if (data.has_more && data.next_cursor) {
+          loadMoreLink.dataset.cursor = data.next_cursor;
+          loadMoreLink.textContent = 'Load more';
+          loadMoreLink.removeAttribute('disabled');
+          // Update no-JS href too
+          const url = new URL(window.location.href);
+          url.searchParams.set('cursor', data.next_cursor);
+          loadMoreLink.href = url.pathname + url.search;
+        } else {
+          loadMoreLink.remove();
+        }
+      } catch {
+        loadMoreLink.textContent = 'Load more';
+        loadMoreLink.removeAttribute('disabled');
+      }
+    });
+  }
+</script>

@@ -8,11 +8,26 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Rust — format, lint, test
+  # Rust — format, lint, test, and SQLx prepare
   # ---------------------------------------------------------------------------
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: trident
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: trident
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +38,24 @@ jobs:
 
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Install sqlx-cli
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: sqlx-cli
+          version: latest
+          features: postgres
+          args: --no-default-features
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgres://trident:password@localhost:5432/trident
+        run: sqlx migrate run
+
+      - name: Run sqlx prepare
+        env:
+          DATABASE_URL: postgres://trident:password@localhost:5432/trident
+        run: cargo sqlx prepare --workspace
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -42,6 +75,7 @@ jobs:
     defaults:
       run:
         working-directory: services/api
+
     steps:
       - uses: actions/checkout@v4
 
@@ -60,7 +94,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v2.12.2
           working-directory: services/api
 
   # ---------------------------------------------------------------------------
@@ -72,6 +106,7 @@ jobs:
     defaults:
       run:
         working-directory: sdk/typescript
+
     steps:
       - uses: actions/checkout@v4
 
@@ -87,6 +122,38 @@ jobs:
 
       - name: Type check
         run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # OpenAPI specification — Spectral linting
+  # ---------------------------------------------------------------------------
+  openapi:
+    name: OpenAPI Spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Spectral and dependencies
+        run: npm install -g @stoplight/spectral-cli openapi-typescript
+
+      - name: Lint OpenAPI specification
+        run: spectral lint api/openapi.yaml --ruleset spectral:oas
+
+      - name: Regenerate types
+        run: openapi-typescript api/openapi.yaml -o sdk/typescript/src/api-types.gen.ts
+
+      - name: Check for uncommitted changes
+        run: |
+          if git diff --exit-code sdk/typescript/src/api-types.gen.ts; then
+            echo "✓ Generated types are up-to-date"
+          else
+            echo "✗ Generated types are stale. Run 'npm run generate:types' and commit changes."
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # Rust integration tests — real Postgres + Redis
@@ -150,6 +217,7 @@ jobs:
   docker:
     name: Docker build
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 

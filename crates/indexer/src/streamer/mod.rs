@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use trident_common::TridentError;
 
 use crate::{
@@ -140,7 +141,8 @@ impl Streamer {
                 self.refresh_contract_filter().await?;
             }
 
-            match self.poll_once(&mut cursor).await {
+            let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
+            match self.poll_once(&mut cursor).instrument(poll_span).await {
                 Ok(events_processed) => {
                     if events_processed > 0 {
                         tracing::info!(events_processed, cursor, "Batch processed");
@@ -201,6 +203,7 @@ impl Streamer {
                     metrics::record_rpc_retry();
                 }
                 async { self.rpc.get_events(sl, pc.clone(), limit).await }
+                    .instrument(tracing::info_span!("rpc_get_events"))
             })
             .await?;
 
@@ -222,7 +225,11 @@ impl Streamer {
             let mut events_in_page: i32 = 0;
             let mut skipped_in_page: u64 = 0;
             for raw in &page.events {
-                match self.parser.parse_event(raw) {
+                let parse_result = {
+                    let _span = tracing::info_span!("parse_events").entered();
+                    self.parser.parse_event(raw)
+                };
+                match parse_result {
                     Ok(Some(event)) => {
                         // Contract allowlist filtering (issue #47).
                         // None → index all; Some(set) → only listed contracts.
@@ -236,12 +243,18 @@ impl Streamer {
                                 continue;
                             }
                         }
-                        db::insert_event(&self.db, &event).await?;
+                        db::insert_event(&self.db, &event)
+                            .instrument(tracing::info_span!(
+                                "db_insert_events",
+                                contract_id = %event.contract_id
+                            ))
+                            .await?;
                         redis_stream::publish_event(
                             &mut self.redis,
                             &event,
                             self.config.redis_stream_maxlen,
                         )
+                        .instrument(tracing::info_span!("redis_xadd"))
                         .await?;
                         total += 1;
                         events_in_page += 1;

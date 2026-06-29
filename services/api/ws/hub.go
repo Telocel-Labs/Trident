@@ -7,61 +7,78 @@ import (
 	"sync"
 )
 
-// client represents a single connected WebSocket subscriber.
+// subscriber is the registration interface shared by REST WebSocket clients
+// and GraphQL subscription channels.
+type subscriber interface {
+	getContractID() string
+	trySend(msg []byte) bool // false = dropped (slow consumer)
+	shutdown()               // called by Hub.unregister to signal cleanup
+}
+
+// client is a REST WebSocket subscriber.
 type client struct {
 	contractID string
 	send       chan []byte
 }
 
-// Hub manages all active WebSocket clients and routes broadcast messages to
+func (c *client) getContractID() string { return c.contractID }
+
+func (c *client) trySend(msg []byte) bool {
+	select {
+	case c.send <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *client) shutdown() { close(c.send) }
+
+// Hub manages all active subscribers and routes broadcast messages to
 // the correct subscribers based on contractId.
 type Hub struct {
 	mu      sync.RWMutex
-	clients map[*client]struct{}
+	clients map[subscriber]struct{}
 }
 
-// NewHub constructs a Hub ready to use. Call Run in a goroutine before
-// accepting any WebSocket connections.
+// NewHub constructs a Hub ready to use.
 func NewHub() *Hub {
 	return &Hub{
-		clients: make(map[*client]struct{}),
+		clients: make(map[subscriber]struct{}),
 	}
 }
 
-// register adds c to the hub's active set. Safe to call concurrently.
-func (h *Hub) register(c *client) {
+// register adds s to the hub's active set. Safe to call concurrently.
+func (h *Hub) register(s subscriber) {
 	h.mu.Lock()
-	h.clients[c] = struct{}{}
+	h.clients[s] = struct{}{}
 	h.mu.Unlock()
-	slog.Debug("ws: client registered", "contractId", c.contractID)
+	slog.Debug("ws: client registered", "contractId", s.getContractID())
 }
 
-// unregister removes c from the hub and closes its send channel so the
-// goroutine draining it can exit cleanly.
-func (h *Hub) unregister(c *client) {
+// unregister removes s from the hub and calls shutdown so its goroutine
+// can exit cleanly.
+func (h *Hub) unregister(s subscriber) {
 	h.mu.Lock()
-	if _, ok := h.clients[c]; ok {
-		delete(h.clients, c)
-		close(c.send)
+	if _, ok := h.clients[s]; ok {
+		delete(h.clients, s)
+		s.shutdown()
 	}
 	h.mu.Unlock()
-	slog.Debug("ws: client unregistered", "contractId", c.contractID)
+	slog.Debug("ws: client unregistered", "contractId", s.getContractID())
 }
 
-// Broadcast delivers msg to every client subscribed to contractID.
-// It is safe to call from any goroutine (e.g. the Redis consumer).
-// Clients whose send buffer is full are dropped to avoid blocking the caller.
+// Broadcast delivers msg to every subscriber watching contractID.
+// It is safe to call from any goroutine. Slow consumers are dropped.
 func (h *Hub) Broadcast(contractID string, msg []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	for c := range h.clients {
-		if c.contractID != contractID {
+	for s := range h.clients {
+		if s.getContractID() != contractID {
 			continue
 		}
-		select {
-		case c.send <- msg:
-		default:
+		if !s.trySend(msg) {
 			slog.Warn("ws: dropping message for slow client", "contractId", contractID)
 		}
 	}

@@ -1,0 +1,734 @@
+openapi: 3.1.0
+info:
+  title: Trident REST API
+  description: Real-time indexing and event querying for Soroban contract events
+  version: 1.0.0
+  contact:
+    name: Trident Team
+  license:
+    name: Apache 2.0
+
+servers:
+  - url: https://api.trident.telocel.com
+    description: Production
+  - url: http://localhost:3000
+    description: Development
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /v1/health:
+    get:
+      summary: Health check
+      description: Returns indexer health status and last indexed ledger
+      operationId: getHealth
+      tags:
+        - System
+      security: []
+      responses:
+        "200":
+          description: Indexer is healthy or degraded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/events:
+    get:
+      summary: List Soroban contract events
+      description: Query events with optional filtering by contract, topics, and ledger range
+      operationId: listEvents
+      tags:
+        - Events
+      parameters:
+        - name: contract_id
+          in: query
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Filter by Soroban contract address (strkey format, 56 chars starting with C)
+          example: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
+        - name: topic_0
+          in: query
+          schema:
+            type: string
+          description: Filter by primary topic (XDR-encoded)
+        - name: topic_1
+          in: query
+          schema:
+            type: string
+          description: Filter by secondary topic (XDR-encoded)
+        - name: from_ledger
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Lower bound of ledger range (inclusive)
+        - name: to_ledger
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Upper bound of ledger range (inclusive)
+        - name: network
+          in: query
+          schema:
+            type: string
+            enum: [testnet, mainnet]
+            default: testnet
+          description: Network to query
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of events to return
+        - name: after
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response (for next page)
+      responses:
+        "200":
+          description: List of events with pagination metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/events/{id}:
+    get:
+      summary: Get a single event by ID
+      description: Retrieve a specific event by its UUID
+      operationId: getEvent
+      tags:
+        - Events
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Event UUID (v4)
+          example: 550e8400-e29b-41d4-a716-446655440000
+      responses:
+        "200":
+          description: Event details
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - event
+                properties:
+                  event:
+                    $ref: "#/components/schemas/SorobanEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Event not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/events/stream:
+    get:
+      summary: Stream events (Server-Sent Events)
+      description: Real-time event stream using Server-Sent Events (SSE)
+      operationId: streamEvents
+      tags:
+        - Events
+      parameters:
+        - name: contract_id
+          in: query
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Contract to subscribe to
+          required: true
+        - name: topic_0
+          in: query
+          schema:
+            type: string
+          description: Optional topic filter
+      responses:
+        "200":
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/events/batch:
+    post:
+      summary: Get multiple events by ID
+      description: Retrieve multiple events in a single request (up to 100)
+      operationId: batchGetEvents
+      tags:
+        - Events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - ids
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  maxItems: 100
+                  description: List of event UUIDs
+              example:
+                ids:
+                  - 550e8400-e29b-41d4-a716-446655440000
+                  - 550e8400-e29b-41d4-a716-446655440001
+      responses:
+        "200":
+          description: Multiple event details
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - events
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SorobanEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/stats/indexer:
+    get:
+      summary: Get indexer statistics
+      description: Returns real-time indexer health metrics and throughput
+      operationId: getIndexerStats
+      tags:
+        - Statistics
+      security: []
+      responses:
+        "200":
+          description: Indexer statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexerStatsResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/stats/contracts:
+    get:
+      summary: Get contract activity statistics
+      description: Returns contracts sorted by event count with optional ledger range filtering
+      operationId: getContractStats
+      tags:
+        - Statistics
+      parameters:
+        - name: from_ledger
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Lower bound of ledger range (inclusive, default 0 for all time)
+        - name: to_ledger
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Upper bound of ledger range (inclusive, default latest indexed)
+        - name: network
+          in: query
+          schema:
+            type: string
+            enum: [testnet, mainnet]
+            default: testnet
+          description: Network to query
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Number of top contracts to return
+      responses:
+        "200":
+          description: Contract activity statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractStatsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/api-keys:
+    post:
+      summary: Create an API key
+      description: Generate a new API key for authentication
+      operationId: createApiKey
+      tags:
+        - API Keys
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  description: Human-readable label for this key
+                network:
+                  type: string
+                  enum: [testnet, mainnet]
+                  default: mainnet
+                  description: Network this key is associated with
+                rate_limit_tier:
+                  type: string
+                  enum: [free, standard, premium, internal]
+                  default: standard
+                  description: Rate limit tier for this key
+      responses:
+        "201":
+          description: API key created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  key:
+                    type: string
+                    description: The raw API key (shown only once)
+                  key_prefix:
+                    type: string
+                    description: First 16 characters of key for reference
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    get:
+      summary: List API keys
+      description: List all API keys (admin only)
+      operationId: listApiKeys
+      tags:
+        - API Keys
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: List of API keys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        key_prefix:
+                          type: string
+                        label:
+                          type: string
+                        network:
+                          type: string
+                        rate_limit_tier:
+                          type: string
+                        last_used_at:
+                          type: string
+                          format: date-time
+                        request_count:
+                          type: integer
+                        created_at:
+                          type: string
+                          format: date-time
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/api-keys/{id}:
+    delete:
+      summary: Delete an API key
+      description: Revoke and delete an API key (admin only)
+      operationId: deleteApiKey
+      tags:
+        - API Keys
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: API key ID
+      responses:
+        "204":
+          description: API key deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: API key not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/admin/db:
+    get:
+      summary: Database admin statistics
+      description: Returns database and connection pool statistics (admin only)
+      operationId: getAdminDbStats
+      tags:
+        - Admin
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Database statistics
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      description: Exposes Prometheus-formatted metrics
+      operationId: getMetrics
+      tags:
+        - Metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus metrics
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+
+components:
+  schemas:
+    SorobanEvent:
+      type: object
+      required:
+        - id
+        - contract_id
+        - ledger_sequence
+        - ledger_timestamp
+        - transaction_hash
+        - event_index
+        - event_type
+        - topics
+        - data
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique event identifier
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        ledger_sequence:
+          type: integer
+          format: uint64
+          description: Ledger sequence number
+        ledger_timestamp:
+          type: string
+          format: date-time
+          description: Ledger timestamp in ISO 8601 format
+        transaction_hash:
+          type: string
+          description: Transaction hash (XDR-encoded)
+        event_index:
+          type: integer
+          format: uint32
+          description: Event index within transaction
+        event_type:
+          type: string
+          enum: [contract, system, diagnostic]
+          description: Type of event
+        topics:
+          type: array
+          items:
+            type: string
+          description: Event topics (XDR-encoded)
+        data:
+          type: string
+          description: Event data (XDR-encoded)
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp when event was indexed
+
+    EventListResponse:
+      type: object
+      required:
+        - events
+        - has_more
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/SorobanEvent"
+          description: List of events
+        has_more:
+          type: boolean
+          description: Whether more results are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for next page (null if has_more is false)
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - indexer
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          description: Overall system status
+        indexer:
+          type: object
+          required:
+            - last_ledger_indexed
+          properties:
+            last_ledger_indexed:
+              type: integer
+              format: int64
+              nullable: true
+              description: Latest indexed ledger sequence
+            last_poll_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: Timestamp of last successful indexer poll
+
+    IndexerStatsResponse:
+      type: object
+      required:
+        - status
+        - network
+      properties:
+        status:
+          type: string
+          enum: [healthy, lagging, stalled]
+          description: Indexer health status
+        network:
+          type: string
+          description: Network name from NETWORK environment variable
+        last_ledger_indexed:
+          type: integer
+          format: int64
+          nullable: true
+          description: Latest indexed ledger sequence
+        chain_tip_ledger:
+          type: integer
+          format: int64
+          nullable: true
+          description: Current chain tip ledger (from RPC)
+        lag_ledgers:
+          type: integer
+          format: int64
+          nullable: true
+          description: Number of ledgers behind chain tip
+        events_indexed_total:
+          type: integer
+          format: int64
+          nullable: true
+          description: Cumulative events indexed
+        events_last_poll:
+          type: integer
+          format: int32
+          nullable: true
+          description: Events processed in last poll
+        avg_poll_duration_ms:
+          type: integer
+          format: int32
+          nullable: true
+          description: Average poll duration in milliseconds
+        last_poll_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp of last successful poll
+
+    ContractStatsResponse:
+      type: object
+      required:
+        - contracts
+        - from_ledger
+        - to_ledger
+        - network
+        - generated_at
+      properties:
+        contracts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractStats"
+          description: Contracts sorted by event count (descending)
+        from_ledger:
+          type: integer
+          format: int64
+          description: Lower bound of queried ledger range
+        to_ledger:
+          type: integer
+          format: int64
+          description: Upper bound of queried ledger range
+        network:
+          type: string
+          enum: [testnet, mainnet]
+          description: Network queried
+        generated_at:
+          type: string
+          format: date-time
+          description: Timestamp when response was generated
+
+    ContractStats:
+      type: object
+      required:
+        - contract_id
+        - event_count
+        - last_seen_ledger
+        - last_seen_at
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        event_count:
+          type: integer
+          format: int64
+          description: Total events for this contract in range
+        last_seen_ledger:
+          type: integer
+          format: int64
+          description: Latest ledger sequence for this contract
+        last_seen_at:
+          type: string
+          format: date-time
+          description: Timestamp of last event for this contract
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)
+            message:
+              type: string
+              description: Human-readable error message
+            request_id:
+              type: string
+              description: Request ID for debugging
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    ServiceUnavailable:
+      description: Service temporarily unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for authentication
+
+    AdminKey:
+      type: apiKey
+      in: header
+      name: ADMIN_API_KEY
+      description: Admin key for admin endpoints (environment variable)
+
+tags:
+  - name: System
+    description: System and health endpoints
+  - name: Events
+    description: Event querying and streaming
+  - name: Statistics
+    description: Analytics and statistics endpoints
+  - name: API Keys
+    description: API key management (admin only)
+  - name: Admin
+    description: Admin endpoints
+  - name: Metrics
+    description: Monitoring and metrics
