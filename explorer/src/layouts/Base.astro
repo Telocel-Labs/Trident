@@ -1,0 +1,61 @@
+---
+interface Props {
+  title: string;
+  description?: string;
+  ogTitle?: string;
+  ogDescription?: string;
+}
+
+const {
+  title,
+  description = 'Explore Soroban contract events on Stellar with Trident.',
+  ogTitle,
+  ogDescription,
+} = Astro.props;
+
+const fullTitle = title ? `${title} | Trident Explorer` : 'Trident Explorer';
+---
+
+<!doctype html>
+<html lang="en" class="h-full bg-gray-950 text-gray-100">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    {ogTitle && <meta property="og:title" content={ogTitle} />}
+    {ogDescription && <meta property="og:description" content={ogDescription} />}
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Trident Explorer" />
+  </head>
+  <body class="min-h-full flex flex-col antialiased">
+    <header class="sticky top-0 z-10 bg-gray-950 border-b border-gray-800 px-4 py-3 flex items-center justify-between">
+      <a href="/" class="font-bold text-white tracking-tight text-lg">
+        <span aria-hidden="true">&#x1F531;</span> Trident
+      </a>
+      <nav class="flex gap-5 text-sm text-gray-400">
+        <a href="/" class="hover:text-white transition-colors">Explorer</a>
+        <a
+          href="https://docs.trident.dev"
+          class="hover:text-white transition-colors"
+          target="_blank"
+          rel="noopener noreferrer">Docs</a
+        >
+        <a
+          href="https://app.trident.dev/signup"
+          class="hover:text-white transition-colors"
+          target="_blank"
+          rel="noopener noreferrer">Get API Key</a
+        >
+      </nav>
+    </header>
+
+    <main class="flex-1 w-full max-w-6xl mx-auto px-4 py-8">
+      <slot />
+    </main>
+
+    <footer class="border-t border-gray-800 px-4 py-4 text-center text-xs text-gray-500">
+      Trident &mdash; Soroban Event Indexer for Stellar
+    </footer>
+  </body>
+</html>

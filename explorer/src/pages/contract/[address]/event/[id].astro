@@ -1,0 +1,157 @@
+---
+import Base from '../../../../layouts/Base.astro';
+import { getEvent } from '../../../../lib/api';
+import { truncate, stellarExpertBase, tryFormatJson } from '../../../../lib/format';
+import type { Network } from '../../../../lib/types';
+
+const { address, id } = Astro.params as { address: string; id: string };
+const rawNetwork = Astro.url.searchParams.get('network');
+const network: Network = rawNetwork === 'mainnet' ? 'mainnet' : 'testnet';
+
+let event: Awaited<ReturnType<typeof getEvent>> | null = null;
+let fetchError = '';
+try {
+  event = await getEvent(id, network);
+} catch (err) {
+  fetchError = err instanceof Error ? err.message : 'Event not found';
+}
+
+const shortAddr = truncate(address);
+const shortId = truncate(id, 8, 8);
+const expertBase = stellarExpertBase(network);
+
+const ogTitle = event
+  ? `Event ${shortId} — ${event.topics[0] ?? event.event_type} on ${network}`
+  : `Event ${shortId}`;
+const ogDescription = event
+  ? `Soroban event at ledger ${event.ledger_sequence}. Contract: ${shortAddr}. Type: ${event.topics[0] ?? event.event_type}.`
+  : 'Soroban event detail.';
+---
+
+<Base
+  title={`Event ${shortId}`}
+  description={ogDescription}
+  ogTitle={ogTitle}
+  ogDescription={ogDescription}
+>
+  <!-- Breadcrumb -->
+  <nav class="text-xs text-gray-500 mb-6 flex items-center gap-1.5 flex-wrap" aria-label="Breadcrumb">
+    <a href={`/?network=${network}`} class="hover:text-white">Home</a>
+    <span>/</span>
+    <a href={`/contract/${address}?network=${network}`} class="hover:text-white font-mono" title={address}>
+      {shortAddr}
+    </a>
+    <span>/</span>
+    <span class="text-gray-300 font-mono" title={id}>{shortId}</span>
+  </nav>
+
+  {fetchError ? (
+    <div class="rounded-lg bg-red-900/30 border border-red-800 px-4 py-3 text-sm text-red-300">
+      {fetchError}
+    </div>
+  ) : event ? (
+    <div class="space-y-6">
+      <!-- Header -->
+      <div class="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 class="text-xl font-bold text-white mb-1">
+            Event
+            <span class="font-mono text-indigo-300 text-base ml-2">{shortId}</span>
+          </h1>
+          <div class="flex gap-2 items-center flex-wrap mt-1">
+            <span class="px-2 py-0.5 rounded-full text-xs bg-indigo-900/50 text-indigo-300 font-medium">
+              {event.topics[0] ?? event.event_type}
+            </span>
+            <span
+              class={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                network === 'mainnet'
+                  ? 'bg-amber-900/40 text-amber-400'
+                  : 'bg-blue-900/40 text-blue-400'
+              }`}
+            >
+              {network}
+            </span>
+            <span class="text-gray-500 text-xs">
+              Ledger {event.ledger_sequence}
+            </span>
+          </div>
+        </div>
+
+        <button
+          id="share-btn"
+          class="px-4 py-2 rounded bg-gray-800 hover:bg-gray-700 text-sm text-gray-300 hover:text-white transition-colors shrink-0"
+        >
+          Share ↗
+        </button>
+      </div>
+
+      <!-- Details card -->
+      <div class="rounded-lg border border-gray-800 divide-y divide-gray-800">
+        {[
+          { label: 'Event ID', value: event.id, mono: true },
+          { label: 'Contract', value: event.contract_id, mono: true, link: `${expertBase}/contract/${event.contract_id}` },
+          { label: 'Ledger', value: String(event.ledger_sequence), mono: false },
+          { label: 'Timestamp', value: event.ledger_timestamp, mono: false },
+          { label: 'Tx Hash', value: event.transaction_hash, mono: true, link: `${expertBase}/tx/${event.transaction_hash}` },
+          { label: 'Event Index', value: String(event.event_index), mono: false },
+          { label: 'Event Type', value: event.event_type, mono: false },
+        ].map(({ label, value, mono, link }) => (
+          <div class="flex gap-4 px-4 py-3 text-sm">
+            <span class="text-gray-400 w-28 shrink-0">{label}</span>
+            {link ? (
+              <a
+                href={link}
+                target="_blank"
+                rel="noopener noreferrer"
+                class={`break-all hover:text-indigo-300 underline underline-offset-2 ${mono ? 'font-mono text-gray-200' : 'text-gray-200'}`}
+              >
+                {value}
+              </a>
+            ) : (
+              <span class={`break-all ${mono ? 'font-mono text-gray-200' : 'text-gray-200'}`}>{value}</span>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <!-- Topics -->
+      <div>
+        <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-widest mb-3">Topics</h2>
+        <div class="rounded-lg border border-gray-800 divide-y divide-gray-800">
+          {event.topics.length === 0 ? (
+            <div class="px-4 py-3 text-sm text-gray-500">No topics.</div>
+          ) : (
+            event.topics.map((topic, i) => (
+              <div class="flex gap-4 px-4 py-3 text-sm">
+                <span class="text-gray-400 w-28 shrink-0">topic_{i}</span>
+                <span class="font-mono text-gray-200 break-all">{topic}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      <!-- Data -->
+      <div>
+        <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-widest mb-3">Data</h2>
+        <pre class="rounded-lg border border-gray-800 bg-gray-900 px-4 py-3 text-xs font-mono text-gray-200 overflow-x-auto whitespace-pre-wrap break-all">
+{event.data ? tryFormatJson(event.data) : '(empty)'}
+        </pre>
+      </div>
+    </div>
+  ) : null}
+</Base>
+
+<script>
+  const shareBtn = document.getElementById('share-btn') as HTMLButtonElement | null;
+  if (shareBtn) {
+    shareBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(window.location.href);
+        const orig = shareBtn.textContent;
+        shareBtn.textContent = 'Link copied!';
+        setTimeout(() => { shareBtn.textContent = orig; }, 1500);
+      } catch { /* clipboard unavailable */ }
+    });
+  }
+</script>
