@@ -11,7 +11,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 # HTTP client for Stellar RPC JSON-RPC calls
 reqwest = { version = "0.11", features = ["json"] }
@@ -54,6 +54,12 @@ tokio-util = "0.7"
 # Prometheus /metrics endpoint
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
+
+# OpenTelemetry distributed tracing (issue #81)
+opentelemetry = { version = "0.22", features = ["trace"] }
+opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.23"
 
 [dev-dependencies]
 # Mock HTTP server for RPC integration tests
