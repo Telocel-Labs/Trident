@@ -30,6 +30,7 @@ var (
 type DBPool interface {
 	Ping(ctx context.Context) error
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
