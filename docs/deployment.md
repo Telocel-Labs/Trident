@@ -511,3 +511,65 @@ Fly automatically redeploys the app when secrets change.
 fly releases -a trident-api          # list releases
 fly deploy --image-label <version> -a trident-api  # roll back to a specific release
 ```
+
+---
+
+## Distributed Tracing (OpenTelemetry)
+
+All three Trident services — `trident-go-api`, `trident-grpc-api`, and `trident-indexer` — are instrumented with OpenTelemetry. Tracing is **opt-in**: set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable it; leave it empty for zero overhead.
+
+### Local development with Jaeger
+
+`docker/docker-compose.dev.yml` includes a Jaeger all-in-one container. Start it alongside the other infrastructure dependencies:
+
+```bash
+docker compose -f docker/docker-compose.dev.yml up -d
+```
+
+Then set the following in your `.env` before starting the services:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+OTEL_SAMPLING_RATIO=1.0
+```
+
+Open the Jaeger UI at **http://localhost:16686** and search by service name:
+
+- `trident-go-api` — HTTP handler spans and outbound gRPC call spans
+- `trident-grpc-api` — inbound gRPC handler spans and SQL query spans
+- `trident-indexer` — poll cycle, RPC, parse, DB insert, and Redis publish spans
+
+A single `GET /v1/events` request produces a trace with spans linked across all three services via the W3C `traceparent` header.
+
+### Production (Grafana Tempo on Fly.io)
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your Grafana Tempo OTLP gRPC endpoint on each app:
+
+```bash
+fly secrets set -a trident-api       OTEL_EXPORTER_OTLP_ENDPOINT="https://tempo.your-org.grafana.net:443"
+fly secrets set -a trident-grpc-api  OTEL_EXPORTER_OTLP_ENDPOINT="https://tempo.your-org.grafana.net:443"
+fly secrets set -a trident-indexer   OTEL_EXPORTER_OTLP_ENDPOINT="https://tempo.your-org.grafana.net:443"
+```
+
+Set the sampling ratio (default 10% in production):
+
+```bash
+fly secrets set -a trident-api       OTEL_SAMPLING_RATIO=0.1
+fly secrets set -a trident-grpc-api  OTEL_SAMPLING_RATIO=0.1
+fly secrets set -a trident-indexer   OTEL_SAMPLING_RATIO=0.1
+```
+
+### Span attributes
+
+| Service | Span name | Key attributes |
+|---|---|---|
+| `trident-go-api` | HTTP handler (auto via `otelhttp`) | `http.method`, `http.status_code`, `http.route` |
+| `trident-go-api` | gRPC client call (auto via `otelgrpc`) | `rpc.system`, `rpc.method` |
+| `trident-grpc-api` | `list_events` | `rpc.system`, `contract_id` |
+| `trident-grpc-api` | `get_event` | `rpc.system` |
+| `trident-grpc-api` | `stream_events` | `rpc.system` |
+| `trident-indexer` | `poll_cycle` | `cursor` |
+| `trident-indexer` | `rpc_get_events` | — |
+| `trident-indexer` | `parse_events` | — |
+| `trident-indexer` | `db_insert_events` | `contract_id` |
+| `trident-indexer` | `redis_xadd` | — |

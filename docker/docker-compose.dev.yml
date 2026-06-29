@@ -31,6 +31,14 @@ services:
       - redis_dev_data:/data
     command: redis-server --appendonly yes
 
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
 volumes:
   postgres_dev_data:
   redis_dev_data:

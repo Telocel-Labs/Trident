@@ -1,4 +1,7 @@
+use opentelemetry_otlp::WithExportConfig;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 mod alerting;
@@ -10,10 +13,44 @@ mod redis_stream;
 mod rpc;
 mod streamer;
 
+fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+    let sampling_ratio = std::env::var("OTEL_SAMPLING_RATIO")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.1);
+
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    match opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint))
+        .with_trace_config(
+            opentelemetry_sdk::trace::Config::default()
+                .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(sampling_ratio))
+                .with_resource(opentelemetry_sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new("service.name", "trident-indexer"),
+                ])),
+        )
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+    {
+        Ok(tracer) => Some(tracer),
+        Err(e) => {
+            eprintln!("Failed to initialise OpenTelemetry tracer: {e}");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+    let tracer = init_tracer();
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracer.map(|t| tracing_opentelemetry::layer().with_tracer(t)))
         .init();
 
     tracing::info!("Trident indexer starting");
