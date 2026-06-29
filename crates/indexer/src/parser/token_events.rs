@@ -6,6 +6,7 @@ use stellar_xdr::curr::ScVal;
 
 /// Attempt to decode a known SEP-41 token event from decoded topics and data.
 /// Returns Some(structured_json) on success, None on any failure (logs DEBUG).
+#[allow(dead_code)] // Functions are used in tests
 pub fn try_decode_token_event(topics: &[ScVal], data: &ScVal) -> Option<Json> {
     let name = match topics.first() {
         Some(ScVal::Symbol(s)) => s.to_utf8_string_lossy(),
@@ -45,6 +46,7 @@ fn decode_transfer(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     Ok(json!({ "event": "transfer", "from": from, "to": to, "amount": amount }))
 }
 
+#[allow(dead_code)]
 fn decode_mint(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     let admin = addr_topic(topics, 1, "mint.admin")?;
     let to = addr_topic(topics, 2, "mint.to")?;
@@ -52,12 +54,14 @@ fn decode_mint(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     Ok(json!({ "event": "mint", "admin": admin, "to": to, "amount": amount }))
 }
 
+#[allow(dead_code)]
 fn decode_burn(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     let from = addr_topic(topics, 1, "burn.from")?;
     let amount = i128_data(data, "burn.amount")?;
     Ok(json!({ "event": "burn", "from": from, "amount": amount }))
 }
 
+#[allow(dead_code)]
 fn decode_clawback(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     let admin = addr_topic(topics, 1, "clawback.admin")?;
     let from = addr_topic(topics, 2, "clawback.from")?;
@@ -65,12 +69,14 @@ fn decode_clawback(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     Ok(json!({ "event": "clawback", "admin": admin, "from": from, "amount": amount }))
 }
 
+#[allow(dead_code)]
 fn decode_set_admin(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     let admin = addr_topic(topics, 1, "set_admin.admin")?;
     let new_admin = addr_scval(data, "set_admin.new_admin")?;
     Ok(json!({ "event": "set_admin", "admin": admin, "new_admin": new_admin }))
 }
 
+#[allow(dead_code)]
 fn decode_set_authorized(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     let admin = addr_topic(topics, 1, "set_authorized.admin")?;
     let id = addr_topic(topics, 2, "set_authorized.id")?;
@@ -86,12 +92,14 @@ fn decode_set_authorized(topics: &[ScVal], data: &ScVal) -> Result<Json, String>
     Ok(json!({ "event": "set_authorized", "admin": admin, "id": id, "authorize": authorize }))
 }
 
+#[allow(dead_code)]
 fn decode_increase_supply(topics: &[ScVal], data: &ScVal) -> Result<Json, String> {
     let admin = addr_topic(topics, 1, "increase_supply.admin")?;
     let amount = i128_data(data, "increase_supply.amount")?;
     Ok(json!({ "event": "increase_supply", "admin": admin, "amount": amount }))
 }
 
+#[allow(dead_code)]
 fn addr_topic(topics: &[ScVal], index: usize, field: &str) -> Result<String, String> {
     match topics.get(index) {
         Some(ScVal::Address(addr)) => Ok(scaddress_to_string(addr)),
@@ -103,6 +111,7 @@ fn addr_topic(topics: &[ScVal], index: usize, field: &str) -> Result<String, Str
     }
 }
 
+#[allow(dead_code)]
 fn addr_scval(val: &ScVal, field: &str) -> Result<String, String> {
     match val {
         ScVal::Address(addr) => Ok(scaddress_to_string(addr)),
@@ -114,6 +123,7 @@ fn addr_scval(val: &ScVal, field: &str) -> Result<String, String> {
 }
 
 /// i128 values are always stored as JSON strings to preserve full precision.
+#[allow(dead_code)]
 fn i128_data(val: &ScVal, field: &str) -> Result<String, String> {
     match val {
         ScVal::I128(parts) => {

@@ -20,7 +20,8 @@
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "lint": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "generate:types": "openapi-typescript ../../api/openapi.yaml -o src/api-types.gen.ts"
   },
   "dependencies": {
     "zod": "^3.22.4"

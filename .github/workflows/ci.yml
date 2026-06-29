@@ -124,6 +124,38 @@ jobs:
         run: npm run lint
 
   # ---------------------------------------------------------------------------
+  # OpenAPI specification — Spectral linting
+  # ---------------------------------------------------------------------------
+  openapi:
+    name: OpenAPI Spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Spectral and dependencies
+        run: npm install -g @stoplight/spectral-cli openapi-typescript
+
+      - name: Lint OpenAPI specification
+        run: spectral lint api/openapi.yaml --ruleset spectral:oas
+
+      - name: Regenerate types
+        run: openapi-typescript api/openapi.yaml -o sdk/typescript/src/api-types.gen.ts
+
+      - name: Check for uncommitted changes
+        run: |
+          if git diff --exit-code sdk/typescript/src/api-types.gen.ts; then
+            echo "✓ Generated types are up-to-date"
+          else
+            echo "✗ Generated types are stale. Run 'npm run generate:types' and commit changes."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
   # Rust integration tests — real Postgres + Redis
   # Runs integration tests that are silently skipped when TEST_DATABASE_URL
   # and TEST_REDIS_URL are absent. Scoped to push/PR against main and dev.
