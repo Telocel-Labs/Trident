@@ -165,3 +165,55 @@ jobs:
           tags: trident-go-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Helm — lint, template render, and kind cluster deployment validation
+  # ---------------------------------------------------------------------------
+  helm:
+    name: Helm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Lint chart
+        run: helm lint helm/trident
+
+      - name: Render templates
+        run: helm template trident helm/trident | kubectl apply --dry-run=client -f -
+        env:
+          KUBECONFIG: /dev/null
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: trident-ci
+
+      - name: Create CI secrets
+        run: |
+          kubectl create secret generic trident-secrets \
+            --from-literal=DATABASE_URL="postgres://trident:trident@postgres:5432/trident" \
+            --from-literal=REDIS_URL="redis://redis:6379" \
+            --from-literal=ADMIN_API_KEY="ci-admin-key"
+
+      - name: Install chart (CI values — nginx only, no image pull)
+        run: |
+          helm install trident helm/trident \
+            --set indexer.image.repository=busybox \
+            --set indexer.image.tag=latest \
+            --set grpcApi.image.repository=busybox \
+            --set grpcApi.image.tag=latest \
+            --set goApi.image.repository=busybox \
+            --set goApi.image.tag=latest \
+            --wait=false \
+            --timeout=60s
+
+      - name: Verify Kubernetes resources are created
+        run: |
+          kubectl get deployments
+          kubectl get services
+          kubectl get hpa
