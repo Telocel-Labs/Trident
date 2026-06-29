@@ -137,14 +137,11 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install Spectral CLI
-        run: npm install -g @stoplight/spectral-cli
+      - name: Install Spectral and dependencies
+        run: npm install -g @stoplight/spectral-cli @stoplight/spectral-rulesets openapi-typescript
 
       - name: Lint OpenAPI specification
-        run: spectral lint api/openapi.yaml --ruleset @stoplight/spectral-oas
-
-      - name: Install openapi-typescript
-        run: npm install -g openapi-typescript
+        run: spectral lint api/openapi.yaml --ruleset @stoplight/spectral-rulesets/rulesets/oas
 
       - name: Regenerate types
         run: openapi-typescript api/openapi.yaml -o sdk/typescript/src/api-types.gen.ts
