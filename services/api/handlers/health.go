@@ -19,6 +19,7 @@ const healthStalenessThreshold = 60 * time.Second
 // are pooled (the production server uses a *pgxpool.Pool behind PgBouncer).
 type DBPool interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 // HealthRow holds the columns we read from system_state for the health check.
