@@ -3,85 +3,124 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"sync"
 	"time"
 
-	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+
+	"github.com/Depo-dev/trident/services/api/gen"
 )
 
-const healthStalenessThreshold = 60 * time.Second
+const healthCheckTimeout = 3 * time.Second
 
-// DBPool is the minimal query surface the health check needs. Both *pgx.Conn
-// and *pgxpool.Pool satisfy it, so handlers stay agnostic to how connections
-// are pooled (the production server uses a *pgxpool.Pool behind PgBouncer).
+var (
+	errNoDatabase   = errors.New("not configured")
+	errNoRedis      = errors.New("not configured")
+	errNoGRPCClient = errors.New("not configured")
+)
+
+// DBPool is the subset of pgxpool.Pool used across handlers.
+// Ping is required so the health check can detect a broken pool that was
+// created successfully but whose underlying connections have since died.
 type DBPool interface {
+	Ping(ctx context.Context) error
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// HealthRow holds the columns we read from system_state for the health check.
-type HealthRow struct {
-	LastLedgerIndexed sql.NullInt64
-	LastPollAt        sql.NullTime
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
-// HealthResponse is the JSON body returned by GET /v1/health.
+// RedisPinger is the subset of *redis.Client used by the health check.
+type RedisPinger interface {
+	Ping(ctx context.Context) *redis.StatusCmd
+}
+
+// EventsLister is the subset of gen.EventsClient used by the health check.
+type EventsLister interface {
+	ListEvents(ctx context.Context, in *gen.ListEventsRequest, opts ...grpc.CallOption) (*gen.ListEventsResponse, error)
+}
+
+// HealthChecks holds the per-dependency check results.
+type HealthChecks struct {
+	Postgres string `json:"postgres"`
+	Redis    string `json:"redis"`
+	GRPCAPI  string `json:"grpc_api"`
+}
+
+// HealthResponse is the JSON body for GET /v1/health.
 type HealthResponse struct {
-	Status  string `json:"status"`
-	Indexer struct {
-		LastLedgerIndexed *int64  `json:"last_ledger_indexed"`
-		LastPollAt        *string `json:"last_poll_at"`
-	} `json:"indexer"`
+	Status     string       `json:"status"`
+	IndexerLag *int64       `json:"indexer_lag"`
+	Checks     HealthChecks `json:"checks"`
 }
 
 // Health handles GET /v1/health.
 //
-// Acceptance criteria (issue #62):
-//   - Returns the indexer's last_ledger_indexed and last_poll_at fields from system_state.
-//   - Returns HTTP 503 with status "degraded" when last_poll_at is NULL or older than 60 s.
-//   - Returns HTTP 200 with status "ok" otherwise.
-//
-// db may be nil when DATABASE_URL is not configured; the endpoint returns 503 in that case.
-func Health(db DBPool) http.HandlerFunc {
+// Runs Postgres, Redis, and gRPC checks concurrently with a shared
+// 3-second timeout. Returns 200 when all checks pass, 503 when any fail.
+// The indexer_lag field is populated from system_state when Postgres is
+// healthy and the chain tip is available in the cache; null otherwise.
+func Health(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if db == nil {
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "database connection unavailable")
-			return
-		}
+		parentCtx := r.Context()
 
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-
-		var lastLedger *int64
-		var lastPollAt *time.Time
-
-		row := db.QueryRow(ctx,
-			`SELECT last_ledger_indexed, last_poll_at
-			   FROM system_state
-			  WHERE key = 'latest_ledger_cursor'`,
+		var (
+			wg         sync.WaitGroup
+			pgErr      error
+			lastLedger *int64
+			redisErr   error
+			grpcErr    error
 		)
 
-		// Scan into nullable pointers using pgx semantics.
-		err := row.Scan(&lastLedger, &lastPollAt)
-		if err != nil && err != pgx.ErrNoRows {
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "database query failed")
-			return
+		wg.Add(3)
+
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(parentCtx, healthCheckTimeout)
+			defer cancel()
+			lastLedger, pgErr = checkPostgres(ctx, db)
+		}()
+
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(parentCtx, healthCheckTimeout)
+			defer cancel()
+			redisErr = checkRedis(ctx, redisClient)
+		}()
+
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(parentCtx, healthCheckTimeout)
+			defer cancel()
+			grpcErr = checkGRPC(ctx, grpcClient)
+		}()
+
+		wg.Wait()
+
+		resp := HealthResponse{
+			Checks: HealthChecks{
+				Postgres: resultString(pgErr),
+				Redis:    resultString(redisErr),
+				GRPCAPI:  resultString(grpcErr),
+			},
 		}
 
-		var resp HealthResponse
-
-		if lastLedger != nil {
-			resp.Indexer.LastLedgerIndexed = lastLedger
-		}
-		if lastPollAt != nil {
-			s := lastPollAt.UTC().Format(time.RFC3339)
-			resp.Indexer.LastPollAt = &s
+		if pgErr == nil && lastLedger != nil {
+			if tip := globalChainTipCache.get(parentCtx); tip != nil {
+				lag := *tip - *lastLedger
+				resp.IndexerLag = &lag
+			}
 		}
 
-		// Degraded if last_poll_at is null or older than 60 seconds.
-		if lastPollAt == nil || time.Since(*lastPollAt) > healthStalenessThreshold {
+		if pgErr != nil || redisErr != nil || grpcErr != nil {
 			resp.Status = "degraded"
 			writeJSON(w, http.StatusServiceUnavailable, resp)
 			return
@@ -92,8 +131,47 @@ func Health(db DBPool) http.HandlerFunc {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+func resultString(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "error: " + err.Error()
+}
+
+// checkPostgres pings the pool then queries system_state for the indexer's
+// last processed ledger. Returns (nil, errNoDatabase) when db is nil,
+// (nil, err) on ping/query failure, (&ledger, nil) on success, or
+// (nil, nil) when the system_state row doesn't exist yet (ErrNoRows).
+func checkPostgres(ctx context.Context, db DBPool) (*int64, error) {
+	if db == nil {
+		return nil, errNoDatabase
+	}
+	// Ping first so a broken pool is detected even if QueryRow would succeed
+	// by returning a cached-but-stale row.
+	if err := db.Ping(ctx); err != nil {
+		return nil, err
+	}
+	var lastLedger *int64
+	row := db.QueryRow(ctx,
+		`SELECT last_ledger_indexed FROM system_state WHERE key = 'latest_ledger_cursor'`,
+	)
+	if err := row.Scan(&lastLedger); err != nil && err != pgx.ErrNoRows {
+		return nil, err
+	}
+	return lastLedger, nil
+}
+
+func checkRedis(ctx context.Context, redisClient RedisPinger) error {
+	if redisClient == nil {
+		return errNoRedis
+	}
+	return redisClient.Ping(ctx).Err()
+}
+
+func checkGRPC(ctx context.Context, client EventsLister) error {
+	if client == nil {
+		return errNoGRPCClient
+	}
+	_, err := client.ListEvents(ctx, &gen.ListEventsRequest{Limit: 0})
+	return err
 }
