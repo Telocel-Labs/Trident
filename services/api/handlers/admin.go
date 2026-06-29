@@ -3,8 +3,13 @@ package handlers
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/google/uuid"
 )
 
 // adminStatsTimeout bounds how long the admin endpoint waits on PgBouncer.
@@ -30,6 +35,7 @@ type DBStats struct {
 type AdminConfig struct {
 	AdminKey  string
 	StatsFunc func(ctx context.Context) (*DBStats, error)
+	DB        *pgxpool.Pool // for audit log queries
 }
 
 // AdminDB handles GET /v1/admin/db.
@@ -75,4 +81,128 @@ func validAdminKey(expected, provided string) bool {
 
 func errorBody(message string) map[string]any {
 	return map[string]any{"error": map[string]string{"message": message}}
+}
+
+// AdminKeyUsageResponse is the response for GET /v1/admin/keys/:id/usage.
+type AdminKeyUsageResponse struct {
+	APIKeyID           string                `json:"api_key_id"`
+	From               string                `json:"from"`
+	To                 string                `json:"to"`
+	TotalRequests      int64                 `json:"total_requests"`
+	SuccessfulRequests int64                 `json:"successful_requests"`
+	ByEndpoint         []AdminEndpointUsage  `json:"by_endpoint"`
+}
+
+type AdminEndpointUsage struct {
+	Endpoint        string  `json:"endpoint"`
+	Requests        int64   `json:"requests"`
+	AvgDurationMs   float64 `json:"avg_duration_ms"`
+}
+
+// AdminKeyUsage handles GET /v1/admin/keys/:id/usage.
+//
+// Returns aggregated usage statistics for an API key from the audit log.
+// Query params: from (RFC3339, required), to (RFC3339, required).
+func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cfg.AdminKey == "" || cfg.DB == nil {
+			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin usage endpoint is not configured"))
+			return
+		}
+
+		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
+			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			return
+		}
+
+		keyIDStr := r.PathValue("id")
+		if keyIDStr == "" {
+			writeJSON(w, http.StatusBadRequest, errorBody("missing api key id"))
+			return
+		}
+		keyID, err := uuid.Parse(keyIDStr)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody("invalid api key id"))
+			return
+		}
+
+		fromStr := r.URL.Query().Get("from")
+		toStr := r.URL.Query().Get("to")
+		if fromStr == "" || toStr == "" {
+			writeJSON(w, http.StatusBadRequest, errorBody("from and to query parameters are required (RFC3339)"))
+			return
+		}
+
+		from, err := time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody("invalid from timestamp format, use RFC3339"))
+			return
+		}
+		to, err := time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody("invalid to timestamp format, use RFC3339"))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), adminStatsTimeout)
+		defer cancel()
+
+		// Total requests
+		var totalReqs int64
+		err = cfg.DB.QueryRow(ctx,
+			`SELECT COUNT(*) FROM audit_log WHERE api_key_id = $1 AND ts >= $2 AND ts < $3`,
+			keyID, from, to,
+		).Scan(&totalReqs)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query total requests"))
+			return
+		}
+
+		// Successful requests (2xx)
+		var successReqs int64
+		err = cfg.DB.QueryRow(ctx,
+			`SELECT COUNT(*) FROM audit_log WHERE api_key_id = $1 AND ts >= $2 AND ts < $3 AND status_code < 400`,
+			keyID, from, to,
+		).Scan(&successReqs)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query successful requests"))
+			return
+		}
+
+		// By endpoint
+		rows, err := cfg.DB.Query(ctx,
+			`SELECT endpoint, COUNT(*) as req_count, AVG(duration_ms)::float8 as avg_duration
+			 FROM audit_log
+			 WHERE api_key_id = $1 AND ts >= $2 AND ts < $3
+			 GROUP BY endpoint
+			 ORDER BY req_count DESC`,
+			keyID, from, to,
+		)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query endpoint breakdown"))
+			return
+		}
+		defer rows.Close()
+
+		var byEndpoint []AdminEndpointUsage
+		for rows.Next() {
+			var eu AdminEndpointUsage
+			if err := rows.Scan(&eu.Endpoint, &eu.Requests, &eu.AvgDurationMs); err != nil {
+				writeJSON(w, http.StatusInternalServerError, errorBody("scan error"))
+				return
+			}
+			byEndpoint = append(byEndpoint, eu)
+		}
+
+		resp := AdminKeyUsageResponse{
+			APIKeyID:           keyIDStr,
+			From:               fromStr,
+			To:                 toStr,
+			TotalRequests:      totalReqs,
+			SuccessfulRequests: successReqs,
+			ByEndpoint:         byEndpoint,
+		}
+
+		writeJSON(w, http.StatusOK, resp)
+	}
 }
