@@ -3,9 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"

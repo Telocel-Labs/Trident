@@ -20,6 +20,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const auditCleanupInterval = 6 * time.Hour
+
 const defaultDBPoolSize = 5
 
 func main() {
@@ -86,6 +88,26 @@ func main() {
 		defer usageStop()
 	}
 
+	// Start async audit log writer (issue #162). Batches entries every 500ms
+	// and inserts them in bulk — zero latency added to the request path.
+	var auditWriter *middleware.AuditWriter
+	if pool != nil {
+		auditWriter = middleware.NewAuditWriter(
+			pool, slog.Default(), 500*time.Millisecond, 100, 10000,
+		)
+		defer auditWriter.Close()
+		// Background cleanup: delete audit log entries older than 90 days.
+		go runAuditCleanup(ctx, pool)
+	}
+
+	adminCfg := handlers.AdminConfig{
+		AdminKey: os.Getenv("ADMIN_API_KEY"),
+		DB:       pool,
+	}
+	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
+		adminCfg.StatsFunc = newPgbouncerStats(adminURL)
+	}
+
 	apiKeyCfg := handlers.APIKeyConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
 		DB:       pool,
@@ -97,7 +119,8 @@ func main() {
 	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
-	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminConfig()))
+	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
+	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
 	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
@@ -114,6 +137,9 @@ func main() {
 	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB}
 	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
+	if auditWriter != nil {
+		handler = middleware.AuditMiddleware(auditWriter)(handler)
+	}
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
 
 	server := &http.Server{
@@ -168,10 +194,36 @@ func dbPoolSizeFromEnv() int32 {
 	return defaultDBPoolSize
 }
 
-func adminConfig() handlers.AdminConfig {
-	cfg := handlers.AdminConfig{AdminKey: os.Getenv("ADMIN_API_KEY")}
-	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
-		cfg.StatsFunc = newPgbouncerStats(adminURL)
+func runAuditCleanup(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(auditCleanupInterval)
+	defer ticker.Stop()
+
+	cleanup := func() {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		for {
+			tag, err := pool.Exec(cleanupCtx,
+				`DELETE FROM audit_log WHERE ts < NOW() - INTERVAL '90 days' AND ctid IN (
+					SELECT ctid FROM audit_log WHERE ts < NOW() - INTERVAL '90 days' LIMIT 1000
+				)`,
+			)
+			if err != nil {
+				slog.Warn("audit cleanup failed", "err", err)
+				return
+			}
+			if tag.RowsAffected() == 0 {
+				return
+			}
+		}
 	}
-	return cfg
+
+	for {
+		select {
+		case <-ctx.Done():
+			cleanup()
+			return
+		case <-ticker.C:
+			cleanup()
+		}
+	}
 }
