@@ -213,6 +213,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Docker — build images (no push)
+  # Both application images are built here so the layer cache is warm when
+  # the e2e job runs docker compose build below.
   # ---------------------------------------------------------------------------
   docker:
     name: Docker build
@@ -233,6 +235,177 @@ jobs:
           tags: trident-go-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build Rust gRPC API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/api/Dockerfile
+          push: false
+          tags: trident-grpc-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Rust indexer image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/indexer/Dockerfile
+          push: false
+          tags: trident-indexer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # E2E smoke test — full-stack Docker Compose + curl assertions
+  #
+  # Runs after all unit/lint jobs pass. Builds the complete four-service stack
+  # (Postgres, Redis, Rust gRPC API, Go REST API), waits for health checks,
+  # then asserts:
+  #   1. GET /v1/health   → 200 {"status":"ok"}
+  #   2. GET /v1/events   → 200 with a valid JSON body
+  #
+  # A fixed test API key is pre-seeded into Postgres by docker/ci-seed.sql
+  # and the corresponding HMAC-SHA256 digest is set in .env.ci as
+  # API_KEY_HASHES. The raw key is hardcoded for CI only — it is documented
+  # in .env.ci as "do not use outside CI".
+  #
+  # On any failure the step "Dump service logs" captures all container output
+  # so engineers can diagnose failures without re-running the job.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E smoke test
+    runs-on: ubuntu-latest
+    needs: [rust, go, typescript, docker]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Restore the layer cache written by the docker job above so that
+      # `docker compose build` below is a no-op cache hit.
+      - name: Restore Go API image cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: services/api/Dockerfile
+          push: false
+          tags: trident-go-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Restore Rust gRPC API image cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/api/Dockerfile
+          push: false
+          tags: trident-grpc-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Restore Rust indexer image cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/indexer/Dockerfile
+          push: false
+          tags: trident-indexer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build full stack images
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            build --pull=false
+
+      - name: Start full stack
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            up -d
+
+      - name: Wait for Go API to become healthy
+        # Poll GET /v1/health until it returns 200 or we exhaust retries.
+        # --retry-connrefused keeps retrying even when the port is not yet
+        # open; --retry-delay 3 gives each service time to initialise.
+        run: |
+          echo "Waiting for /v1/health to return 200..."
+          curl \
+            --silent \
+            --fail \
+            --retry 20 \
+            --retry-delay 5 \
+            --retry-connrefused \
+            --max-time 10 \
+            http://localhost:3000/v1/health
+          echo ""
+          echo "/v1/health returned 200 OK"
+
+      - name: Assert GET /v1/health returns status ok
+        run: |
+          RESPONSE=$(curl --silent --fail http://localhost:3000/v1/health)
+          echo "Response: $RESPONSE"
+
+          STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+          if [ "$STATUS" != "ok" ]; then
+            echo "ERROR: expected status=ok, got status=$STATUS"
+            exit 1
+          fi
+          echo "✓ /v1/health returned {\"status\": \"ok\"}"
+
+      - name: Assert GET /v1/events returns 200 with JSON body
+        env:
+          # This raw key is pre-seeded in Postgres via docker/ci-seed.sql and
+          # its HMAC-SHA256 digest is in .env.ci as API_KEY_HASHES.
+          # DO NOT use this key outside CI.
+          CI_API_KEY: ci-test-api-key-do-not-use-in-production
+        run: |
+          RESPONSE=$(curl \
+            --silent \
+            --fail \
+            --max-time 10 \
+            -H "X-API-Key: ${CI_API_KEY}" \
+            "http://localhost:3000/v1/events?limit=1")
+          echo "Response: $RESPONSE"
+
+          # Validate the response is valid JSON — python3 will exit non-zero if not.
+          echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); print('✓ /v1/events returned valid JSON')"
+
+      - name: Dump service logs
+        # Always run so logs are available for both passing and failing runs.
+        if: always()
+        run: |
+          echo "=== docker compose ps ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            ps
+
+          echo "=== Service logs ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            logs --no-color --timestamps
+
+      - name: Tear down stack
+        # Always run to avoid leaving containers behind if a test step fails.
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            down -v --remove-orphans
 
   # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
