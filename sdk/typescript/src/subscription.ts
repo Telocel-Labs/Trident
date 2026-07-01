@@ -60,22 +60,50 @@ function parseWsMessage(raw: unknown): SorobanEvent | null {
 export function createSubscription(
   wsUrl: string,
   params: SubscribeToContractParams,
+  webSocketImpl?: any,
 ): Subscription {
   let cancelled = false;
-  let ws: WebSocket | null = null;
+  let ws: any = null;
   let backoffMs = INITIAL_BACKOFF_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  function connect(): void {
+  async function connect(): Promise<void> {
     if (cancelled) return;
 
-    ws = new WebSocket(wsUrl);
+    let WS: any;
+    try {
+      if (webSocketImpl) {
+        WS = webSocketImpl;
+      } else if (typeof WebSocket !== "undefined") {
+        WS = WebSocket;
+      } else {
+        const wsModule = await import("ws");
+        WS = wsModule.default || wsModule;
+      }
+    } catch (err) {
+      params.onError?.(
+        new Error(
+          "WebSocket is not defined. If you are running in Node.js < 21, you must install the 'ws' package or provide a webSocketImpl in TridentClientConfig.",
+        ),
+      );
+      return;
+    }
+
+    if (cancelled) return;
+
+    try {
+      ws = new WS(wsUrl);
+    } catch (err) {
+      params.onError?.(err instanceof Error ? err : new Error(String(err)));
+      scheduleReconnect();
+      return;
+    }
 
     ws.onopen = () => {
       backoffMs = INITIAL_BACKOFF_MS; // reset on successful connect
     };
 
-    ws.onmessage = (evt: MessageEvent) => {
+    ws.onmessage = (evt: any) => {
       let raw: unknown;
       try {
         raw = JSON.parse(evt.data as string);
@@ -96,10 +124,10 @@ export function createSubscription(
       params.onError?.(new Error("WebSocket connection error"));
     };
 
-    ws.onclose = (evt: CloseEvent) => {
+    ws.onclose = (evt: any) => {
       if (cancelled) return;
       // Unexpected close — schedule reconnect.
-      if (!evt.wasClean) {
+      if (!evt || !evt.wasClean) {
         scheduleReconnect();
       }
     };
