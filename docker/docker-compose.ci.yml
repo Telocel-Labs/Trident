@@ -1,0 +1,132 @@
+# CI overlay for the Trident full-stack smoke test.
+#
+# Usage:
+#   docker compose \
+#     -f docker/docker-compose.yml \
+#     -f docker/docker-compose.ci.yml \
+#     --env-file .env.ci \
+#     up -d
+#
+# What this overlay does:
+#   - Adds the Rust gRPC API service (not present in the base compose).
+#   - Bypasses PgBouncer — all services connect directly to postgres:5432.
+#     This removes one dependency layer and avoids the scram-sha-256
+#     auth-type bootstrapping that PgBouncer needs.
+#   - Disables restart policies so a crashed container surfaces as a hard
+#     failure instead of retrying silently.
+#   - Sets CI-appropriate log levels and disables resource limits.
+#   - Exposes the Go API on a predictable host port for curl probing.
+#   - Seeds the test API key into postgres on first start via the postgres
+#     initdb mechanism (before any application service starts).
+
+services:
+  # ---------------------------------------------------------------------------
+  # Postgres — run init SQL to seed the test API key and apply the schema.
+  # The base compose does not mount initdb scripts; we add one here.
+  # ---------------------------------------------------------------------------
+  postgres:
+    restart: "no"
+    environment:
+      # Override to use simple md5 so PgBouncer auth bootstrapping is not needed
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ../database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../database/migrations/0002_system_state_health.sql:/docker-entrypoint-initdb.d/02_health.sql:ro
+      - ../database/migrations/0003_api_keys.sql:/docker-entrypoint-initdb.d/03_api_keys.sql:ro
+      - ../database/migrations/0003_alert_webhook.sql:/docker-entrypoint-initdb.d/04_alert_webhook.sql:ro
+      - ../database/migrations/0004_soroban_events_network.sql:/docker-entrypoint-initdb.d/05_events_network.sql:ro
+      - ./ci-seed.sql:/docker-entrypoint-initdb.d/99_ci_seed.sql:ro
+
+  # ---------------------------------------------------------------------------
+  # Redis — no changes needed; just disable restart.
+  # ---------------------------------------------------------------------------
+  redis:
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # PgBouncer — disabled in CI. All services use DATABASE_URL pointing
+  # directly at postgres:5432 (set in .env.ci).
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    profiles:
+      - pgbouncer  # only started when this profile is explicitly selected
+
+  # ---------------------------------------------------------------------------
+  # Rust gRPC API — added here because it is not in the base compose.
+  #
+  # The base compose has no grpc-api service; it is defined only in this
+  # overlay so the full stack (indexer + grpc-api + go-api) can be wired
+  # together for smoke tests.
+  # ---------------------------------------------------------------------------
+  grpc-api:
+    build:
+      context: ..
+      dockerfile: crates/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GRPC_ADDR: 0.0.0.0:50051
+      REDIS_URL: ${REDIS_URL}
+      RUST_LOG: ${LOG_LEVEL:-info}
+      GRPC_API_DB_POOL_SIZE: ${GRPC_API_DB_POOL_SIZE:-5}
+    expose:
+      - "50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Rust indexer — bypass PgBouncer, lower poll interval for faster startup.
+  # ---------------------------------------------------------------------------
+  indexer:
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: ${REDIS_URL}
+      STELLAR_RPC_URL: ${STELLAR_RPC_URL}
+      NETWORK: ${NETWORK:-testnet}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-5000}
+      INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC:-false}
+      METRICS_PORT: ${METRICS_PORT:-9090}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      RUST_LOG: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${METRICS_PORT:-9090}/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Go REST API — bypass PgBouncer, point gRPC at the grpc-api service.
+  # ---------------------------------------------------------------------------
+  api:
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: ${REDIS_URL}
+      # Point at the grpc-api service defined in this overlay, not localhost.
+      GRPC_ADDR: grpc-api:50051
+      PORT: ${PORT:-3000}
+      API_KEY_SALT: ${API_KEY_SALT}
+      API_KEY_HASHES: ${API_KEY_HASHES}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      grpc-api:
+        condition: service_started
