@@ -164,6 +164,15 @@ func main() {
 		Redis:    redisClient,
 	}
 
+	webhookDB, err := newDB()
+	if err != nil {
+		slog.Warn("database unavailable for webhook handlers", "err", err)
+	} else {
+		defer webhookDB.Close()
+	}
+	startWebhookWorker(ctx, webhookDB, redisClient)
+	startWebhookCleanupJob(ctx, webhookDB)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB, redisClient, grpcClient))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
@@ -179,6 +188,12 @@ func main() {
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
+	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
+	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
+	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
+	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
+	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
+	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
