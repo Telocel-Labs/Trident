@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -18,7 +18,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
@@ -140,6 +139,7 @@ func main() {
 	apiKeyCfg := handlers.APIKeyConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
 		DB:       pool,
+		Redis:    redisClient,
 	}
 
 	mux := http.NewServeMux()
@@ -149,8 +149,10 @@ func main() {
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminConfig()))
+	// API key management (admin-only via X-Admin-Key header)
 	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
+	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
@@ -166,8 +168,17 @@ func main() {
 		rlDB = pool
 	}
 	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB}
-	handler := middleware.Chain(otelhttp.NewHandler(mux, "trident-go-api"), middleware.StructuredLogging, middleware.RequestID)
+
+	// DB-backed auth middleware with Redis caching and env-var fallback.
+	var authDB middleware.DBAuthConfig
+	if pool != nil {
+		authDB.DB = pool
+	}
+	authDB.Redis = redisClient
+
+	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
+	handler = middleware.NewDBAuth(authDB)(handler)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
 
 	server := &http.Server{

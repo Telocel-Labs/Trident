@@ -48,6 +48,7 @@ fn extract_context(metadata: &tonic::metadata::MetadataMap) -> opentelemetry::Co
 
 const REDIS_STREAM_KEY: &str = "trident:events";
 const STREAM_CHANNEL_BUF: usize = 128;
+const DEFAULT_NETWORK: &str = "testnet";
 
 pub struct EventsServiceImpl {
     pub db: PgPool,
@@ -99,6 +100,15 @@ fn db_err(e: sqlx::Error) -> Status {
     Status::internal("internal error")
 }
 
+/// Normalise a network string — defaults to "testnet" when empty.
+fn resolve_network(network: &str) -> &str {
+    if network.is_empty() {
+        DEFAULT_NETWORK
+    } else {
+        network
+    }
+}
+
 // ---------------------------------------------------------------------------
 // gRPC service implementation
 // ---------------------------------------------------------------------------
@@ -120,6 +130,7 @@ impl Events for EventsServiceImpl {
 
         async move {
             let limit = req.limit.clamp(1, 200) as i64;
+            let network = resolve_network(&req.network);
 
             let (cursor_seq, cursor_idx): (Option<i64>, Option<i32>) = if req.cursor.is_empty() {
                 (None, None)
@@ -172,12 +183,51 @@ impl Events for EventsServiceImpl {
             .await
             .map_err(db_err)?;
 
-            let has_more = rows.len() as i64 == limit;
-            let next_cursor = if has_more {
-                rows.last().map(|r| r.id.to_string()).unwrap_or_default()
-            } else {
-                String::new()
-            };
+            match row {
+                Some((seq, idx)) => (Some(seq), Some(idx)),
+                None => return Err(Status::invalid_argument("cursor references unknown event")),
+            }
+        };
+
+        let rows: Vec<EventRow> = sqlx::query_as(
+            r#"
+            SELECT id, contract_id, ledger_sequence, ledger_timestamp,
+                   transaction_hash, event_index, event_type, topics, data, created_at
+            FROM soroban_events
+            WHERE
+                network = $1
+                AND ($2::text = '' OR contract_id = $2)
+                AND ($3::text = '' OR topic_0 = $3)
+                AND ($4::text = '' OR topic_1 = $4)
+                AND ($5::bigint = 0 OR ledger_sequence >= $5)
+                AND ($6::bigint = 0 OR ledger_sequence <= $6)
+                AND (
+                    $7::bigint IS NULL
+                    OR (ledger_sequence, event_index) > ($7, $8)
+                )
+            ORDER BY ledger_sequence ASC, event_index ASC
+            LIMIT $9
+            "#,
+        )
+        .bind(network)
+        .bind(&req.contract_id)
+        .bind(&req.topic_0)
+        .bind(&req.topic_1)
+        .bind(req.ledger_from as i64)
+        .bind(req.ledger_to as i64)
+        .bind(cursor_seq)
+        .bind(cursor_idx)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(db_err)?;
+
+        let has_more = rows.len() as i64 == limit;
+        let next_cursor = if has_more {
+            rows.last().map(|r| r.id.to_string()).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
             let events: Vec<Event> = rows.into_iter().map(row_to_event).collect();
 
@@ -206,18 +256,22 @@ impl Events for EventsServiceImpl {
             let id = Uuid::parse_str(&req.id)
                 .map_err(|_| Status::invalid_argument("id must be a valid UUID"))?;
 
-            let row: Option<EventRow> = sqlx::query_as(
-                r#"
-                SELECT id, contract_id, ledger_sequence, ledger_timestamp,
-                       transaction_hash, event_index, event_type, topics, data, created_at
-                FROM soroban_events
-                WHERE id = $1
-                "#,
-            )
-            .bind(id)
-            .fetch_optional(&db)
-            .await
-            .map_err(db_err)?;
+        let network = resolve_network(&req.network);
+
+        let row: Option<EventRow> = sqlx::query_as(
+            r#"
+            SELECT id, contract_id, ledger_sequence, ledger_timestamp,
+                   transaction_hash, event_index, event_type, topics, data, created_at
+            FROM soroban_events
+            WHERE id = $1
+              AND network = $2
+            "#,
+        )
+        .bind(id)
+        .bind(network)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(db_err)?;
 
             match row {
                 Some(r) => Ok(Response::new(row_to_event(r))),
@@ -384,23 +438,21 @@ mod tests {
         EventsServiceImpl::new(db, redis)
     }
 
-    async fn seed_events(pool: &PgPool, contract_id: &str, count: usize) {
+    async fn seed_events(pool: &PgPool, contract_id: &str, network: &str, count: usize) {
         for i in 0..count {
-            // Include contract_id in the tx hash so rows seeded for different
-            // contracts never share a (transaction_hash, event_index) pair and
-            // ON CONFLICT DO NOTHING silently drops them across test runs.
             sqlx::query(
                 r#"
                 INSERT INTO soroban_events
-                    (contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+                    (contract_id, network, ledger_sequence, ledger_timestamp, transaction_hash,
                      event_index, event_type, topics, data)
-                VALUES ($1, $2, NOW(), $3, $4, 'contract', '["transfer"]', '{}')
+                VALUES ($1, $2, $3, NOW(), $4, $5, 'contract', '["transfer"]', '{}')
                 ON CONFLICT DO NOTHING
                 "#,
             )
             .bind(contract_id)
+            .bind(network)
             .bind((100 + i) as i64)
-            .bind(format!("txhash_{contract_id}_{i}"))
+            .bind(format!("txhash_{contract_id}_{network}_{i}"))
             .bind(i as i32)
             .execute(pool)
             .await
@@ -408,18 +460,19 @@ mod tests {
         }
     }
 
-    async fn insert_one_event(pool: &PgPool) -> Uuid {
+    async fn insert_one_event(pool: &PgPool, network: &str) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO soroban_events
-                (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+                (id, contract_id, network, ledger_sequence, ledger_timestamp, transaction_hash,
                  event_index, event_type, topics, data)
-            VALUES ($1, 'CTEST', 999, NOW(), 'txhashtest', 0, 'contract', '["transfer"]', '{}')
+            VALUES ($1, 'CTEST', $2, 999, NOW(), 'txhashtest', 0, 'contract', '["transfer"]', '{}')
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(id)
+        .bind(network)
         .execute(pool)
         .await
         .unwrap();
@@ -434,12 +487,13 @@ mod tests {
         let contract_a = format!("CONTRACT_A_{}", uuid::Uuid::new_v4());
         let contract_b = format!("CONTRACT_B_{}", uuid::Uuid::new_v4());
 
-        seed_events(&pool, &contract_a, 3).await;
-        seed_events(&pool, &contract_b, 2).await;
+        seed_events(&pool, &contract_a, "testnet", 3).await;
+        seed_events(&pool, &contract_b, "testnet", 2).await;
 
         let svc = make_svc(&db_url, &redis_url).await;
         let req = Request::new(ListEventsRequest {
             contract_id: contract_a.clone(),
+            network: "testnet".to_string(),
             limit: 200,
             ..Default::default()
         });
@@ -456,13 +510,14 @@ mod tests {
         let pool = PgPool::connect(&db_url).await.unwrap();
 
         let contract_id = format!("CONTRACT_PAGE_{}", uuid::Uuid::new_v4());
-        seed_events(&pool, &contract_id, 5).await;
+        seed_events(&pool, &contract_id, "testnet", 5).await;
 
         let svc = make_svc(&db_url, &redis_url).await;
 
         let first_page = svc
             .list_events(Request::new(ListEventsRequest {
                 contract_id: contract_id.clone(),
+                network: "testnet".to_string(),
                 limit: 2,
                 ..Default::default()
             }))
@@ -477,6 +532,7 @@ mod tests {
         let second_page = svc
             .list_events(Request::new(ListEventsRequest {
                 contract_id: contract_id.clone(),
+                network: "testnet".to_string(),
                 limit: 200,
                 cursor: first_page.next_cursor,
                 ..Default::default()
@@ -490,15 +546,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_events_isolated_by_network() {
+        let (db_url, redis_url) = require_services!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CONTRACT_NET_{}", uuid::Uuid::new_v4());
+        seed_events(&pool, &contract_id, "testnet", 3).await;
+        seed_events(&pool, &contract_id, "mainnet", 2).await;
+
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let testnet_resp = svc
+            .list_events(Request::new(ListEventsRequest {
+                contract_id: contract_id.clone(),
+                network: "testnet".to_string(),
+                limit: 200,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mainnet_resp = svc
+            .list_events(Request::new(ListEventsRequest {
+                contract_id: contract_id.clone(),
+                network: "mainnet".to_string(),
+                limit: 200,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(testnet_resp.events.len(), 3);
+        assert_eq!(mainnet_resp.events.len(), 2);
+    }
+
+    #[tokio::test]
     async fn get_existing_event_returns_correct_fields() {
         let (db_url, redis_url) = require_services!();
         let pool = PgPool::connect(&db_url).await.unwrap();
 
-        let event_id = insert_one_event(&pool).await;
+        let event_id = insert_one_event(&pool, "testnet").await;
 
         let svc = make_svc(&db_url, &redis_url).await;
         let req = Request::new(GetEventRequest {
             id: event_id.to_string(),
+            network: "testnet".to_string(),
         });
         let event = svc.get_event(req).await.unwrap().into_inner();
 
@@ -509,12 +603,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_event_wrong_network_returns_not_found() {
+        let (db_url, redis_url) = require_services!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let event_id = insert_one_event(&pool, "testnet").await;
+
+        let svc = make_svc(&db_url, &redis_url).await;
+        let req = Request::new(GetEventRequest {
+            id: event_id.to_string(),
+            network: "mainnet".to_string(),
+        });
+        let err = svc.get_event(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
     async fn get_unknown_uuid_returns_not_found() {
         let (db_url, redis_url) = require_services!();
         let svc = make_svc(&db_url, &redis_url).await;
 
         let req = Request::new(GetEventRequest {
             id: Uuid::new_v4().to_string(),
+            network: "testnet".to_string(),
         });
         let err = svc.get_event(req).await.unwrap_err();
 
@@ -528,6 +640,7 @@ mod tests {
 
         let req = Request::new(GetEventRequest {
             id: "not-a-uuid".to_string(),
+            network: "testnet".to_string(),
         });
         let err = svc.get_event(req).await.unwrap_err();
 

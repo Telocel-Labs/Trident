@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "trident.fullname" . }}-go-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: go-api
+spec:
+  replicas: {{ .Values.goApi.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 8 }}
+    spec:
+      {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: go-api
+          image: "{{ .Values.goApi.image.repository }}:{{ .Values.goApi.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.goApi.service.port }}
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: REDIS_URL
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: ADMIN_API_KEY
+            {{- range $k, $v := .Values.goApi.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.goApi.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.goApi.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.goApi.resources | nindent 12 }}
+      {{- with .Values.goApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.goApi.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.goApi.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "trident.fullname" . }}-go-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: go-api
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.goApi.service.port }}
+      targetPort: http
+      protocol: TCP
