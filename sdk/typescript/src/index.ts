@@ -15,6 +15,7 @@ export interface TridentClientConfig {
   apiUrl: string;
   apiKey: string;
   network: Network;
+  webSocketImpl?: any;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +227,6 @@ export class TridentClient {
     if (params.topic0) qs.set("topic0", params.topic0);
 
     const wsUrl = `${wsBase}/ws?${qs.toString()}`;
-    return createSubscription(wsUrl, params);
+    return createSubscription(wsUrl, params, this.config.webSocketImpl);
   }
 }

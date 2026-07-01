@@ -84,6 +84,10 @@ message ListEventsRequest {
 
   // Maximum number of events to return. Capped server-side at 200.
   uint32 limit = 7;
+
+  // Network scope derived from the authenticated API key ("testnet" | "mainnet").
+  // Enforced server-side; cannot be overridden by the caller.
+  string network = 8;
 }
 
 message ListEventsResponse {
@@ -103,6 +107,10 @@ message ListEventsResponse {
 message GetEventRequest {
   // UUID of the event to fetch.
   string id = 1;
+
+  // Network scope derived from the authenticated API key ("testnet" | "mainnet").
+  // Enforced server-side; cannot be overridden by the caller.
+  string network = 2;
 }
 
 // ---------------------------------------------------------------------------

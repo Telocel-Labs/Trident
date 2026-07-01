@@ -8,11 +8,26 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Rust — format, lint, test
+  # Rust — format, lint, test, and SQLx prepare
   # ---------------------------------------------------------------------------
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: trident
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: trident
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +38,24 @@ jobs:
 
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Install sqlx-cli
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: sqlx-cli
+          version: latest
+          features: postgres
+          args: --no-default-features
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgres://trident:password@localhost:5432/trident
+        run: sqlx migrate run --source database/migrations
+
+      - name: Run sqlx prepare
+        env:
+          DATABASE_URL: postgres://trident:password@localhost:5432/trident
+        run: cargo sqlx prepare --workspace
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -42,6 +75,7 @@ jobs:
     defaults:
       run:
         working-directory: services/api
+
     steps:
       - uses: actions/checkout@v4
 
@@ -60,7 +94,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v2.12.2
           working-directory: services/api
 
   # ---------------------------------------------------------------------------
@@ -72,6 +106,7 @@ jobs:
     defaults:
       run:
         working-directory: sdk/typescript
+
     steps:
       - uses: actions/checkout@v4
 
@@ -87,6 +122,38 @@ jobs:
 
       - name: Type check
         run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # OpenAPI specification — Spectral linting
+  # ---------------------------------------------------------------------------
+  openapi:
+    name: OpenAPI Spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Spectral and dependencies
+        run: npm install -g @stoplight/spectral-cli openapi-typescript
+
+      - name: Lint OpenAPI specification
+        run: spectral lint api/openapi.yaml
+
+      - name: Regenerate types
+        run: openapi-typescript api/openapi.yaml -o sdk/typescript/src/api-types.gen.ts
+
+      - name: Check for uncommitted changes
+        run: |
+          if git diff --exit-code sdk/typescript/src/api-types.gen.ts; then
+            echo "✓ Generated types are up-to-date"
+          else
+            echo "✗ Generated types are stale. Run 'npm run generate:types' and commit changes."
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # Rust integration tests — real Postgres + Redis
@@ -142,14 +209,17 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
           TEST_REDIS_URL: redis://localhost:6379
           CI: "true"
-        run: cargo test --all -- --include-ignored
+        run: cargo test --all -- --include-ignored --test-threads=1
 
   # ---------------------------------------------------------------------------
   # Docker — build images (no push)
+  # Both application images are built here so the layer cache is warm when
+  # the e2e job runs docker compose build below.
   # ---------------------------------------------------------------------------
   docker:
     name: Docker build
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -165,3 +235,224 @@ jobs:
           tags: trident-go-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build Rust gRPC API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/api/Dockerfile
+          push: false
+          tags: trident-grpc-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Rust indexer image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/indexer/Dockerfile
+          push: false
+          tags: trident-indexer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # E2E smoke test — full-stack Docker Compose + curl assertions
+  #
+  # Runs after all unit/lint jobs pass. Builds the complete four-service stack
+  # (Postgres, Redis, Rust gRPC API, Go REST API), waits for health checks,
+  # then asserts:
+  #   1. GET /v1/health   → 200 {"status":"ok"}
+  #   2. GET /v1/events   → 200 with a valid JSON body
+  #
+  # A fixed test API key is pre-seeded into Postgres by docker/ci-seed.sql
+  # and the corresponding HMAC-SHA256 digest is set in .env.ci as
+  # API_KEY_HASHES. The raw key is hardcoded for CI only — it is documented
+  # in .env.ci as "do not use outside CI".
+  #
+  # On any failure the step "Dump service logs" captures all container output
+  # so engineers can diagnose failures without re-running the job.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E smoke test
+    runs-on: ubuntu-latest
+    needs: [rust, go, typescript, docker]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Restore the layer cache written by the docker job above so that
+      # `docker compose build` below is a no-op cache hit.
+      - name: Restore Go API image cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: services/api/Dockerfile
+          push: false
+          tags: trident-go-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Restore Rust gRPC API image cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/api/Dockerfile
+          push: false
+          tags: trident-grpc-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Restore Rust indexer image cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/indexer/Dockerfile
+          push: false
+          tags: trident-indexer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build full stack images
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            build --pull=false
+
+      - name: Start full stack
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            up -d
+
+      - name: Wait for Go API to become healthy
+        # Poll GET /v1/health until it returns 200 or we exhaust retries.
+        # --retry-connrefused keeps retrying even when the port is not yet
+        # open; --retry-delay 3 gives each service time to initialise.
+        run: |
+          echo "Waiting for /v1/health to return 200..."
+          curl \
+            --silent \
+            --fail \
+            --retry 20 \
+            --retry-delay 5 \
+            --retry-connrefused \
+            --max-time 10 \
+            http://localhost:3000/v1/health
+          echo ""
+          echo "/v1/health returned 200 OK"
+
+      - name: Assert GET /v1/health returns status ok
+        run: |
+          RESPONSE=$(curl --silent --fail http://localhost:3000/v1/health)
+          echo "Response: $RESPONSE"
+
+          STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+          if [ "$STATUS" != "ok" ]; then
+            echo "ERROR: expected status=ok, got status=$STATUS"
+            exit 1
+          fi
+          echo "✓ /v1/health returned {\"status\": \"ok\"}"
+
+      - name: Assert GET /v1/events returns 200 with JSON body
+        env:
+          # This raw key is pre-seeded in Postgres via docker/ci-seed.sql and
+          # its HMAC-SHA256 digest is in .env.ci as API_KEY_HASHES.
+          # DO NOT use this key outside CI.
+          CI_API_KEY: ci-test-api-key-do-not-use-in-production
+        run: |
+          RESPONSE=$(curl \
+            --silent \
+            --fail \
+            --max-time 10 \
+            -H "X-API-Key: ${CI_API_KEY}" \
+            "http://localhost:3000/v1/events?limit=1")
+          echo "Response: $RESPONSE"
+
+          # Validate the response is valid JSON — python3 will exit non-zero if not.
+          echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); print('✓ /v1/events returned valid JSON')"
+
+      - name: Dump service logs
+        # Always run so logs are available for both passing and failing runs.
+        if: always()
+        run: |
+          echo "=== docker compose ps ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            ps
+
+          echo "=== Service logs ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            logs --no-color --timestamps
+
+      - name: Tear down stack
+        # Always run to avoid leaving containers behind if a test step fails.
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  # Helm — lint, template render, and kind cluster deployment validation
+  # ---------------------------------------------------------------------------
+  helm:
+    name: Helm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Lint chart
+        run: helm lint helm/trident
+
+      - name: Render templates
+        run: helm template trident helm/trident
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: trident-ci
+
+      - name: Create CI secrets
+        run: |
+          kubectl create secret generic trident-secrets \
+            --from-literal=DATABASE_URL="postgres://trident:trident@postgres:5432/trident" \
+            --from-literal=REDIS_URL="redis://redis:6379" \
+            --from-literal=ADMIN_API_KEY="ci-admin-key"
+
+      - name: Install chart (CI values — nginx only, no image pull)
+        run: |
+          helm install trident helm/trident \
+            --set indexer.image.repository=busybox \
+            --set indexer.image.tag=latest \
+            --set grpcApi.image.repository=busybox \
+            --set grpcApi.image.tag=latest \
+            --set goApi.image.repository=busybox \
+            --set goApi.image.tag=latest \
+            --wait=false \
+            --timeout=60s
+
+      - name: Verify Kubernetes resources are created
+        run: |
+          kubectl get deployments
+          kubectl get services
+          kubectl get hpa

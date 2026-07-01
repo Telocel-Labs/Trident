@@ -1,0 +1,16 @@
+apiVersion: v2
+name: trident
+description: Helm chart for self-hosted Trident Soroban event indexer on Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - soroban
+  - stellar
+  - blockchain
+  - indexer
+home: https://github.com/telocel-labs/trident
+sources:
+  - https://github.com/telocel-labs/trident
+maintainers:
+  - name: Trident Team

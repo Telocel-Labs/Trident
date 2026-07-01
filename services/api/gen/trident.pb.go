@@ -167,6 +167,10 @@ type ListEventsRequest struct {
 	Cursor string `protobuf:"bytes,6,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	// Maximum number of events to return. Capped server-side at 200.
 	Limit uint32 `protobuf:"varint,7,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Network scope derived from the authenticated API key ("testnet" | "mainnet").
+	// NOTE: run `buf generate` after modifying proto/trident.proto to regenerate
+	// the rawDesc binary and enable wire serialisation of this field.
+	Network string `protobuf:"bytes,8,opt,name=network,proto3" json:"network,omitempty"`
 }
 
 func (x *ListEventsRequest) Reset() {
@@ -248,6 +252,13 @@ func (x *ListEventsRequest) GetLimit() uint32 {
 	return 0
 }
 
+func (x *ListEventsRequest) GetNetwork() string {
+	if x != nil {
+		return x.Network
+	}
+	return ""
+}
+
 type ListEventsResponse struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -318,6 +329,10 @@ type GetEventRequest struct {
 
 	// UUID of the event to fetch.
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Network scope derived from the authenticated API key ("testnet" | "mainnet").
+	// NOTE: run `buf generate` after modifying proto/trident.proto to regenerate
+	// the rawDesc binary and enable wire serialisation of this field.
+	Network string `protobuf:"bytes,2,opt,name=network,proto3" json:"network,omitempty"`
 }
 
 func (x *GetEventRequest) Reset() {
@@ -353,6 +368,13 @@ func (*GetEventRequest) Descriptor() ([]byte, []int) {
 func (x *GetEventRequest) GetId() string {
 	if x != nil {
 		return x.Id
+	}
+	return ""
+}
+
+func (x *GetEventRequest) GetNetwork() string {
+	if x != nil {
+		return x.Network
 	}
 	return ""
 }

@@ -1,4 +1,5 @@
-version: "3.9"
+version: \
+3.9\
 
 # Development compose — runs only the infrastructure dependencies.
 # The indexer and API service are run locally (cargo run / go run) so that
@@ -12,12 +13,16 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: trident
     ports:
-      - "5432:5432"
+      - \
+5432:5432\
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
-      - ../database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trident -d trident"]
+      test: [\
+CMD-SHELL\, \pg_isready
+-U
+trident
+trident\]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -26,10 +31,19 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - \
+6379:6379\
     volumes:
       - redis_dev_data:/data
     command: redis-server --appendonly yes
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
 
 volumes:
   postgres_dev_data:

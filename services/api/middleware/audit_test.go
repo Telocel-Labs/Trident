@@ -188,10 +188,10 @@ func TestAuditContextFunctions(t *testing.T) {
 	ctx := t.Context()
 
 	// Nil by default
-	if id := APIKeyIDFromContext(ctx); id != nil {
+	if id := AuditAPIKeyIDFromContext(ctx); id != nil {
 		t.Error("expected nil API key ID from empty context")
 	}
-	if n := NetworkFromContext(ctx); n != "" {
+	if n := AuditNetworkFromContext(ctx); n != "" {
 		t.Error("expected empty network from empty context")
 	}
 
@@ -200,10 +200,10 @@ func TestAuditContextFunctions(t *testing.T) {
 	ctx = WithAuditAPIKeyID(ctx, &id)
 	ctx = WithAuditNetwork(ctx, "testnet")
 
-	if got := APIKeyIDFromContext(ctx); got == nil || *got != id {
+	if got := AuditAPIKeyIDFromContext(ctx); got == nil || *got != id {
 		t.Errorf("API key ID mismatch: got %v, want %v", got, id)
 	}
-	if got := NetworkFromContext(ctx); got != "testnet" {
+	if got := AuditNetworkFromContext(ctx); got != "testnet" {
 		t.Errorf("network mismatch: got %q, want %q", got, "testnet")
 	}
 }

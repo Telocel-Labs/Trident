@@ -222,8 +222,8 @@ func WithAuditAPIKeyID(ctx context.Context, apiKeyID *uuid.UUID) context.Context
 	return context.WithValue(ctx, auditLogAPIKeyIDKey, apiKeyID)
 }
 
-// APIKeyIDFromContext retrieves the API key ID from the request context.
-func APIKeyIDFromContext(ctx context.Context) *uuid.UUID {
+// AuditAPIKeyIDFromContext retrieves the audit API key UUID from the request context.
+func AuditAPIKeyIDFromContext(ctx context.Context) *uuid.UUID {
 	if v := ctx.Value(auditLogAPIKeyIDKey); v != nil {
 		if id, ok := v.(*uuid.UUID); ok {
 			return id
@@ -237,8 +237,8 @@ func WithAuditNetwork(ctx context.Context, network string) context.Context {
 	return context.WithValue(ctx, auditLogNetworkKey, network)
 }
 
-// NetworkFromContext retrieves the network from the request context.
-func NetworkFromContext(ctx context.Context) string {
+// AuditNetworkFromContext retrieves the audit network from the request context.
+func AuditNetworkFromContext(ctx context.Context) string {
 	if v := ctx.Value(auditLogNetworkKey); v != nil {
 		if n, ok := v.(string); ok {
 			return n
@@ -274,8 +274,8 @@ func AuditMiddleware(writer *AuditWriter) func(http.Handler) http.Handler {
 
 			next.ServeHTTP(wrapped, r)
 
-			apiKeyID := APIKeyIDFromContext(r.Context())
-			network := NetworkFromContext(r.Context())
+			apiKeyID := AuditAPIKeyIDFromContext(r.Context())
+			network := AuditNetworkFromContext(r.Context())
 
 			entry := AuditEntry{
 				APIKeyID:    apiKeyID,

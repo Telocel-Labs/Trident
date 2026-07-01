@@ -116,4 +116,4 @@ Security issues must not be filed as public GitHub issues. Send them to `securit
 
 ---
 
-*Trident is infrastructure for the whole Stellar ecosystem. Getting it right matters. Thanks for helping.*
+*Trident is infrastructure for the whole Stellar ecosystem. Getting it right matters. Thanks for helping.*>>>>>>> 7e309c3 (chore(db): integrate sqlx-cli database migration management)

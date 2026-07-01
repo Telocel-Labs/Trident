@@ -9,6 +9,7 @@ import (
 	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/gen"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 )
 
@@ -44,8 +45,9 @@ func SetEventsClient(client gen.EventsClient) {
 // ListEvents handles GET /v1/events (issues #42, #44, #143).
 //
 // Validates query parameters and decodes the opaque pagination cursor before
-// forwarding to the gRPC backend. Returns 400 on any validation failure.
-// The response always includes has_more and next_cursor per issue #143.
+// forwarding to the gRPC backend. The network is derived from the authenticated
+// API key context and enforced server-side — callers cannot override it.
+// Returns 400 on any validation failure.
 func ListEvents(w http.ResponseWriter, r *http.Request) {
 	if eventsClient == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
@@ -77,13 +79,17 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		pagingToken = decoded
 	}
 
-	// Build gRPC request
+	// Network is enforced server-side from the authenticated API key context.
+	// Unauthenticated requests default to "testnet".
+	network := middleware.NetworkFromContext(r.Context())
+
 	grpcReq := &gen.ListEventsRequest{
 		ContractId: params.ContractID,
-		Topic_0:     q.Get("topic0"),
-		Topic_1:     q.Get("topic1"),
+		Topic_0:    q.Get("topic0"),
+		Topic_1:    q.Get("topic1"),
 		Cursor:     pagingToken,
 		Limit:      uint32(params.Limit),
+		Network:    network,
 	}
 
 	if params.LedgerFrom != nil {
@@ -126,8 +132,9 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 
 // GetEvent handles GET /v1/events/{id}.
 //
-// Validates the :id path parameter as a UUID v4 (issue #42).
-// Returns 400 Bad Request when the format is invalid.
+// Validates the :id path parameter as a UUID v4 (issue #42). The network is
+// derived from the authenticated API key context to prevent cross-network
+// data exposure. Returns 400 when the format is invalid.
 func GetEvent(w http.ResponseWriter, r *http.Request) {
 	if eventsClient == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
@@ -140,11 +147,16 @@ func GetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Call gRPC backend
+	// Network enforced from authenticated API key context.
+	network := middleware.NetworkFromContext(r.Context())
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id})
+	event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{
+		Id:      id,
+		Network: network,
+	})
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc GetEvent failed", "err", err)

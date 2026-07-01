@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -18,13 +18,63 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
 const auditCleanupInterval = 6 * time.Hour
 
 const defaultDBPoolSize = 5
 
+func initTracer(ctx context.Context) func() {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		return func() {}
+	}
+
+	samplingRatio := 0.1
+	if r := os.Getenv("OTEL_SAMPLING_RATIO"); r != "" {
+		if f, err := strconv.ParseFloat(r, 64); err == nil {
+			samplingRatio = f
+		}
+	}
+
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(endpoint),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		slog.Warn("failed to create OTLP trace exporter", "err", err)
+		return func() {}
+	}
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(semconv.ServiceName("trident-go-api")),
+	)
+	if err != nil {
+		slog.Warn("failed to create OTel resource", "err", err)
+		res = resource.Default()
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.TraceIDRatioBased(samplingRatio)),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	return func() { _ = tp.Shutdown(context.Background()) }
+}
+
 func main() {
+	shutdownTracer := initTracer(context.Background())
+	defer shutdownTracer()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
@@ -111,6 +161,7 @@ func main() {
 	apiKeyCfg := handlers.APIKeyConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
 		DB:       pool,
+		Redis:    redisClient,
 	}
 
 	mux := http.NewServeMux()
@@ -121,12 +172,17 @@ func main() {
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
 	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
+	// API key management (admin-only via X-Admin-Key header)
 	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
+	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
+	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
+	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
+	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
@@ -135,11 +191,20 @@ func main() {
 		rlDB = pool
 	}
 	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB}
+
+	// DB-backed auth middleware with Redis caching and env-var fallback.
+	var authDB middleware.DBAuthConfig
+	if pool != nil {
+		authDB.DB = pool
+	}
+	authDB.Redis = redisClient
+
 	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
 	if auditWriter != nil {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
+	handler = middleware.NewDBAuth(authDB)(handler)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
 
 	server := &http.Server{

@@ -1,0 +1,140 @@
+# Default values for the Trident Helm chart.
+# Sensitive environment variables (DATABASE_URL, REDIS_URL, API keys) must be
+# placed in a Kubernetes Secret referenced by global.existingSecret — raw
+# values should never appear in values.yaml or be committed to version control.
+
+global:
+  # Name of a pre-existing Secret that holds sensitive env vars.
+  # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY
+  existingSecret: trident-secrets
+  imagePullPolicy: IfNotPresent
+  # Optional: imagePullSecrets for private registries
+  imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Indexer — 1 replica (distributed cursor not yet supported)
+# ---------------------------------------------------------------------------
+indexer:
+  image:
+    repository: ghcr.io/telocel-labs/trident-indexer
+    tag: latest
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+  env:
+    # GRPC_ADDR of the Rust gRPC service (in-cluster DNS)
+    GRPC_ADDR: "trident-grpc-api:5000"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---------------------------------------------------------------------------
+# Rust gRPC API — 1 replica
+# ---------------------------------------------------------------------------
+grpcApi:
+  image:
+    repository: ghcr.io/telocel-labs/trident-grpc-api
+    tag: latest
+  replicaCount: 1
+  service:
+    port: 5000
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---------------------------------------------------------------------------
+# Go API — configurable replicas with HPA
+# ---------------------------------------------------------------------------
+goApi:
+  image:
+    repository: ghcr.io/telocel-labs/trident-go-api
+    tag: latest
+  replicaCount: 2
+  service:
+    port: 3000
+  env:
+    PORT: "3000"
+    GRPC_ADDR: "trident-grpc-api:5000"
+  hpa:
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  livenessProbe:
+    httpGet:
+      path: /v1/health
+      port: 3000
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 2
+  readinessProbe:
+    httpGet:
+      path: /v1/health
+      port: 3000
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    # Stricter than liveness — pod is removed from rotation faster
+    failureThreshold: 1
+    timeoutSeconds: 2
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---------------------------------------------------------------------------
+# Nginx — reverse proxy / static gateway
+# Set enabled: false to use the Ingress resource instead
+# ---------------------------------------------------------------------------
+nginx:
+  enabled: true
+  image:
+    repository: nginx
+    tag: "1.25-alpine"
+  replicaCount: 1
+  service:
+    type: LoadBalancer
+    port: 80
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---------------------------------------------------------------------------
+# Ingress — use when nginx.enabled is false and a cluster Ingress controller
+# is available (e.g. ingress-nginx, AWS ALB, GCE)
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: trident.example.com
+  tls: []
+    # - secretName: trident-tls
+    #   hosts:
+    #     - trident.example.com

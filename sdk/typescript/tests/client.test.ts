@@ -331,4 +331,73 @@ describe("subscribeToContract", () => {
       client.subscribeToContract({ contractId: "CTEST", topic0: "", onEvent: () => {} }),
     ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
   });
+
+  it("falls back to importing 'ws' when global WebSocket is not defined", async () => {
+    vi.stubGlobal("WebSocket", undefined);
+
+    let capturedUrl = "";
+    const MockWS = class {
+      constructor(url: string) {
+        capturedUrl = url;
+      }
+      onopen = null;
+      onmessage = null;
+      onerror = null;
+      onclose = null;
+      close() {}
+    };
+
+    vi.doMock("ws", () => {
+      return {
+        default: MockWS,
+      };
+    });
+
+    client.subscribeToContract({
+      contractId: "CTEST",
+      onEvent: () => {},
+    });
+
+    // Wait a bit for the async import of "ws" to resolve
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(capturedUrl).toContain("contractId=CTEST");
+    vi.unstubAllGlobals();
+    vi.doUnmock("ws");
+  });
+
+  it("uses webSocketImpl when provided in config", () => {
+    let capturedUrl = "";
+    const CustomMockWS = class {
+      constructor(url: string) {
+        capturedUrl = url;
+      }
+      onopen = null;
+      onmessage = null;
+      onerror = null;
+      onclose = null;
+      close() {}
+    };
+
+    const clientWithCustomWS = new TridentClient({
+      apiUrl: BASE_URL,
+      apiKey: API_KEY,
+      network: "testnet",
+      webSocketImpl: CustomMockWS,
+    });
+
+    vi.stubGlobal("WebSocket", class {
+      constructor() {
+        throw new Error("Should not use global WebSocket");
+      }
+    });
+
+    clientWithCustomWS.subscribeToContract({
+      contractId: "CTEST",
+      onEvent: () => {},
+    });
+
+    expect(capturedUrl).toContain("contractId=CTEST");
+    vi.unstubAllGlobals();
+  });
 });

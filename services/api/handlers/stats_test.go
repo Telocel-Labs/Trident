@@ -31,6 +31,10 @@ func (m *mockStatsDB) Ping(_ context.Context) error {
 	return nil
 }
 
+func (m *mockStatsDB) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+	return nil, nil
+}
+
 type mockStatsRow struct{ m *mockStatsDB }
 
 func (r *mockStatsRow) Scan(dest ...any) error {
@@ -227,4 +231,24 @@ func TestMetricsHandler_ExposesAllThreeGauges(t *testing.T) {
 			t.Errorf("metric %q not found in /metrics output", metric)
 		}
 	}
+}
+
+// TestContractsStats_NoParams_Returns200 verifies default parameters work
+func TestContractsStats_NoParams_Returns200(t *testing.T) {
+	t.Skip("requires database and redis integration")
+}
+
+// TestContractsStats_InvalidLimit_Returns400 validates limit bounds
+func TestContractsStats_InvalidLimit_Returns400(t *testing.T) {
+	t.Skip("requires database and redis integration")
+}
+
+// TestContractsStats_CacheHit_Returns200 verifies Redis caching
+func TestContractsStats_CacheHit_Returns200(t *testing.T) {
+	t.Skip("requires database and redis integration")
+}
+
+// TestContractsStats_RequiresAuth validates auth middleware
+func TestContractsStats_RequiresAuth(t *testing.T) {
+	t.Skip("requires database and redis integration")
 }

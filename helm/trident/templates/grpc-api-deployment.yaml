@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "trident.fullname" . }}-grpc-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grpc-api
+spec:
+  replicas: {{ .Values.grpcApi.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 8 }}
+    spec:
+      {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: grpc-api
+          image: "{{ .Values.grpcApi.image.repository }}:{{ .Values.grpcApi.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.grpcApi.service.port }}
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: REDIS_URL
+          resources:
+            {{- toYaml .Values.grpcApi.resources | nindent 12 }}
+      {{- with .Values.grpcApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.grpcApi.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.grpcApi.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "trident.fullname" . }}-grpc-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grpc-api
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.grpcApi.service.port }}
+      targetPort: grpc
+      protocol: TCP
