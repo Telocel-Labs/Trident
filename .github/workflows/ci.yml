@@ -209,7 +209,7 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
           TEST_REDIS_URL: redis://localhost:6379
           CI: "true"
-        run: cargo test --all -- --include-ignored
+        run: cargo test --all -- --include-ignored --test-threads=1
 
   # ---------------------------------------------------------------------------
   # Docker — build images (no push)
