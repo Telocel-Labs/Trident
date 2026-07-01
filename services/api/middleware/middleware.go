@@ -11,9 +11,6 @@ import (
 
 const RequestIDHeader = "X-Request-ID"
 
-// RequestIDCtxKey is the context key for request ID
-type contextKey string
-
 const RequestIDCtxKey contextKey = "request_id"
 
 // RequestID middleware attaches a UUID to the request context and response header

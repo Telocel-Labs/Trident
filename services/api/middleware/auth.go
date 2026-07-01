@@ -142,6 +142,16 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 	}
 }
 
+// Validator returns a func(string) bool that checks whether the HMAC-SHA256
+// of the provided key is in the given valid hashes set. Used by the GraphQL
+// WebSocket handler which needs a standalone key-check function.
+func Validator(hashes map[string]struct{}) func(string) bool {
+	return func(key string) bool {
+		_, ok := hashes[hmacKeyHash(key)]
+		return ok
+	}
+}
+
 // Auth validates X-API-Key for protected API and WebSocket routes.
 // GET /v1/health remains public. validHashes is the pre-parsed set of
 // accepted HMAC-SHA256 hex digests. When validHashes is empty all requests
