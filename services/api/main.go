@@ -89,7 +89,7 @@ func main() {
 		slog.Error("failed to connect to gRPC backend", "err", err)
 		os.Exit(1)
 	}
-	defer grpcClient.Close()
+	defer func() { _ = grpcClient.Close() }()
 	handlers.SetEventsClient(grpcClient)
 
 	var pool *pgxpool.Pool
@@ -122,7 +122,7 @@ func main() {
 		os.Exit(1)
 	}
 	redisClient := redis.NewClient(redisOpts)
-	defer redisClient.Close()
+	defer func() { _ = redisClient.Close() }()
 
 	hub := ws.NewHub()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -168,10 +168,13 @@ func main() {
 	if err != nil {
 		slog.Warn("database unavailable for webhook handlers", "err", err)
 	} else {
-		defer webhookDB.Close()
+		defer func() { _ = webhookDB.Close() }()
 	}
 	startWebhookWorker(ctx, webhookDB, redisClient)
 	startWebhookCleanupJob(ctx, webhookDB)
+
+	// Configure internal status handler with dependencies.
+	handlers.SetInternalStatusDeps(pool, redisClient, hub)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB, redisClient, grpcClient))
@@ -195,6 +198,7 @@ func main() {
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
+	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
 	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))

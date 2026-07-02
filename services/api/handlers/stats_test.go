@@ -89,7 +89,7 @@ func TestIndexerStats_Stalled_Returns503(t *testing.T) {
 		t.Fatalf("stalled: want 503, got %d", rec.Code)
 	}
 	var resp IndexerStatsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Status != "stalled" {
 		t.Errorf("want status=stalled, got %q", resp.Status)
 	}
@@ -104,7 +104,7 @@ func TestIndexerStats_NullLastPollAt_IsStalled(t *testing.T) {
 		t.Fatalf("null poll: want 503, got %d", rec.Code)
 	}
 	var resp IndexerStatsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Status != "stalled" {
 		t.Errorf("want stalled, got %q", resp.Status)
 	}
@@ -158,7 +158,7 @@ func TestIndexerStats_Lagging_Returns200(t *testing.T) {
 		t.Fatalf("lagging: want 200, got %d", rec.Code)
 	}
 	var resp IndexerStatsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Status != "lagging" {
 		t.Errorf("want lagging, got %q", resp.Status)
 	}
@@ -176,7 +176,7 @@ func TestIndexerStats_NilChainTip_LagIsNil(t *testing.T) {
 		t.Fatalf("nil tip: want 200, got %d", rec.Code)
 	}
 	var resp IndexerStatsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.ChainTipLedger != nil {
 		t.Errorf("chain_tip_ledger: want nil, got %v", resp.ChainTipLedger)
 	}
@@ -193,7 +193,7 @@ func TestIndexerStats_LastPollAt_RFC3339(t *testing.T) {
 	IndexerStats(&mockStatsDB{lastPollAt: &ts}).ServeHTTP(rec, statsReq())
 
 	var resp IndexerStatsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.LastPollAt == nil {
 		t.Fatal("last_poll_at should not be nil")
 	}

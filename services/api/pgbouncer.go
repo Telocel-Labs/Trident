@@ -29,7 +29,7 @@ func newPgbouncerStats(adminURL string) func(context.Context) (*handlers.DBStats
 		if err != nil {
 			return nil, fmt.Errorf("connect to pgbouncer admin: %w", err)
 		}
-		defer conn.Close(ctx)
+		defer func() { _ = conn.Close(ctx) }()
 
 		pools, err := queryShow(ctx, conn, "SHOW POOLS")
 		if err != nil {

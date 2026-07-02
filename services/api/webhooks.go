@@ -259,7 +259,7 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var sub webhookSubscription
@@ -325,7 +325,7 @@ func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event 
 	if err != nil {
 		return webhookDeliveryResult{Err: err}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
 	responseBody := strings.TrimSpace(string(bodyBytes))
@@ -388,7 +388,7 @@ func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		var subscriptions []webhookSubscription
 		for rows.Next() {
@@ -543,7 +543,7 @@ func deliveriesWebhookHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		var deliveries []webhookDelivery
 		for rows.Next() {

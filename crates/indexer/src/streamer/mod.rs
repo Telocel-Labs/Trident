@@ -1,4 +1,4 @@
-﻿//! # Streamer
+//! # Streamer
 //!
 //! Owns the RPC polling loop. Responsibilities:
 //!
@@ -177,7 +177,7 @@ impl Streamer {
     async fn poll_once(&mut self, cursor: &mut u64) -> Result<usize, TridentError> {
         let poll_start = Instant::now();
         let retry_strategy = ExponentialBackoff::from_millis(200)
-            .max_delay(Duration::from_secs(30))
+            .max_delay(Duration::from_secs(2))
             .take(5);
 
         // First-ever run: anchor to ledger 1 via start_ledger.
@@ -269,6 +269,39 @@ impl Streamer {
                             error = %e,
                             "Skipping unparseable event"
                         );
+                        metrics::record_parse_error();
+                        let ledger_seq: u64 = raw.ledger.parse().unwrap_or(0);
+                        let event_idx: u32 = raw
+                            .id
+                            .split('-')
+                            .next_back()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let raw_payload = serde_json::to_string(&serde_json::json!({
+                            "type": &raw.event_type,
+                            "ledger": &raw.ledger,
+                            "ledgerClosedAt": &raw.ledger_closed_at,
+                            "contractId": &raw.contract_id,
+                            "id": &raw.id,
+                            "topic": &raw.topic,
+                            "value": &raw.value,
+                        }))
+                        .unwrap_or_else(|_| "{}".to_string());
+                        if let Err(db_err) = db::insert_parse_error(
+                            &self.db,
+                            ledger_seq,
+                            event_idx,
+                            &raw_payload,
+                            &e.to_string(),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                error = %db_err,
+                                "Failed to record parse error in database"
+                            );
+                        }
+                        skipped_in_page += 1;
                     }
                 }
             }
@@ -315,6 +348,11 @@ impl Streamer {
 
             page_cursor = last_paging_token;
         }
+
+        // Recompute lag once the loop settles so it reflects the final cursor
+        // relative to the chain tip (zero once we have caught up).
+        metrics::set_ledger_lag(self.last_chain_tip.saturating_sub(*cursor) as i64);
+
         // Write health stats after every successful cycle (issue #62).
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
@@ -355,7 +393,7 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{Limited, Limits, ScSymbol, ScVal, WriteXdr};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Skip the test and return early if required env vars are missing.
@@ -674,23 +712,46 @@ mod tests {
         let (db_url, redis_url) = require_services!();
         let server = MockServer::start().await;
 
-        // First call returns 200 events (full page) → triggers follow-up
+        // getLedgers calls (made after each cursor advance) must not consume the
+        // getEvents page mocks, so match them separately.
         Mock::given(method("POST"))
             .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+        // First getEvents call returns 200 events (full page) → triggers follow-up
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
             .respond_with(rpc_ok(events_page(400, 200)))
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        // Second call returns 5 events (partial page) → stops pagination
+        // Second getEvents call returns 5 events (partial page) → stops pagination
         Mock::given(method("POST"))
             .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
             .respond_with(rpc_ok(events_page(401, 5)))
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        // Any further calls return empty
+        // Any further getEvents calls return empty
         Mock::given(method("POST"))
             .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
             .respond_with(rpc_ok(events_page(401, 0)))
             .mount(&server)
             .await;

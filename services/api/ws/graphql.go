@@ -112,7 +112,7 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 	done := make(chan struct{})
 
 	// conn.Close() runs last so the read goroutine unblocks via I/O error.
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// Closing done signals the read goroutine to exit via select.
 	defer close(done)
 

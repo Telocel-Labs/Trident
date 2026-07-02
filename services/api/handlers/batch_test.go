@@ -85,7 +85,7 @@ func TestBatchGetEvents_SomeMissing(t *testing.T) {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
 	var resp handlers.BatchEventsResponse
-	json.NewDecoder(w.Body).Decode(&resp)
+	_ = json.NewDecoder(w.Body).Decode(&resp)
 	if len(resp.Events) != 1 {
 		t.Errorf("expected 1 event, got %d", len(resp.Events))
 	}
@@ -122,7 +122,7 @@ func TestBatchGetEvents_InvalidUUID(t *testing.T) {
 		t.Errorf("expected 400, got %d", w.Code)
 	}
 	var body map[string]any
-	json.NewDecoder(w.Body).Decode(&body)
+	_ = json.NewDecoder(w.Body).Decode(&body)
 	if _, ok := body["invalid_ids"]; !ok {
 		t.Errorf("expected invalid_ids in response, got: %v", body)
 	}

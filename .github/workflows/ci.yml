@@ -64,7 +64,9 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all
+        env:
+          DATABASE_URL: postgres://trident:password@localhost:5432/trident
+        run: cargo test --all -- --test-threads=1
 
   # ---------------------------------------------------------------------------
   # Go — vet and lint
@@ -92,7 +94,7 @@ jobs:
         run: go test -race ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
           working-directory: services/api
@@ -206,6 +208,7 @@ jobs:
 
       - name: Run integration tests
         env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
           TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
           TEST_REDIS_URL: redis://localhost:6379
           CI: "true"

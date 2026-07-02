@@ -45,15 +45,15 @@ var (
 func MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		fmt.Fprintf(w, "# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
-		fmt.Fprintf(w, "# TYPE trident_indexer_lag_ledgers gauge\n")
-		fmt.Fprintf(w, "trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
-		fmt.Fprintf(w, "# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
-		fmt.Fprintf(w, "# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
-		fmt.Fprintf(w, "trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
-		fmt.Fprintf(w, "# HELP trident_indexer_events_total Cumulative events indexed.\n")
-		fmt.Fprintf(w, "# TYPE trident_indexer_events_total gauge\n")
-		fmt.Fprintf(w, "trident_indexer_events_total %g\n", metricEventsTotal.Get())
+		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
+		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_lag_ledgers gauge\n")
+		_, _ = fmt.Fprintf(w,"trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
+		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
+		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
+		_, _ = fmt.Fprintf(w,"trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
+		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_events_total Cumulative events indexed.\n")
+		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_events_total gauge\n")
+		_, _ = fmt.Fprintf(w,"trident_indexer_events_total %g\n", metricEventsTotal.Get())
 	}
 }
 
@@ -107,7 +107,7 @@ func fetchLatestLedger(ctx context.Context, rpcURL string) *int64 {
 		slog.Debug("stats: RPC call failed", "err", err)
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var result struct {
 		Result struct {
