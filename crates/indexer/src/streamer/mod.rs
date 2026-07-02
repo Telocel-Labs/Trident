@@ -1,4 +1,4 @@
-﻿//! # Streamer
+//! # Streamer
 //!
 //! Owns the RPC polling loop. Responsibilities:
 //!
@@ -285,14 +285,17 @@ impl Streamer {
                             "id": &raw.id,
                             "topic": &raw.topic,
                             "value": &raw.value,
-                        })).unwrap_or_else(|_| "{}".to_string());
+                        }))
+                        .unwrap_or_else(|_| "{}".to_string());
                         if let Err(db_err) = db::insert_parse_error(
                             &self.db,
                             ledger_seq,
                             event_idx,
                             &raw_payload,
                             &e.to_string(),
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::error!(
                                 error = %db_err,
                                 "Failed to record parse error in database"

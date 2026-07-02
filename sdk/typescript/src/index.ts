@@ -267,7 +267,7 @@ export class TridentClient {
       // Use graphql-ws protocol for subscriptions
       // This will be implemented via the graphql-ws client library
       throw new TridentError(
-        "NOT_IMPLEMENTED",
+        "INTERNAL",
         "GraphQL subscriptions are not yet fully implemented",
       );
     }

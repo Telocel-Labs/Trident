@@ -38,10 +38,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         EVENTS_SKIPPED_TOTAL,
         "Events skipped (diagnostic, failed call, or contract filter)"
     );
-    describe_counter!(
-        PARSE_ERRORS_TOTAL,
-        "Total events that failed XDR decoding"
-    );
+    describe_counter!(PARSE_ERRORS_TOTAL, "Total events that failed XDR decoding");
     describe_histogram!(
         POLL_DURATION_SECONDS,
         "Time per poll_once cycle, in seconds"

@@ -119,9 +119,7 @@ fn ws_url_from_api_url(api_url: &str) -> String {
 // HTTP response error mapping
 // ---------------------------------------------------------------------------
 
-async fn check_response(
-    response: reqwest::Response,
-) -> Result<reqwest::Response, TridentError> {
+async fn check_response(response: reqwest::Response) -> Result<reqwest::Response, TridentError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -217,14 +215,9 @@ impl TridentClient {
     /// # Ok::<(), trident_sdk::TridentError>(())
     /// # });
     /// ```
-    pub async fn query_events(
-        &self,
-        params: QueryParams,
-    ) -> Result<PaginatedEvents, TridentError> {
-        let mut url =
-            url::Url::parse(&format!("{}/v1/events", self.config.api_url)).map_err(|e| {
-                TridentError::WebSocket(e.to_string())
-            })?;
+    pub async fn query_events(&self, params: QueryParams) -> Result<PaginatedEvents, TridentError> {
+        let mut url = url::Url::parse(&format!("{}/v1/events", self.config.api_url))
+            .map_err(|e| TridentError::WebSocket(e.to_string()))?;
 
         {
             let mut qs = url.query_pairs_mut();
@@ -246,21 +239,13 @@ impl TridentClient {
             if let Some(a) = &params.after {
                 qs.append_pair("cursor", a);
             }
-            qs.append_pair(
-                "limit",
-                &params.first.unwrap_or(50).to_string(),
-            );
+            qs.append_pair("limit", &params.first.unwrap_or(50).to_string());
             if let Some(et) = &params.event_type {
                 qs.append_pair("event_type", et);
             }
         }
 
-        let response = self
-            .http
-            .get(url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let response = self.http.get(url).headers(self.headers()).send().await?;
 
         let response = check_response(response).await?;
         let body: ApiListResponse = response.json().await?;
@@ -326,12 +311,7 @@ impl TridentClient {
             url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
         );
 
-        let response = self
-            .http
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let response = self.http.get(&url).headers(self.headers()).send().await?;
 
         let response = check_response(response).await?;
         let body: ApiGetResponse = response.json().await?;
@@ -563,10 +543,7 @@ mod tests {
         let body = serde_json::json!({ "event": event_body() });
 
         let mock = server
-            .mock(
-                "GET",
-                "/v1/events/550e8400-e29b-41d4-a716-446655440000",
-            )
+            .mock("GET", "/v1/events/550e8400-e29b-41d4-a716-446655440000")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(body.to_string())
@@ -605,9 +582,7 @@ mod tests {
     #[tokio::test]
     async fn subscription_terminates_on_drop() {
         use futures::stream;
-        let sub = Subscription::new(
-            stream::empty::<Result<SorobanEvent, TridentError>>(),
-        );
+        let sub = Subscription::new(stream::empty::<Result<SorobanEvent, TridentError>>());
         drop(sub);
     }
 

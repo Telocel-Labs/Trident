@@ -30,10 +30,16 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 
     match opentelemetry_otlp::new_pipeline()
         .tracing()
-        .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint))
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(endpoint),
+        )
         .with_trace_config(
             opentelemetry_sdk::trace::Config::default()
-                .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(sampling_ratio))
+                .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
+                    sampling_ratio,
+                ))
                 .with_resource(opentelemetry_sdk::Resource::new(vec![
                     opentelemetry::KeyValue::new("service.name", "trident-grpc-api"),
                 ])),

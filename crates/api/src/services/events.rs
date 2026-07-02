@@ -41,9 +41,7 @@ impl<'a> Extractor for MetadataCarrier<'a> {
 }
 
 fn extract_context(metadata: &tonic::metadata::MetadataMap) -> opentelemetry::Context {
-    opentelemetry::global::get_text_map_propagator(|prop| {
-        prop.extract(&MetadataCarrier(metadata))
-    })
+    opentelemetry::global::get_text_map_propagator(|prop| prop.extract(&MetadataCarrier(metadata)))
 }
 
 const REDIS_STREAM_KEY: &str = "trident:events";
@@ -148,49 +146,14 @@ impl Events for EventsServiceImpl {
 
                 match row {
                     Some((seq, idx)) => (Some(seq), Some(idx)),
-                    None => return Err(Status::invalid_argument("cursor references unknown event")),
+                    None => {
+                        return Err(Status::invalid_argument("cursor references unknown event"))
+                    }
                 }
             };
 
             let rows: Vec<EventRow> = sqlx::query_as(
                 r#"
-                SELECT id, contract_id, ledger_sequence, ledger_timestamp,
-                       transaction_hash, event_index, event_type, topics, data, created_at
-                FROM soroban_events
-                WHERE
-                    ($1::text = '' OR contract_id = $1)
-                    AND ($2::text = '' OR topic_0 = $2)
-                    AND ($3::text = '' OR topic_1 = $3)
-                    AND ($4::bigint = 0 OR ledger_sequence >= $4)
-                    AND ($5::bigint = 0 OR ledger_sequence <= $5)
-                    AND (
-                        $6::bigint IS NULL
-                        OR (ledger_sequence, event_index) > ($6, $7)
-                    )
-                ORDER BY ledger_sequence ASC, event_index ASC
-                LIMIT $8
-                "#,
-            )
-            .bind(&req.contract_id)
-            .bind(&req.topic_0)
-            .bind(&req.topic_1)
-            .bind(req.ledger_from as i64)
-            .bind(req.ledger_to as i64)
-            .bind(cursor_seq)
-            .bind(cursor_idx)
-            .bind(limit)
-            .fetch_all(&db)
-            .await
-            .map_err(db_err)?;
-
-            match row {
-                Some((seq, idx)) => (Some(seq), Some(idx)),
-                None => return Err(Status::invalid_argument("cursor references unknown event")),
-            }
-        };
-
-        let rows: Vec<EventRow> = sqlx::query_as(
-            r#"
             SELECT id, contract_id, ledger_sequence, ledger_timestamp,
                    transaction_hash, event_index, event_type, topics, data, created_at
             FROM soroban_events
@@ -208,26 +171,26 @@ impl Events for EventsServiceImpl {
             ORDER BY ledger_sequence ASC, event_index ASC
             LIMIT $9
             "#,
-        )
-        .bind(network)
-        .bind(&req.contract_id)
-        .bind(&req.topic_0)
-        .bind(&req.topic_1)
-        .bind(req.ledger_from as i64)
-        .bind(req.ledger_to as i64)
-        .bind(cursor_seq)
-        .bind(cursor_idx)
-        .bind(limit)
-        .fetch_all(&self.db)
-        .await
-        .map_err(db_err)?;
+            )
+            .bind(network)
+            .bind(&req.contract_id)
+            .bind(&req.topic_0)
+            .bind(&req.topic_1)
+            .bind(req.ledger_from as i64)
+            .bind(req.ledger_to as i64)
+            .bind(cursor_seq)
+            .bind(cursor_idx)
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await
+            .map_err(db_err)?;
 
-        let has_more = rows.len() as i64 == limit;
-        let next_cursor = if has_more {
-            rows.last().map(|r| r.id.to_string()).unwrap_or_default()
-        } else {
-            String::new()
-        };
+            let has_more = rows.len() as i64 == limit;
+            let next_cursor = if has_more {
+                rows.last().map(|r| r.id.to_string()).unwrap_or_default()
+            } else {
+                String::new()
+            };
 
             let events: Vec<Event> = rows.into_iter().map(row_to_event).collect();
 
@@ -249,29 +212,28 @@ impl Events for EventsServiceImpl {
         let span = tracing::info_span!("get_event", "rpc.system" = "grpc");
         span.set_parent(parent_cx);
 
-        let db = self.db.clone();
         let req = request.into_inner();
 
         async move {
             let id = Uuid::parse_str(&req.id)
                 .map_err(|_| Status::invalid_argument("id must be a valid UUID"))?;
 
-        let network = resolve_network(&req.network);
+            let network = resolve_network(&req.network);
 
-        let row: Option<EventRow> = sqlx::query_as(
-            r#"
-            SELECT id, contract_id, ledger_sequence, ledger_timestamp,
-                   transaction_hash, event_index, event_type, topics, data, created_at
-            FROM soroban_events
-            WHERE id = $1
-              AND network = $2
-            "#,
-        )
-        .bind(id)
-        .bind(network)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(db_err)?;
+            let row: Option<EventRow> = sqlx::query_as(
+                r#"
+                SELECT id, contract_id, ledger_sequence, ledger_timestamp,
+                       transaction_hash, event_index, event_type, topics, data, created_at
+                FROM soroban_events
+                WHERE id = $1
+                  AND network = $2
+                "#,
+            )
+            .bind(id)
+            .bind(network)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(db_err)?;
 
             match row {
                 Some(r) => Ok(Response::new(row_to_event(r))),

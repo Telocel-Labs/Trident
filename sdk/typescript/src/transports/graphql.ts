@@ -140,7 +140,7 @@ export class GraphQLTransport {
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       throw new TridentError(
-        "SERVICE_UNAVAILABLE",
+        "INTERNAL",
         `HTTP ${res.status}: ${body}`,
         undefined,
       );
