@@ -14,6 +14,7 @@ use trident_common::TridentError;
 pub const LEDGER_LAG: &str = "trident_indexer_ledger_lag";
 pub const EVENTS_TOTAL: &str = "trident_indexer_events_total";
 pub const EVENTS_SKIPPED_TOTAL: &str = "trident_indexer_events_skipped_total";
+pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
@@ -37,6 +38,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         EVENTS_SKIPPED_TOTAL,
         "Events skipped (diagnostic, failed call, or contract filter)"
     );
+    describe_counter!(
+        PARSE_ERRORS_TOTAL,
+        "Total events that failed XDR decoding"
+    );
     describe_histogram!(
         POLL_DURATION_SECONDS,
         "Time per poll_once cycle, in seconds"
@@ -51,6 +56,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     // seed them at zero so /metrics is complete from the very first scrape.
     counter!(EVENTS_TOTAL).increment(0);
     counter!(EVENTS_SKIPPED_TOTAL).increment(0);
+    counter!(PARSE_ERRORS_TOTAL).increment(0);
     counter!(POLL_ERRORS_TOTAL).increment(0);
     counter!(RPC_RETRIES_TOTAL).increment(0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -73,6 +79,10 @@ pub fn record_events_skipped(count: u64) {
     if count > 0 {
         counter!(EVENTS_SKIPPED_TOTAL).increment(count);
     }
+}
+
+pub fn record_parse_error() {
+    counter!(PARSE_ERRORS_TOTAL).increment(1);
 }
 
 pub fn record_poll_duration(seconds: f64) {

@@ -269,6 +269,36 @@ impl Streamer {
                             error = %e,
                             "Skipping unparseable event"
                         );
+                        metrics::record_parse_error();
+                        let ledger_seq: u64 = raw.ledger.parse().unwrap_or(0);
+                        let event_idx: u32 = raw
+                            .id
+                            .split('-')
+                            .next_back()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let raw_payload = serde_json::to_string(&serde_json::json!({
+                            "type": &raw.event_type,
+                            "ledger": &raw.ledger,
+                            "ledgerClosedAt": &raw.ledger_closed_at,
+                            "contractId": &raw.contract_id,
+                            "id": &raw.id,
+                            "topic": &raw.topic,
+                            "value": &raw.value,
+                        })).unwrap_or_else(|_| "{}".to_string());
+                        if let Err(db_err) = db::insert_parse_error(
+                            &self.db,
+                            ledger_seq,
+                            event_idx,
+                            &raw_payload,
+                            &e.to_string(),
+                        ).await {
+                            tracing::error!(
+                                error = %db_err,
+                                "Failed to record parse error in database"
+                            );
+                        }
+                        skipped_in_page += 1;
                     }
                 }
             }

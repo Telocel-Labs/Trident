@@ -233,6 +233,32 @@ pub async fn set_alert_state(
     Ok(())
 }
 
+/// Record a parse error to parse_errors table for auditing and potential replay.
+pub async fn insert_parse_error(
+    pool: &PgPool,
+    ledger_sequence: u64,
+    event_index: u32,
+    raw_payload: &str,
+    error_message: &str,
+) -> Result<(), TridentError> {
+    sqlx::query(
+        r#"
+        INSERT INTO parse_errors
+            (ledger_sequence, event_index, raw_payload, error_message)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(ledger_sequence as i64)
+    .bind(event_index as i32)
+    .bind(raw_payload)
+    .bind(error_message)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::StorageError(format!("insert_parse_error: {e}")))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
