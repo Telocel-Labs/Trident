@@ -8,7 +8,9 @@ import (
 
 func TestValidateQueryStats_Defaults(t *testing.T) {
 	params, err := ValidateQueryStats("", "", "", "")
-	assert.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	assert.Equal(t, "testnet", params.Network)
 	assert.Equal(t, int64(50), params.Limit)
 	assert.Nil(t, params.FromLedgerPtr)
@@ -17,7 +19,9 @@ func TestValidateQueryStats_Defaults(t *testing.T) {
 
 func TestValidateQueryStats_ValidParams(t *testing.T) {
 	params, err := ValidateQueryStats("1000", "5000", "mainnet", "100")
-	assert.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	assert.Equal(t, int64(1000), params.FromLedger)
 	assert.Equal(t, int64(5000), params.ToLedger)
 	assert.Equal(t, "mainnet", params.Network)
@@ -58,11 +62,15 @@ func TestValidateQueryStats_InvalidNetwork(t *testing.T) {
 
 func TestValidateQueryStats_NetworkCaseInsensitive(t *testing.T) {
 	params, err := ValidateQueryStats("", "", "TESTNET", "")
-	assert.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	assert.Equal(t, "testnet", params.Network)
 
 	params, err = ValidateQueryStats("", "", "MAINNET", "")
-	assert.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	assert.Equal(t, "mainnet", params.Network)
 }
 
@@ -92,12 +100,16 @@ func TestValidateQueryStats_InvalidLimit_NotInteger(t *testing.T) {
 
 func TestValidateQueryStats_LimitBoundary_Min(t *testing.T) {
 	params, err := ValidateQueryStats("", "", "", "1")
-	assert.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	assert.Equal(t, int64(1), params.Limit)
 }
 
 func TestValidateQueryStats_LimitBoundary_Max(t *testing.T) {
 	params, err := ValidateQueryStats("", "", "", "100")
-	assert.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	assert.Equal(t, int64(100), params.Limit)
 }

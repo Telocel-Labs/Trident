@@ -100,7 +100,7 @@ func InternalStatus() http.HandlerFunc {
 
 			// DB pool connections
 			if statusDeps.db != nil {
-				resp.DBPoolOpenConns = int32(statusDeps.db.Stat().TotalConns)
+				resp.DBPoolOpenConns = statusDeps.db.Stat().TotalConns()
 			}
 
 			// Parse errors in last 24 hours

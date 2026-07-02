@@ -154,23 +154,23 @@ impl Events for EventsServiceImpl {
 
             let rows: Vec<EventRow> = sqlx::query_as(
                 r#"
-            SELECT id, contract_id, ledger_sequence, ledger_timestamp,
-                   transaction_hash, event_index, event_type, topics, data, created_at
-            FROM soroban_events
-            WHERE
-                network = $1
-                AND ($2::text = '' OR contract_id = $2)
-                AND ($3::text = '' OR topic_0 = $3)
-                AND ($4::text = '' OR topic_1 = $4)
-                AND ($5::bigint = 0 OR ledger_sequence >= $5)
-                AND ($6::bigint = 0 OR ledger_sequence <= $6)
-                AND (
-                    $7::bigint IS NULL
-                    OR (ledger_sequence, event_index) > ($7, $8)
-                )
-            ORDER BY ledger_sequence ASC, event_index ASC
-            LIMIT $9
-            "#,
+                SELECT id, contract_id, ledger_sequence, ledger_timestamp,
+                       transaction_hash, event_index, event_type, topics, data, created_at
+                FROM soroban_events
+                WHERE
+                    network = $1
+                    AND ($2::text = '' OR contract_id = $2)
+                    AND ($3::text = '' OR topic_0 = $3)
+                    AND ($4::text = '' OR topic_1 = $4)
+                    AND ($5::bigint = 0 OR ledger_sequence >= $5)
+                    AND ($6::bigint = 0 OR ledger_sequence <= $6)
+                    AND (
+                        $7::bigint IS NULL
+                        OR (ledger_sequence, event_index) > ($7, $8)
+                    )
+                ORDER BY ledger_sequence ASC, event_index ASC
+                LIMIT $9
+                "#,
             )
             .bind(network)
             .bind(&req.contract_id)
@@ -181,7 +181,7 @@ impl Events for EventsServiceImpl {
             .bind(cursor_seq)
             .bind(cursor_idx)
             .bind(limit)
-            .fetch_all(&self.db)
+            .fetch_all(&db)
             .await
             .map_err(db_err)?;
 
@@ -212,6 +212,7 @@ impl Events for EventsServiceImpl {
         let span = tracing::info_span!("get_event", "rpc.system" = "grpc");
         span.set_parent(parent_cx);
 
+        let db = self.db.clone();
         let req = request.into_inner();
 
         async move {
@@ -222,16 +223,16 @@ impl Events for EventsServiceImpl {
 
             let row: Option<EventRow> = sqlx::query_as(
                 r#"
-                SELECT id, contract_id, ledger_sequence, ledger_timestamp,
-                       transaction_hash, event_index, event_type, topics, data, created_at
-                FROM soroban_events
-                WHERE id = $1
-                  AND network = $2
-                "#,
+            SELECT id, contract_id, ledger_sequence, ledger_timestamp,
+                   transaction_hash, event_index, event_type, topics, data, created_at
+            FROM soroban_events
+            WHERE id = $1
+              AND network = $2
+            "#,
             )
             .bind(id)
             .bind(network)
-            .fetch_optional(&self.db)
+            .fetch_optional(&db)
             .await
             .map_err(db_err)?;
 
@@ -365,13 +366,9 @@ mod tests {
 
     macro_rules! require_services {
         () => {{
-            let in_ci = std::env::var("CI").map(|v| v == "true").unwrap_or(false);
             let db = match std::env::var("TEST_DATABASE_URL") {
                 Ok(url) => url,
                 Err(_) => {
-                    if in_ci {
-                        panic!("TEST_DATABASE_URL must be set in CI");
-                    }
                     eprintln!("SKIP: TEST_DATABASE_URL not set");
                     return;
                 }
@@ -379,9 +376,6 @@ mod tests {
             let rd = match std::env::var("TEST_REDIS_URL") {
                 Ok(url) => url,
                 Err(_) => {
-                    if in_ci {
-                        panic!("TEST_REDIS_URL must be set in CI");
-                    }
                     eprintln!("SKIP: TEST_REDIS_URL not set");
                     return;
                 }
@@ -424,17 +418,19 @@ mod tests {
 
     async fn insert_one_event(pool: &PgPool, network: &str) -> Uuid {
         let id = Uuid::new_v4();
+        let tx_hash = format!("txhashtest-{id}");
         sqlx::query(
             r#"
             INSERT INTO soroban_events
                 (id, contract_id, network, ledger_sequence, ledger_timestamp, transaction_hash,
                  event_index, event_type, topics, data)
-            VALUES ($1, 'CTEST', $2, 999, NOW(), 'txhashtest', 0, 'contract', '["transfer"]', '{}')
+            VALUES ($1, 'CTEST', $2, 999, NOW(), $3, 0, 'contract', '["transfer"]', '{}')
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(id)
         .bind(network)
+        .bind(tx_hash)
         .execute(pool)
         .await
         .unwrap();

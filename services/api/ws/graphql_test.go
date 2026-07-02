@@ -312,7 +312,7 @@ func TestGQLHandler_AuthAndDeliver(t *testing.T) {
 	hub.Broadcast("CTEST", event)
 
 	// Expect a next message.
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	msg := readGQLFrame(t, r)
 	if msg.Type != "next" {
 		t.Fatalf("expected next, got %q", msg.Type)
@@ -351,7 +351,7 @@ func TestGQLHandler_InvalidKeyClosesWithError(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write connection_init: %v", err)
 	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	msg := readGQLFrame(t, r)
 	if msg.Type != "connection_error" {
 		t.Fatalf("expected connection_error, got %q", msg.Type)
@@ -393,7 +393,7 @@ func TestGQLHandler_Topic0Filter(t *testing.T) {
 	// Broadcast event with matching topic — must arrive.
 	hub.Broadcast("CF", []byte(`{"id":"e1","contract_id":"CF","topics":["wanted"]}`))
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	msg := readGQLFrame(t, r)
 	if msg.Type != "next" {
 		t.Fatalf("expected next, got %q", msg.Type)
@@ -498,7 +498,7 @@ func TestGQLHandler_TwoSubscriptionsOneSendPerEvent(t *testing.T) {
 	// Broadcast to only sub-a's contract; sub-b must not receive it.
 	hub.Broadcast("sub-a-contract", []byte(`{"id":"only-a","contract_id":"sub-a-contract","topics":[]}`))
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	msg := readGQLFrame(t, r)
 	if msg.ID != "sub-a" {
 		t.Errorf("expected delivery to sub-a, got id=%q", msg.ID)

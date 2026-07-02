@@ -42,9 +42,9 @@ func TestLoad_AllVarsPresent(t *testing.T) {
 // TestCollectMissing verifies the missing-var collection logic via the
 // exported CollectMissing helper (see config.go).
 func TestMissingVarsIdentified(t *testing.T) {
-	os.Unsetenv("DATABASE_URL")
-	os.Unsetenv("REDIS_URL")
-	os.Unsetenv("API_GRPC_ADDR")
+	_ = os.Unsetenv("DATABASE_URL")
+	_ = os.Unsetenv("REDIS_URL")
+	_ = os.Unsetenv("API_GRPC_ADDR")
 
 	missing := config.CollectMissing()
 	if len(missing) != 3 {
@@ -66,7 +66,7 @@ func TestMissingVarsIdentified(t *testing.T) {
 }
 
 func TestMissingVars_OnlyDatabaseURL(t *testing.T) {
-	os.Unsetenv("DATABASE_URL")
+	_ = os.Unsetenv("DATABASE_URL")
 	t.Setenv("REDIS_URL", "redis://localhost:6379")
 	t.Setenv("API_GRPC_ADDR", "localhost:50051")
 
@@ -78,7 +78,7 @@ func TestMissingVars_OnlyDatabaseURL(t *testing.T) {
 
 func TestMissingVars_OnlyRedisURL(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	os.Unsetenv("REDIS_URL")
+	_ = os.Unsetenv("REDIS_URL")
 	t.Setenv("API_GRPC_ADDR", "localhost:50051")
 
 	missing := config.CollectMissing()
@@ -90,7 +90,7 @@ func TestMissingVars_OnlyRedisURL(t *testing.T) {
 func TestMissingVars_OnlyAPIGrpcAddr(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
 	t.Setenv("REDIS_URL", "redis://localhost:6379")
-	os.Unsetenv("API_GRPC_ADDR")
+	_ = os.Unsetenv("API_GRPC_ADDR")
 
 	missing := config.CollectMissing()
 	if len(missing) != 1 || missing[0] != "API_GRPC_ADDR" {

@@ -41,7 +41,7 @@ var noop = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Wri
 // ---------------------------------------------------------------------------
 
 func TestAuth_HealthSkipped(t *testing.T) {
-	os.Setenv("API_KEY_SALT", testSalt)
+	_ = os.Setenv("API_KEY_SALT", testSalt)
 	h := middleware.Auth(validHashes(testSalt, "k1"), noop)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
@@ -54,7 +54,7 @@ func TestAuth_HealthSkipped(t *testing.T) {
 }
 
 func TestAuth_ValidKey(t *testing.T) {
-	os.Setenv("API_KEY_SALT", testSalt)
+	_ = os.Setenv("API_KEY_SALT", testSalt)
 	h := middleware.Auth(validHashes(testSalt, "good-key"), noop)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
@@ -68,7 +68,7 @@ func TestAuth_ValidKey(t *testing.T) {
 }
 
 func TestAuth_MissingKey(t *testing.T) {
-	os.Setenv("API_KEY_SALT", testSalt)
+	_ = os.Setenv("API_KEY_SALT", testSalt)
 	h := middleware.Auth(validHashes(testSalt, "k1"), noop)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
@@ -81,7 +81,7 @@ func TestAuth_MissingKey(t *testing.T) {
 }
 
 func TestAuth_InvalidKey(t *testing.T) {
-	os.Setenv("API_KEY_SALT", testSalt)
+	_ = os.Setenv("API_KEY_SALT", testSalt)
 	h := middleware.Auth(validHashes(testSalt, "good-key"), noop)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
