@@ -83,3 +83,11 @@ func (h *Hub) Broadcast(contractID string, msg []byte) {
 		}
 	}
 }
+
+// ClientCount returns the number of currently active WebSocket clients.
+// Safe to call from any goroutine.
+func (h *Hub) ClientCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
+}

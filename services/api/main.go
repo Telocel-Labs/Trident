@@ -173,6 +173,9 @@ func main() {
 	startWebhookWorker(ctx, webhookDB, redisClient)
 	startWebhookCleanupJob(ctx, webhookDB)
 
+	// Configure internal status handler with dependencies.
+	handlers.SetInternalStatusDeps(pool, redisClient, hub)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB, redisClient, grpcClient))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
@@ -195,6 +198,7 @@ func main() {
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
+	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
 	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
