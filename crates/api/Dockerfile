@@ -11,11 +11,15 @@ COPY proto/ proto/
 COPY crates/common/Cargo.toml crates/common/Cargo.toml
 COPY crates/api/Cargo.toml    crates/api/Cargo.toml
 COPY crates/indexer/Cargo.toml crates/indexer/Cargo.toml
+COPY crates/backfill/Cargo.toml crates/backfill/Cargo.toml
+COPY sdk/rust/Cargo.toml sdk/rust/Cargo.toml
 
-RUN mkdir -p crates/common/src crates/api/src crates/indexer/src \
+RUN mkdir -p crates/common/src crates/api/src crates/indexer/src crates/backfill/src sdk/rust/src \
     && echo "pub fn _stub() {}" > crates/common/src/lib.rs \
     && echo "fn main() {}"      > crates/api/src/main.rs \
     && echo "fn main() {}"      > crates/indexer/src/main.rs \
+    && echo "fn main() {}"      > crates/backfill/src/main.rs \
+    && echo "pub fn _stub() {}" > sdk/rust/src/lib.rs \
     && cargo build --release -p trident-api
 
 COPY . .

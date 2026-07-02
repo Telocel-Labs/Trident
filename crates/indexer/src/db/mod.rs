@@ -296,9 +296,28 @@ mod tests {
 
     /// Calling `insert_event` twice with the same event must not error and
     /// the row count in `soroban_events` must remain 1.
-    #[sqlx::test(migrations = "../../database/migrations")]
-    async fn insert_event_is_idempotent(pool: PgPool) {
+    ///
+    /// Uses the shared test database (TEST_DATABASE_URL) like the other
+    /// integration tests; skips when it is not configured.
+    #[tokio::test]
+    async fn insert_event_is_idempotent() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
         let event = make_event("CABC_CONTRACT_001", 42, 0);
+
+        // Isolate from other tests sharing the database.
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&event.contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
 
         insert_event(&pool, &event)
             .await
@@ -307,10 +326,12 @@ mod tests {
             .await
             .expect("second insert must not error");
 
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM soroban_events")
-            .fetch_one(&pool)
-            .await
-            .expect("count query failed");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&event.contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count query failed");
 
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
     }
