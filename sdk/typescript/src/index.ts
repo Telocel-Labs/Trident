@@ -10,12 +10,14 @@ export type { TridentErrorCode } from "./errors.js";
 // ---------------------------------------------------------------------------
 
 export type Network = "mainnet" | "testnet" | "futurenet";
+export type TransportType = "rest" | "graphql";
 
 export interface TridentClientConfig {
   apiUrl: string;
   apiKey: string;
   network: Network;
   webSocketImpl?: any;
+  transport?: TransportType;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,9 +129,12 @@ function apiEventToSorobanEvent(
 
 export class TridentClient {
   private readonly config: TridentClientConfig;
+  private readonly transport: "rest" | "graphql";
+  private graphqlTransport?: any; // Lazy-loaded GraphQL transport
 
   constructor(config: TridentClientConfig) {
     this.config = config;
+    this.transport = config.transport ?? "rest";
   }
 
   private get headers(): Record<string, string> {
@@ -162,6 +167,16 @@ export class TridentClient {
     return schema.parse(json);
   }
 
+  private async getGraphQLTransport() {
+    if (this.graphqlTransport) {
+      return this.graphqlTransport;
+    }
+    // Lazy load GraphQL transport only when needed
+    const { GraphQLTransport } = await import("./transports/graphql.js");
+    this.graphqlTransport = new GraphQLTransport(this.config.apiUrl, this.config.apiKey);
+    return this.graphqlTransport;
+  }
+
   /**
    * Query historical Soroban events with optional filtering.
    *
@@ -169,6 +184,20 @@ export class TridentClient {
    * the next call to fetch the next page.
    */
   async queryEvents(params: QueryEventsParams): Promise<PaginatedEvents> {
+    if (this.transport === "graphql") {
+      const transport = await this.getGraphQLTransport();
+      return transport.queryEvents(
+        params.contractId,
+        params.topic0,
+        params.topic1,
+        params.ledgerFrom,
+        params.ledgerTo,
+        params.limit,
+        params.after,
+      );
+    }
+
+    // REST transport (default)
     const qs = new URLSearchParams();
     if (params.contractId) qs.set("contractId", params.contractId);
     if (params.topic0) qs.set("topic0", params.topic0);
@@ -197,6 +226,12 @@ export class TridentClient {
    * Throws `TridentError` with code `NOT_FOUND` if no event exists.
    */
   async getEventById(params: GetEventByIdParams): Promise<SorobanEvent> {
+    if (this.transport === "graphql") {
+      const transport = await this.getGraphQLTransport();
+      return transport.getEventById(params.id);
+    }
+
+    // REST transport (default)
     const url = `${this.config.apiUrl}/v1/events/${encodeURIComponent(params.id)}`;
     const apiEvent = await this.fetchJSON(url, ApiEventSchema);
     return apiEventToSorobanEvent(apiEvent);
@@ -205,10 +240,8 @@ export class TridentClient {
   /**
    * Open a real-time WebSocket subscription to events emitted by a contract.
    *
-   * Replaces `https://` with `wss://` (and `http://` with `ws://`) to derive
-   * the WebSocket URL. Reconnects with exponential backoff (500ms–30s) on
-   * unexpected close. Returns a `Subscription` handle whose `unsubscribe()`
-   * closes the socket and cancels any pending reconnect.
+   * For GraphQL transport, requires graphql-ws to be installed.
+   * For REST transport, uses native WebSocket.
    */
   subscribeToContract(params: SubscribeToContractParams): Subscription {
     if (params.topic0 !== undefined && params.topic0 === "") {
@@ -219,6 +252,27 @@ export class TridentClient {
       );
     }
 
+    if (this.transport === "graphql") {
+      // GraphQL subscriptions require graphql-ws
+      try {
+        // Attempt to import graphql-ws
+        require("graphql-ws");
+      } catch {
+        throw new TridentError(
+          "INTERNAL",
+          "GraphQL subscriptions require graphql-ws. Install it with: npm install graphql-ws",
+        );
+      }
+
+      // Use graphql-ws protocol for subscriptions
+      // This will be implemented via the graphql-ws client library
+      throw new TridentError(
+        "NOT_IMPLEMENTED",
+        "GraphQL subscriptions are not yet fully implemented",
+      );
+    }
+
+    // REST transport (default) - use native WebSocket
     const wsBase = this.config.apiUrl
       .replace(/^https:\/\//, "wss://")
       .replace(/^http:\/\//, "ws://");
