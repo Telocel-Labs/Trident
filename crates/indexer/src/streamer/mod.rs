@@ -180,21 +180,16 @@ impl Streamer {
             .max_delay(Duration::from_secs(2))
             .take(5);
 
-        // First-ever run: anchor to ledger 1 via start_ledger.
-        // All subsequent calls use paging_token cursors so the RPC can resume
-        // exactly where we left off without re-scanning from genesis.
-        let (start_ledger, initial_cursor) = if *cursor == 0 {
-            (Some(1u64), None)
-        } else {
-            (None, Some(cursor.to_string()))
-        };
-
-        let mut page_cursor = initial_cursor;
+        // The first page of a poll anchors by ledger (startLedger); every later
+        // page in the same poll resumes via the RPC paging token. A fresh index
+        // (cursor 0) starts at ledger 1; a resume starts at the ledger after the
+        // last one we fully processed. startLedger and cursor are mutually
+        // exclusive in the Soroban RPC, so only one is ever sent per request.
+        let mut page_cursor: Option<String> = None;
         let mut total = 0;
 
         loop {
-            let pc = page_cursor.clone();
-            let sl = start_ledger;
+            let (sl, pc) = page_request_params(*cursor, page_cursor.as_deref());
             let mut attempt = 0u32;
             let limit = self.config.max_events_per_poll;
             let page = Retry::start(retry_strategy.clone(), || {
@@ -388,6 +383,23 @@ impl Streamer {
     }
 }
 
+/// Decide the `(startLedger, cursor)` params for a single RPC page request.
+///
+/// `startLedger` and `cursor` are mutually exclusive in the Soroban `getEvents`
+/// RPC, so exactly one is ever `Some`:
+///   - later pages of a poll (`page_cursor` set) → resume by paging token only
+///   - first page, fresh index (`cursor == 0`)   → anchor at ledger 1
+///   - first page, resume (`cursor == N`)        → anchor at ledger `N + 1`,
+///     i.e. the ledger after the last one fully processed (never re-scan `N`,
+///     never send the ledger number in the `cursor` field)
+fn page_request_params(cursor: u64, page_cursor: Option<&str>) -> (Option<u64>, Option<String>) {
+    match page_cursor {
+        Some(token) => (None, Some(token.to_string())),
+        None if cursor == 0 => (Some(1), None),
+        None => (Some(cursor + 1), None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +427,30 @@ mod tests {
             };
             (db, rd)
         }};
+    }
+
+    // Pure unit tests for the pagination decision — no services required, so
+    // these run in the plain `rust` CI job as well as the integration job.
+    #[test]
+    fn page_params_fresh_index_anchors_at_ledger_1() {
+        assert_eq!(page_request_params(0, None), (Some(1), None));
+    }
+
+    #[test]
+    fn page_params_resume_anchors_at_next_ledger_not_cursor_field() {
+        // Regression: a resume must send startLedger = cursor + 1, never the
+        // ledger number in the (paging-token) cursor field.
+        assert_eq!(page_request_params(100, None), (Some(101), None));
+    }
+
+    #[test]
+    fn page_params_later_pages_use_paging_token_only() {
+        // Regression: once paging, startLedger must be cleared (the two params
+        // are mutually exclusive in the RPC).
+        assert_eq!(
+            page_request_params(100, Some("100-5")),
+            (None, Some("100-5".to_string()))
+        );
     }
 
     fn sym_xdr(s: &str) -> String {
