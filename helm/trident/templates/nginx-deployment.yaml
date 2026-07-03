@@ -58,6 +58,10 @@ spec:
             - name: nginx-config
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
+          livenessProbe:
+            {{- toYaml .Values.nginx.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.nginx.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.nginx.resources | nindent 12 }}
       volumes:

@@ -1,6 +1,3 @@
-version: \
-3.9\
-
 # Development compose — runs only the infrastructure dependencies.
 # The indexer and API service are run locally (cargo run / go run) so that
 # code changes reflect immediately without rebuilding containers.

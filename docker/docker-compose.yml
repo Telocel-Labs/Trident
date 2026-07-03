@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Production compose — runs all four services.
 # All secrets are passed via environment variables; never hardcode values here.
 

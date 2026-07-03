@@ -21,6 +21,10 @@ spec:
         - name: indexer
           image: "{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.indexer.metricsPort }}
+              protocol: TCP
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -36,6 +40,10 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.indexer.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.indexer.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.indexer.resources | nindent 12 }}
       {{- with .Values.indexer.nodeSelector }}

@@ -35,6 +35,10 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: REDIS_URL
+          livenessProbe:
+            {{- toYaml .Values.grpcApi.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.grpcApi.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.grpcApi.resources | nindent 12 }}
       {{- with .Values.grpcApi.nodeSelector }}
