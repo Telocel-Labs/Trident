@@ -168,20 +168,23 @@ jobs:
   sdk-react:
     name: SDK (React)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk/react
     steps:
       - uses: actions/checkout@v4
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
-          cache-dependency-path: sdk/react/package-lock.json
+      # react depends on the TypeScript SDK via `file:../typescript`, which
+      # resolves to its built dist/ (gitignored). Build it before installing
+      # react so the file: dependency resolves at test time.
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
+        run: npm ci && npm run build
       - name: Install dependencies
+        working-directory: sdk/react
         run: npm ci
       - name: Test
+        working-directory: sdk/react
         run: npm test
 
   # ---------------------------------------------------------------------------
