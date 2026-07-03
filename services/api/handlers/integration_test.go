@@ -174,8 +174,8 @@ func TestIntegration_GRPCBackendUnavailable(t *testing.T) {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if body["code"] != "INTERNAL" {
-		t.Errorf("expected INTERNAL, got %v", body["code"])
+	if errObj, _ := body["error"].(map[string]any); errObj["code"] != "INTERNAL" {
+		t.Errorf("expected INTERNAL, got %v", body["error"])
 	}
 }
 
@@ -204,7 +204,7 @@ func TestIntegration_GRPCNotFoundMappedTo404(t *testing.T) {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if body["code"] != "NOT_FOUND" {
-		t.Errorf("expected NOT_FOUND, got %v", body["code"])
+	if errObj, _ := body["error"].(map[string]any); errObj["code"] != "NOT_FOUND" {
+		t.Errorf("expected NOT_FOUND, got %v", body["error"])
 	}
 }

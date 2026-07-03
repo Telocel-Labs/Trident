@@ -79,8 +79,8 @@ func TestListEvents_InvalidLimit_Returns400(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body["code"] != "INVALID_ARGUMENT" {
-		t.Errorf("want code=INVALID_ARGUMENT, got %v", body["code"])
+	if errObj, _ := body["error"].(map[string]any); errObj["code"] != "INVALID_ARGUMENT" {
+		t.Errorf("want code=INVALID_ARGUMENT, got %v", body["error"])
 	}
 	if body["error"] == nil {
 		t.Error("error message should be present")
@@ -235,8 +235,8 @@ func TestGetEvent_InvalidUUID_Returns400(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body["code"] != "INVALID_ARGUMENT" {
-		t.Errorf("want code=INVALID_ARGUMENT, got %v", body["code"])
+	if errObj, _ := body["error"].(map[string]any); errObj["code"] != "INVALID_ARGUMENT" {
+		t.Errorf("want code=INVALID_ARGUMENT, got %v", body["error"])
 	}
 }
 
@@ -386,7 +386,7 @@ func TestListEvents_InvalidCursor_Returns400(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body["code"] != "INVALID_ARGUMENT" {
-		t.Errorf("want code=INVALID_ARGUMENT, got %v", body["code"])
+	if errObj, _ := body["error"].(map[string]any); errObj["code"] != "INVALID_ARGUMENT" {
+		t.Errorf("want code=INVALID_ARGUMENT, got %v", body["error"])
 	}
 }

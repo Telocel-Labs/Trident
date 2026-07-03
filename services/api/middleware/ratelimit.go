@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -202,7 +203,7 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 				rlRejected.Add(1)
 				retryAfter := int64(math.Ceil(tcfg.Window.Seconds()))
 				w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
-				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				httputil.WriteError(w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "rate limit exceeded")
 				return
 			}
 
@@ -226,7 +227,7 @@ func WSConnectionLimit(next http.Handler) http.Handler {
 		n := wsConns.Add(1)
 		defer wsConns.Add(-1)
 		if n > limit {
-			http.Error(w, `{"error":"too many WebSocket connections"}`, http.StatusTooManyRequests)
+			httputil.WriteError(w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "too many WebSocket connections")
 			return
 		}
 		next.ServeHTTP(w, r)

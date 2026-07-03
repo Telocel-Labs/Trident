@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -55,12 +56,12 @@ func InternalStatus() http.HandlerFunc {
 		// Check X-Internal-Key header.
 		expectedKey := os.Getenv("INTERNAL_API_KEY")
 		if expectedKey == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "INTERNAL_API_KEY not configured"})
+			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "INTERNAL_API_KEY not configured")
 			return
 		}
 		providedKey := r.Header.Get("X-Internal-Key")
 		if providedKey != expectedKey {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid X-Internal-Key"})
+			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
 			return
 		}
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/handlers"
@@ -22,14 +23,18 @@ func TestStreamMissingContractID(t *testing.T) {
 
 	var body struct {
 		Error struct {
-			Field string `json:"field"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
 		} `json:"error"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body.Error.Field != "contractId" {
-		t.Fatalf("error field: got %q, want contractId", body.Error.Field)
+	if body.Error.Code != "INVALID_ARGUMENT" {
+		t.Fatalf("error code: got %q, want INVALID_ARGUMENT", body.Error.Code)
+	}
+	if !strings.Contains(body.Error.Message, "contractId") {
+		t.Fatalf("error message: got %q, want it to mention contractId", body.Error.Message)
 	}
 }
 

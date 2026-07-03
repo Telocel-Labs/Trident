@@ -3,7 +3,9 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,13 +57,8 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(invalid) > 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error":       "one or more IDs are not valid UUID v4",
-			"code":        string(httputil.INVALID_ARGUMENT),
-			"invalid_ids": invalid,
-		})
+		httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
+			fmt.Sprintf("one or more IDs are not valid UUID v4: %s", strings.Join(invalid, ", ")))
 		return
 	}
 

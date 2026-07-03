@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -89,7 +90,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 
 			key := r.Header.Get("X-API-Key")
 			if key == "" {
-				http.Error(w, `{"error":"Unauthorized"}`, http.StatusUnauthorized)
+				httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 				return
 			}
 
@@ -137,7 +138,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-			http.Error(w, `{"error":"Unauthorized"}`, http.StatusUnauthorized)
+			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 		})
 	}
 }
@@ -175,12 +176,12 @@ func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 
 		key := r.Header.Get("X-API-Key")
 		if key == "" {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 			return
 		}
 
 		if _, ok := validHashes[hmacKeyHash(key)]; !ok {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 			return
 		}
 

@@ -123,8 +123,12 @@ func TestBatchGetEvents_InvalidUUID(t *testing.T) {
 	}
 	var body map[string]any
 	_ = json.NewDecoder(w.Body).Decode(&body)
-	if _, ok := body["invalid_ids"]; !ok {
-		t.Errorf("expected invalid_ids in response, got: %v", body)
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["code"] != "INVALID_ARGUMENT" {
+		t.Errorf("expected error.code=INVALID_ARGUMENT, got: %v", body)
+	}
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "not-a-uuid") {
+		t.Errorf("expected message to list the invalid id, got: %v", body)
 	}
 }
 

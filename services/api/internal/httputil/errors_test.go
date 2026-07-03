@@ -28,12 +28,12 @@ func TestWriteError(t *testing.T) {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if resp.Code != httputil.INVALID_ARGUMENT {
-		t.Errorf("expected INVALID_ARGUMENT, got %s", resp.Code)
+	if resp.Error.Code != httputil.INVALID_ARGUMENT {
+		t.Errorf("expected INVALID_ARGUMENT, got %s", resp.Error.Code)
 	}
 
-	if resp.Error != "test error" {
-		t.Errorf("expected 'test error', got %s", resp.Error)
+	if resp.Error.Message != "test error" {
+		t.Errorf("expected 'test error', got %s", resp.Error.Message)
 	}
 }
 

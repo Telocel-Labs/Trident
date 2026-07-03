@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -29,20 +30,13 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		contractID := r.URL.Query().Get("contractId")
 		if contractID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": map[string]string{
-					"field":   "contractId",
-					"message": "contractId is required",
-				},
-			})
+			httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contractId is required")
 			return
 		}
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": map[string]string{"message": "streaming is not supported"},
-			})
+			httputil.WriteError(w, http.StatusInternalServerError, httputil.INTERNAL, "streaming is not supported")
 			return
 		}
 
@@ -52,9 +46,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 				return
 			}
 			slog.Error("sse: failed to read Redis Stream tail", "err", err)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-				"error": map[string]string{"message": "event stream is unavailable"},
-			})
+			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
 			return
 		}
 

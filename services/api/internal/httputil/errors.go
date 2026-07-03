@@ -12,26 +12,33 @@ import (
 type ErrorCode string
 
 const (
-	NOT_FOUND      ErrorCode = "NOT_FOUND"
-	UNAUTHORIZED   ErrorCode = "UNAUTHORIZED"
-	RATE_LIMITED   ErrorCode = "RATE_LIMITED"
+	NOT_FOUND        ErrorCode = "NOT_FOUND"
+	UNAUTHORIZED     ErrorCode = "UNAUTHORIZED"
+	RATE_LIMITED     ErrorCode = "RATE_LIMITED"
 	INVALID_ARGUMENT ErrorCode = "INVALID_ARGUMENT"
-	INTERNAL       ErrorCode = "INTERNAL"
+	UNAVAILABLE      ErrorCode = "UNAVAILABLE"
+	INTERNAL         ErrorCode = "INTERNAL"
 )
 
-// ErrorResponse is the standardized JSON error body
-type ErrorResponse struct {
-	Error string    `json:"error"`
-	Code  ErrorCode `json:"code"`
+// ErrorDetail is the nested error object required by the OpenAPI ErrorResponse
+// schema and parsed by the client SDKs.
+type ErrorDetail struct {
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
 }
 
-// WriteError writes a standardized JSON error response
+// ErrorResponse is the standardized JSON error body: {"error":{"code","message"}}.
+type ErrorResponse struct {
+	Error ErrorDetail `json:"error"`
+}
+
+// WriteError writes a standardized JSON error response matching the OpenAPI
+// ErrorResponse schema ({"error":{"code","message"}}).
 func WriteError(w http.ResponseWriter, statusCode int, code ErrorCode, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(ErrorResponse{
-		Error: message,
-		Code:  code,
+		Error: ErrorDetail{Code: code, Message: message},
 	})
 }
 
