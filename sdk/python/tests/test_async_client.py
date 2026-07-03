@@ -100,7 +100,7 @@ class TestIterEvents:
         client = make_client()
         received = []
 
-        async def fake_ws(*args, **kwargs):
+        def fake_ws(*args, **kwargs):
             class FakeWS:
                 async def __aenter__(self):
                     return self
