@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0009) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0010) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -36,6 +36,16 @@ CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic0  ON soroban_events
     WHERE topic_0 IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_soroban_events_id_desc          ON soroban_events (id DESC);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp ON soroban_events (ledger_timestamp DESC);
+
+-- Natural-key uniqueness (0010).
+-- The `id` UUIDv5 is derived from (contract_id, ledger_sequence, event_index) and
+-- is NOT a pure function of the Stellar protocol natural key (transaction_hash,
+-- event_index).  This constraint enforces the protocol-level guarantee independently
+-- of the id scheme and is network-scoped to allow the same tx hash to exist on
+-- different networks (test/mainnet).  See database/migrations/0010 for full rationale.
+ALTER TABLE soroban_events
+    ADD CONSTRAINT uq_soroban_events_tx_index_network
+    UNIQUE (transaction_hash, event_index, network);
 
 -- ---------------------------------------------------------------------------
 -- system_state

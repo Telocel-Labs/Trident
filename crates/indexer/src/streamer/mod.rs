@@ -267,7 +267,7 @@ impl Streamer {
                                 continue;
                             }
                         }
-                        db::insert_event(&self.db, &event)
+                        db::insert_event(&self.db, &event, &self.config.network)
                             .instrument(tracing::info_span!(
                                 "db_insert_events",
                                 contract_id = %event.contract_id

@@ -32,18 +32,46 @@ pub async fn connect_pool(database_url: &str, pool_size: u32) -> Result<PgPool, 
 // Using the DNS namespace is arbitrary; what matters is that it is fixed.
 const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
 
-/// Derive a deterministic UUID for an event from its natural key.
-/// Using the same inputs will always produce the same UUID, so duplicate
-/// events produce the same `id` and `ON CONFLICT (id) DO NOTHING` fires.
+/// Derive a deterministic UUID for an event from its indexer-internal composite key.
+///
+/// # Key composition
+/// The UUID is derived from `"contract_id:ledger_sequence:event_index"`.
+///
+/// **Important**: this is NOT the same as the Stellar protocol's natural key
+/// `(transaction_hash, event_index, network)`.  The two keys are complementary:
+///
+/// | Key | Fields | Purpose |
+/// |-----|--------|---------|
+/// | UUIDv5 id | contract_id · ledger_sequence · event_index | Stable primary key for the indexer; deduplicates replays |
+/// | Natural key | transaction_hash · event_index · network | Protocol-level uniqueness; enforced by `uq_soroban_events_tx_index_network` |
+///
+/// Using the same inputs will always produce the same UUID, so a replayed event
+/// produces the same `id` and `ON CONFLICT (id) DO NOTHING` fires.
+///
+/// Because `id` is not a pure function of `(transaction_hash, event_index)`, the
+/// database also carries a `UNIQUE (transaction_hash, event_index, network)` constraint
+/// (migration 0010) as an independent correctness guard.
 fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid {
     let key = format!("{contract_id}:{ledger_sequence}:{event_index}");
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
-/// Insert a normalised event. Silently ignores duplicates via `ON CONFLICT (id) DO NOTHING`.
-/// The `id` is a deterministic UUIDv5 derived from `(contract_id, ledger_sequence, event_index)`,
-/// so replaying the same event always produces the same primary key.
-pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), TridentError> {
+/// Insert a normalised event.
+///
+/// Duplicate handling uses two complementary strategies:
+/// - **Primary**: `ON CONFLICT (id) DO NOTHING` — deduplicates replays because `id`
+///   is a deterministic UUIDv5 derived from `(contract_id, ledger_sequence, event_index)`.
+/// - **Safety net**: `UNIQUE (transaction_hash, event_index, network)` at the DB layer
+///   (migration 0010) catches any case where the same protocol event would be inserted
+///   with a different derived `id` (e.g. due to a bug in id derivation).
+///
+/// The `network` argument must match the value used in `indexed_contracts` for this
+/// deployment (e.g. `"mainnet"` or `"testnet"`).
+pub async fn insert_event(
+    pool: &PgPool,
+    event: &SorobanEvent,
+    network: &str,
+) -> Result<(), TridentError> {
     let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
     let event_type = match event.event_type {
         EventType::Contract => "contract",
@@ -60,8 +88,8 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
         r#"
         INSERT INTO soroban_events
             (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
-             event_index, event_type, topics, data)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             event_index, event_type, topics, data, network)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (id) DO NOTHING
         "#,
     )
@@ -74,6 +102,7 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
     .bind(event_type)
     .bind(&topics)
     .bind(&event.data)
+    .bind(network)
     .execute(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
@@ -293,6 +322,29 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// The UUID id is NOT derived from transaction_hash, so two events with
+    /// different contract_ids but the same (transaction_hash, event_index) would
+    /// produce different UUIDs. This test documents that distinction — the
+    /// natural-key constraint (uq_soroban_events_tx_index_network) is the guard
+    /// for that case.
+    #[test]
+    fn event_uuid_does_not_include_transaction_hash() {
+        // Same (contract_id, ledger, event_index) → same UUID regardless of tx_hash.
+        let uuid_a = event_uuid("CABC", 100, 0);
+        let uuid_b = event_uuid("CABC", 100, 0); // identical inputs, different tx_hash in the event struct
+        assert_eq!(
+            uuid_a, uuid_b,
+            "UUID must be stable across calls with the same indexer key"
+        );
+
+        // Different contract_id → different UUID even if tx+index were the same.
+        let uuid_c = event_uuid("CXYZ", 100, 0);
+        assert_ne!(
+            uuid_a, uuid_c,
+            "different contract_id must produce a different UUID"
+        );
+    }
+
     /// Calling `insert_event` twice with the same event must not error and
     /// the row count in `soroban_events` must remain 1.
     ///
@@ -323,10 +375,10 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_event(&pool, &event)
+        insert_event(&pool, &event, "testnet")
             .await
             .expect("first insert failed");
-        insert_event(&pool, &event)
+        insert_event(&pool, &event, "testnet")
             .await
             .expect("second insert must not error");
 
@@ -338,5 +390,87 @@ mod tests {
                 .expect("count query failed");
 
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
+    }
+
+    /// Inserting two events with the same (transaction_hash, event_index, network) but
+    /// different contract_ids (which would produce different UUIDs) must be rejected
+    /// by the natural-key constraint `uq_soroban_events_tx_index_network`.
+    ///
+    /// This validates that the DB-level guard works independently of the id scheme.
+    #[tokio::test]
+    async fn natural_key_constraint_rejects_duplicate_tx_event_index() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Shared (transaction_hash, event_index) — this is the natural key.
+        let shared_tx_hash = "txhash_natural_key_test_001";
+        let shared_event_index: u32 = 0;
+        let network = "testnet";
+
+        // Clean up any leftovers from previous runs.
+        sqlx::query("DELETE FROM soroban_events WHERE transaction_hash = $1")
+            .bind(shared_tx_hash)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+
+        // First event: contract A, same tx+index.
+        let event_a = SorobanEvent {
+            contract_id: "CONTRACT_A_NATURAL_KEY_TEST".to_string(),
+            ledger_sequence: 999,
+            ledger_timestamp: "2024-01-01T00:00:00Z".to_string(),
+            transaction_hash: shared_tx_hash.to_string(),
+            event_index: shared_event_index,
+            event_type: EventType::Contract,
+            topics: vec![],
+            data: json!({}),
+        };
+        insert_event(&pool, &event_a, network)
+            .await
+            .expect("first insert (contract A) must succeed");
+
+        // Second event: DIFFERENT contract_id → DIFFERENT UUID, but SAME (tx_hash, event_index, network).
+        // The natural-key constraint must reject this.
+        let event_b = SorobanEvent {
+            contract_id: "CONTRACT_B_NATURAL_KEY_TEST".to_string(),
+            ledger_sequence: 999,
+            ledger_timestamp: "2024-01-01T00:00:00Z".to_string(),
+            transaction_hash: shared_tx_hash.to_string(),
+            event_index: shared_event_index,
+            event_type: EventType::Contract,
+            topics: vec![],
+            data: json!({}),
+        };
+        let result = insert_event(&pool, &event_b, network).await;
+        assert!(
+            result.is_err(),
+            "inserting a duplicate (transaction_hash, event_index, network) with a different \
+             contract_id must be rejected by uq_soroban_events_tx_index_network"
+        );
+
+        // Verify exactly one row persisted.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE transaction_hash = $1")
+                .bind(shared_tx_hash)
+                .fetch_one(&pool)
+                .await
+                .expect("count query failed");
+        assert_eq!(count.0, 1, "only the first event should be stored");
+
+        // Cleanup.
+        sqlx::query("DELETE FROM soroban_events WHERE transaction_hash = $1")
+            .bind(shared_tx_hash)
+            .execute(&pool)
+            .await
+            .expect("post-test cleanup failed");
     }
 }
