@@ -15,7 +15,7 @@
 //!   `SorobanEvent` values to both PostgreSQL (via `db`) and Redis Streams
 //!   (via `redis_stream`).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -44,8 +44,10 @@ pub struct Streamer {
     rpc: RpcClient,
     parser: Parser,
     /// `None`  → index all contracts (empty `indexed_contracts` table).
-    /// `Some`  → allowlist; events from unlisted contracts are skipped.
-    contract_filter: Option<HashSet<String>>,
+    /// `Some`  → allowlist with per-contract `index_from` boundaries;
+    ///           events from unlisted contracts or below their index_from
+    ///           are skipped.
+    contract_filter: Option<HashMap<String, i64>>,
     /// Counts poll cycles so we know when to refresh the filter.
     poll_count: u32,
     /// Outbound webhook alerter (issue #75). No-op when URL is not configured.
@@ -96,20 +98,44 @@ impl Streamer {
     async fn load_filter(
         pool: &PgPool,
         network: &str,
-    ) -> Result<Option<HashSet<String>>, TridentError> {
-        let set = db::load_indexed_contracts(pool, network).await?;
-        if set.is_empty() {
+    ) -> Result<Option<HashMap<String, i64>>, TridentError> {
+        let map = db::load_indexed_contracts(pool, network).await?;
+        if map.is_empty() {
             Ok(None)
         } else {
-            tracing::info!(count = set.len(), "Contract allowlist loaded");
-            Ok(Some(set))
+            tracing::info!(count = map.len(), "Contract allowlist loaded");
+            Ok(Some(map))
         }
     }
 
     /// Reload the contract filter from DB. Called periodically inside `run`.
+    /// Detects newly-registered contracts with a historical `index_from` and
+    /// logs a backfill suggestion (issue #202).
     pub async fn refresh_contract_filter(&mut self) -> Result<(), TridentError> {
         match Self::load_filter(&self.db, &self.config.network).await {
             Ok(filter) => {
+                // Detect newly added contracts whose index_from is behind the
+                // current cursor, which means historical events are missing.
+                if let Some(ref new_map) = filter {
+                    if let Some(ref old_map) = self.contract_filter {
+                        let cursor = crate::db::get_cursor(&self.db).await.unwrap_or(0);
+                        for (id, &index_from) in new_map {
+                            if !old_map.contains_key(id) && index_from > 0
+                                && (index_from as u64) < cursor
+                            {
+                                tracing::warn!(
+                                    contract_id = id,
+                                    index_from = index_from,
+                                    cursor = cursor,
+                                    "Contract registered with historical index_from; \
+                                     enqueue a backfill for ledgers {}..{}",
+                                    index_from,
+                                    cursor - 1,
+                                );
+                            }
+                        }
+                    }
+                }
                 self.contract_filter = filter;
                 Ok(())
             }
@@ -211,14 +237,34 @@ impl Streamer {
 
         // The first page of a poll anchors by ledger (startLedger); every later
         // page in the same poll resumes via the RPC paging token. A fresh index
-        // (cursor 0) starts at ledger 1; a resume starts at the ledger after the
-        // last one we fully processed. startLedger and cursor are mutually
-        // exclusive in the Soroban RPC, so only one is ever sent per request.
+        // (cursor 0) starts at ledger 1 (or the minimum index_from across all
+        // tracked contracts, whichever is higher); a resume starts at the ledger
+        // after the last one we fully processed. startLedger and cursor are
+        // mutually exclusive in the Soroban RPC, so only one is ever sent per
+        // request.
+        //
+        // When per-contract index_from values are set, we compute an effective
+        // cursor so that the first startLedger respects the earliest index_from,
+        // avoiding unnecessary scanning of ledgers that will produce no events
+        // for any tracked contract (issue #202).
+        let effective_cursor = if *cursor == 0 {
+            match &self.contract_filter {
+                Some(filter) => {
+                    let min_from = filter.values().copied().min().unwrap_or(0);
+                    // If min index_from > 1, set effective_cursor to min_from - 1
+                    // so that page_request_params returns startLedger = min_from.
+                    if min_from > 1 { min_from - 1 } else { 0 }
+                }
+                None => 0,
+            }
+        } else {
+            *cursor
+        };
         let mut page_cursor: Option<String> = None;
         let mut total = 0;
 
         loop {
-            let (sl, pc) = page_request_params(*cursor, page_cursor.as_deref());
+            let (sl, pc) = page_request_params(effective_cursor, page_cursor.as_deref());
             let mut attempt = 0u32;
             let limit = self.config.max_events_per_poll;
             let page = Retry::start(retry_strategy.clone(), || {
@@ -255,16 +301,30 @@ impl Streamer {
                 };
                 match parse_result {
                     Ok(Some(event)) => {
-                        // Contract allowlist filtering (issue #47).
-                        // None → index all; Some(set) → only listed contracts.
+                        // Contract allowlist filtering (issue #47, #202).
+                        // None → index all; Some(map) → only listed contracts,
+                        // and only at or above their per-contract index_from.
                         if let Some(ref filter) = self.contract_filter {
-                            if !filter.contains(&event.contract_id) {
-                                tracing::trace!(
-                                    contract_id = %event.contract_id,
-                                    "Skipping event from unlisted contract"
-                                );
-                                skipped_in_page += 1;
-                                continue;
+                            match filter.get(&event.contract_id) {
+                                None => {
+                                    tracing::trace!(
+                                        contract_id = %event.contract_id,
+                                        "Skipping event from unlisted contract"
+                                    );
+                                    skipped_in_page += 1;
+                                    continue;
+                                }
+                                Some(&index_from) if (event.ledger_sequence as i64) < index_from => {
+                                    tracing::trace!(
+                                        contract_id = %event.contract_id,
+                                        ledger = event.ledger_sequence,
+                                        index_from = index_from,
+                                        "Skipping event below contract index_from"
+                                    );
+                                    skipped_in_page += 1;
+                                    continue;
+                                }
+                                _ => {}
                             }
                         }
                         db::insert_event(&self.db, &event)
@@ -838,4 +898,162 @@ mod tests {
             "should process 200 + 5 = 205 events across two pages"
         );
     }
-}
+
+    // -----------------------------------------------------------------------
+    // Per-contract index_from gating (issue #202)
+    // -----------------------------------------------------------------------
+
+    fn events_page_multi(entries: Vec<(u64, &str, u32)>) -> serde_json::Value {
+        let events: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|(ledger, contract_id, idx)| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": contract_id,
+                    "id": format!("{:016}-{}", ledger, idx),
+                    "pagingToken": format!("{}-{}", ledger, idx),
+                    "txHash": format!("hash{}{}{}", ledger, contract_id, idx),
+                    "topic": [sym_xdr("transfer")],
+                    "value": void_xdr(),
+                    "inSuccessfulContractCall": true,
+                })
+            })
+            .collect();
+
+        let latest = entries.iter().map(|(l, _, _)| *l).max().unwrap_or(0);
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": latest,
+            }
+        })
+    }
+
+    /// Seed `indexed_contracts` with the given (contract_id, index_from, network) tuples.
+    async fn seed_contracts(pool: &sqlx::PgPool, contracts: Vec<(&str, i64, &str)>) {
+        for (id, index_from, network) in contracts {
+            sqlx::query(
+                r#"
+                INSERT INTO indexed_contracts (contract_id, network, index_from)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (contract_id, network) DO UPDATE SET index_from = EXCLUDED.index_from
+                "#,
+            )
+            .bind(id)
+            .bind(network)
+            .bind(index_from)
+            .execute(pool)
+            .await
+            .expect("seed_contracts failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn index_from_gating_filters_out_below_threshold() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // Register two contracts with different index_from values.
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        reset_db(&pool).await;
+        seed_contracts(
+            &pool,
+            vec![
+                ("CTEST_A", 100, "testnet"),
+                ("CTEST_B", 200, "testnet"),
+            ],
+        )
+        .await;
+        // Clean seed from streamer load_filter won't double-count.
+        // Streamer is created after seeding, so its initial load picks up the contracts.
+
+        // RPC returns events at ledgers 50, 150, and 250 for both contracts.
+        // With index_from=100 for A and index_from=200 for B:
+        //   A50  → skipped (< 100)
+        //   A150 → indexed (≥ 100)
+        //   A250 → indexed (≥ 100)
+        //   B50  → skipped (< 200)
+        //   B150 → skipped (< 200)
+        //   B250 → indexed (≥ 200)
+
+        // getLedgers mock (required for cursor advancement)
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        // First getEvents page: events at ledgers 50, 150, 250
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page_multi(vec![
+                (50, "CTEST_A", 0),
+                (50, "CTEST_B", 1),
+                (150, "CTEST_A", 2),
+                (150, "CTEST_B", 3),
+                (250, "CTEST_A", 4),
+                (250, "CTEST_B", 5),
+            ])))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Subsequent getEvents returns empty (stop pagination)
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page_multi(vec![])))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        // Verify the filter was loaded with index_from values.
+        let filter = s.contract_filter.as_ref().expect("filter should be Some");
+        assert_eq!(filter.get("CTEST_A"), Some(&100));
+        assert_eq!(filter.get("CTEST_B"), Some(&200));
+
+        let mut cursor = 0u64;
+        let total = s.poll_once(&mut cursor).await.unwrap();
+
+        // Only 3 events should be indexed:
+        //   CTEST_A at 150, CTEST_A at 250, CTEST_B at 250
+        assert_eq!(total, 3, "only in-range events should be indexed");
+
+        // Verify stored events in the database.
+        let count_a: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_A'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_a.0, 2, "CTEST_A should have 2 events (ledgers 150, 250)");
+
+        let count_b: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_B'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_b.0, 1,
+            "CTEST_B should have 1 event (ledger 250)"
+        );
+
+        pool.close().await;
+    }
