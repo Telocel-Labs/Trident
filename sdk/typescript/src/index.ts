@@ -8,6 +8,7 @@ export { TridentError, TridentApiError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
 export { iterEvents, DEFAULT_MAX_PAGES } from "./iterator.js";
 export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
+export type { components, operations, paths } from "./api-types.gen.js";
 
 // ---------------------------------------------------------------------------
 // Config

@@ -72,3 +72,11 @@ Dry-run check (runs in CI):
 ```bash
 cargo publish --dry-run --package trident-sdk
 ```
+
+## Regenerating OpenAPI models
+
+Install the generator dependency once with `python3 -m pip install PyYAML`, then run:
+
+```bash
+python3 scripts/generate_sdk_models.py --language rust
+```

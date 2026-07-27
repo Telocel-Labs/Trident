@@ -62,3 +62,11 @@ try:
 except TridentApiError as e:
     print(e.status, e.code, str(e))  # 404 NOT_FOUND event not found
 ```
+
+## Regenerating OpenAPI models
+
+Install the generator dependency once with `python3 -m pip install PyYAML`, then run:
+
+```bash
+python3 scripts/generate_sdk_models.py --language python
+```

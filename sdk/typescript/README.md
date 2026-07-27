@@ -376,3 +376,11 @@ dist/
 ## License
 
 MIT
+
+## Regenerating OpenAPI models
+
+Install the generator dependency once with `python3 -m pip install PyYAML`, then run:
+
+```bash
+python3 scripts/generate_sdk_models.py --language typescript
+```
