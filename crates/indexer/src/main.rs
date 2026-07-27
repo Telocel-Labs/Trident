@@ -69,6 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_pool = db::connect_pool(&cfg.database_url, cfg.db_pool_size).await?;
     tracing::info!(pool_size = cfg.db_pool_size, "Database connected via pool");
 
+    // Optionally seed the contract allow-list with well-known SAC assets (issue #274).
+    if cfg.seed_well_known_contracts {
+        if let Err(e) = sac_bootstrap::seed_well_known_contracts(&db_pool, &cfg.network).await {
+            tracing::warn!(error = %e, "SAC bootstrap failed; indexer will continue without seeding");
+        }
+    }
+
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
     let redis_conn = redis_client.get_multiplexed_async_connection().await?;
     tracing::info!("Redis connected");

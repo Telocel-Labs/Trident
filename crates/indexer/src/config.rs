@@ -52,6 +52,9 @@ pub struct Config {
     pub alert_webhook_url: Option<String>,
     pub alert_lag_threshold: u64,
     pub alert_cooldown_minutes: u64,
+    /// Seed `indexed_contracts` with well-known SAC asset contract ids on startup (issue #274).
+    /// Enabled by setting `SEED_WELL_KNOWN_CONTRACTS=true`.
+    pub seed_well_known_contracts: bool,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -163,6 +166,10 @@ impl Config {
         let alert_lag_threshold = parse_bounded_u64("ALERT_LAG_THRESHOLD", 200, 1, 1_000_000)?;
         let alert_cooldown_minutes = parse_bounded_u64("ALERT_COOLDOWN_MINUTES", 30, 1, 10_080)?;
 
+        let seed_well_known_contracts = std::env::var("SEED_WELL_KNOWN_CONTRACTS")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         Ok(Self {
             database_url: database_url.unwrap(),
             db_pool_size: parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE)?,
@@ -200,6 +207,7 @@ impl Config {
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,
+            seed_well_known_contracts,
         })
     }
 }
