@@ -69,6 +69,9 @@ export interface SubscribeToContractParams {
   topic0?: string;
   onEvent: (event: SorobanEvent) => void;
   onError?: (error: Error) => void;
+  onConnected?: () => void;
+  onDisconnected?: () => void;
+  onResumed?: (fromEventId: string) => void;
 }
 
 export interface Subscription {

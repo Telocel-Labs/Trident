@@ -22,17 +22,24 @@ use trident_common::{EventType, SorobanEvent, TridentError};
 use crate::rpc::RawEvent;
 
 pub mod invocation_metrics;
+pub mod nft_events;
 pub mod token_events;
 
+use nft_events::NftEvent;
 use token_events::TokenEvent;
 
-/// A normalised event together with its optional typed token projection
-/// (issue #211).
+/// A normalised event together with its optional typed projections.
+///
+/// `token` is populated for standard SEP-41 / SAC value-movement events
+/// (issue #211). `nft` is populated for NFT mint/transfer events (issue #275).
 pub struct ParsedEvent {
     pub event: SorobanEvent,
     /// `Some` only for standard SEP-41 / SAC value-movement events whose payload
     /// matches the token interface layout.
     pub token: Option<TokenEvent>,
+    /// `Some` only for NFT mint/transfer events whose payload matches the NFT
+    /// contract event layout (issue #275).
+    pub nft: Option<NftEvent>,
 }
 
 pub struct Parser {
@@ -82,6 +89,7 @@ impl Parser {
         };
 
         let token = token_events::decode_token_event(&topic_vals, &data_val);
+        let nft = nft_events::decode_nft_event(&topic_vals, &data_val);
 
         let ledger_sequence: u64 = raw
             .ledger
@@ -108,6 +116,7 @@ impl Parser {
                 event_type,
             },
             token,
+            nft,
         }))
     }
 }

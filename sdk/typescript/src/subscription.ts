@@ -4,6 +4,7 @@ import type { SorobanEvent, SubscribeToContractParams, Subscription } from "./in
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 30_000;
+const JITTER_FACTOR = 0.2;
 
 /** Inbound WebSocket message schema (matches the Go hub's WriteJSON output). */
 const WsEventSchema = z.object({
@@ -51,9 +52,23 @@ function parseWsMessage(raw: unknown): SorobanEvent | null {
   return parsed.success ? parsed.data : null;
 }
 
+function withJitter(ms: number): number {
+  return ms + Math.random() * ms * JITTER_FACTOR;
+}
+
+function buildWsUrl(baseUrl: string, params: SubscribeToContractParams, lastEventId: string | null): string {
+  const url = new URL(baseUrl);
+  url.searchParams.set("contractId", params.contractId);
+  if (params.topic0) url.searchParams.set("topic0", params.topic0);
+  if (lastEventId) url.searchParams.set("cursor", lastEventId);
+  return url.toString();
+}
+
 /**
  * Opens a WebSocket to {wsUrl} and calls `onEvent` for each matching message.
- * Reconnects with exponential backoff (500ms–30s) on unexpected close.
+ * Reconnects with exponential backoff + jitter (500ms–30s) on unexpected close.
+ * Tracks the last received event id and resumes from it via a `cursor` query
+ * param on reconnect, preventing gaps within the server retention window.
  * Returns a Subscription whose `unsubscribe()` cancels all reconnects and
  * closes the socket.
  */
@@ -66,6 +81,7 @@ export function createSubscription(
   let ws: any = null;
   let backoffMs = INITIAL_BACKOFF_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastEventId: string | null = null;
 
   async function connect(): Promise<void> {
     if (cancelled) return;
@@ -91,8 +107,11 @@ export function createSubscription(
 
     if (cancelled) return;
 
+    const connectUrl = buildWsUrl(wsUrl, params, lastEventId);
+    const isResume = lastEventId !== null;
+
     try {
-      ws = new WS(wsUrl);
+      ws = new WS(connectUrl);
     } catch (err) {
       params.onError?.(err instanceof Error ? err : new Error(String(err)));
       scheduleReconnect();
@@ -100,7 +119,12 @@ export function createSubscription(
     }
 
     ws.onopen = () => {
-      backoffMs = INITIAL_BACKOFF_MS; // reset on successful connect
+      backoffMs = INITIAL_BACKOFF_MS;
+      if (isResume && lastEventId) {
+        params.onResumed?.(lastEventId);
+      } else {
+        params.onConnected?.();
+      }
     };
 
     ws.onmessage = (evt: any) => {
@@ -114,6 +138,7 @@ export function createSubscription(
 
       const event = parseWsMessage(raw);
       if (event) {
+        if (event.id) lastEventId = event.id;
         params.onEvent(event);
       } else {
         params.onError?.(new Error("WebSocket: received invalid event frame"));
@@ -126,7 +151,7 @@ export function createSubscription(
 
     ws.onclose = (evt: any) => {
       if (cancelled) return;
-      // Unexpected close — schedule reconnect.
+      params.onDisconnected?.();
       if (!evt || !evt.wasClean) {
         scheduleReconnect();
       }
@@ -135,10 +160,11 @@ export function createSubscription(
 
   function scheduleReconnect(): void {
     if (cancelled) return;
+    const delay = withJitter(backoffMs);
     reconnectTimer = setTimeout(() => {
       backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
       connect();
-    }, backoffMs);
+    }, delay);
   }
 
   connect();

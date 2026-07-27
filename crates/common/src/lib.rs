@@ -3,4 +3,7 @@ pub mod logging;
 pub mod types;
 
 pub use errors::{Severity, TridentError};
-pub use types::{EventType, SorobanEvent};
+pub use types::{
+    ContractLiveness, ContractVerification, EventType, LivenessStatus, SorobanEvent,
+    SourceBuildMetadata, VerificationStatus,
+};
