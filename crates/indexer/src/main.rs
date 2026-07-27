@@ -7,11 +7,13 @@ use tracing_subscriber::EnvFilter;
 mod alerting;
 mod config;
 mod db;
+mod escrow_integration_test;
 mod metrics;
 mod parser;
 mod poll;
 mod redis_stream;
 mod rpc;
+mod sac_bootstrap;
 mod streamer;
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
