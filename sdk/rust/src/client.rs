@@ -5,8 +5,8 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
-    EventType, PaginatedEvents, QueryParams, SorobanEvent, Subscription, TridentConfig,
-    TridentError,
+    errors::parse_api_error, EventType, PaginatedEvents, QueryParams, SorobanEvent, Subscription,
+    TridentConfig, TridentError,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,11 +139,8 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
             })
         }
         code => {
-            let message = response.text().await.unwrap_or_default();
-            Err(TridentError::Http {
-                status: code,
-                message,
-            })
+            let body = response.text().await.unwrap_or_default();
+            Err(TridentError::Api(parse_api_error(code, &body)))
         }
     }
 }
@@ -344,50 +341,112 @@ impl TridentClient {
     /// # Ok::<(), trident_sdk::TridentError>(())
     /// # });
     /// ```
-    pub async fn subscribe_to_contract(
+    /// Reconnects with exponential backoff + jitter (500ms–30s) on disconnect
+    /// and resumes from the last received event id via the `cursor` query
+    /// parameter, preventing gaps within the server retention window.
+    pub fn subscribe_to_contract(
         &self,
         contract_id: &str,
         topic_0: Option<&str>,
-    ) -> Result<Subscription, TridentError> {
+    ) -> Subscription {
+        use futures::stream;
+        use tokio::time::sleep;
+
+        const INITIAL_BACKOFF_MS: u64 = 500;
+        const MAX_BACKOFF_MS: u64 = 30_000;
+        const JITTER_DIVISOR: u64 = 5;
+
         let ws_base = ws_url_from_api_url(&self.config.api_url);
+        let api_key = self.config.api_key.clone();
+        let contract_id = contract_id.to_string();
+        let topic_0 = topic_0.map(str::to_string);
 
-        let mut ws_url = url::Url::parse(&format!("{}/ws", ws_base))
-            .map_err(|e| TridentError::WebSocket(e.to_string()))?;
-        {
-            let mut qs = ws_url.query_pairs_mut();
-            qs.append_pair("contractId", contract_id);
-            if let Some(t) = topic_0 {
-                qs.append_pair("topic0", t);
-            }
-        }
+        let reconnecting = stream::unfold(
+            (String::new(), INITIAL_BACKOFF_MS),
+            move |(last_cursor, backoff_ms)| {
+                let ws_base = ws_base.clone();
+                let api_key = api_key.clone();
+                let contract_id = contract_id.clone();
+                let topic_0 = topic_0.clone();
 
-        let mut request = ws_url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| TridentError::WebSocket(e.to_string()))?;
+                async move {
+                    let mut ws_url = url::Url::parse(&format!("{}/ws", ws_base)).ok()?;
+                    {
+                        let mut qs = ws_url.query_pairs_mut();
+                        qs.append_pair("contractId", &contract_id);
+                        if let Some(ref t) = topic_0 {
+                            qs.append_pair("topic0", t);
+                        }
+                        if !last_cursor.is_empty() {
+                            qs.append_pair("cursor", &last_cursor);
+                        }
+                    }
 
-        if let Ok(v) = HeaderValue::from_str(&self.config.api_key) {
-            request.headers_mut().insert("X-API-Key", v);
-        }
+                    let mut request = match ws_url.as_str().into_client_request() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Some((
+                                stream::iter(vec![Err(TridentError::WebSocket(e.to_string()))]),
+                                (last_cursor, backoff_ms),
+                            ));
+                        }
+                    };
+                    if let Ok(v) = HeaderValue::from_str(&api_key) {
+                        request.headers_mut().insert("X-API-Key", v);
+                    }
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| TridentError::WebSocket(e.to_string()))?;
+                    // Apply jitter before connecting so concurrent clients don't all
+                    // hammer the server at the same instant after a shared outage.
+                    let jitter_ms = backoff_ms / JITTER_DIVISOR;
+                    let jitter = std::time::Duration::from_millis(
+                        rand::random::<u64>() % jitter_ms.max(1),
+                    );
 
-        let event_stream = ws_stream.filter_map(|msg| async move {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let result = serde_json::from_str::<WsEvent>(&text)
-                        .map(ws_event_to_soroban)
-                        .map_err(TridentError::Deserialize);
-                    Some(result)
+                    match tokio_tungstenite::connect_async(request).await {
+                        Ok((ws_stream, _)) => {
+                            let mut new_cursor = last_cursor.clone();
+                            let events: Vec<Result<SorobanEvent, TridentError>> = ws_stream
+                                .filter_map(|msg| {
+                                    let cursor_cell = &mut new_cursor;
+                                    async move {
+                                        match msg {
+                                            Ok(Message::Text(text)) => {
+                                                match serde_json::from_str::<WsEvent>(&text) {
+                                                    Ok(ev) => {
+                                                        let soroban = ws_event_to_soroban(ev);
+                                                        if !soroban.id.is_empty() {
+                                                            *cursor_cell = soroban.id.clone();
+                                                        }
+                                                        Some(Ok(soroban))
+                                                    }
+                                                    Err(e) => Some(Err(TridentError::Deserialize(e))),
+                                                }
+                                            }
+                                            Ok(Message::Close(_)) | Ok(_) => None,
+                                            Err(e) => Some(Err(TridentError::WebSocket(e.to_string()))),
+                                        }
+                                    }
+                                })
+                                .collect()
+                                .await;
+
+                            Some((stream::iter(events), (new_cursor, INITIAL_BACKOFF_MS)))
+                        }
+                        Err(e) => {
+                            sleep(std::time::Duration::from_millis(backoff_ms) + jitter).await;
+                            let next_backoff = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                            Some((
+                                stream::iter(vec![Err(TridentError::WebSocket(e.to_string()))]),
+                                (last_cursor, next_backoff),
+                            ))
+                        }
+                    }
                 }
-                Ok(Message::Close(_)) | Ok(_) => None,
-                Err(e) => Some(Err(TridentError::WebSocket(e.to_string()))),
-            }
-        });
+            },
+        )
+        .flatten();
 
-        Ok(Subscription::new(event_stream))
+        Subscription::new(reconnecting)
     }
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -82,7 +83,7 @@ func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams) (*Pa
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("query events failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, parseApiError(resp.StatusCode, string(bodyBytes))
 	}
 
 	var res PaginatedEvents
@@ -119,7 +120,7 @@ func (c *Client) GetEventByID(ctx context.Context, id string) (*SorobanEvent, er
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get event failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, parseApiError(resp.StatusCode, string(bodyBytes))
 	}
 
 	var wrapper struct {
@@ -170,18 +171,11 @@ func (c *Client) SubscribeToContract(ctx context.Context, params SubscribeToCont
 		wsScheme = "wss"
 	}
 
-	wsURL := url.URL{
+	wsBase := url.URL{
 		Scheme: wsScheme,
 		Host:   parsedBase.Host,
 		Path:   "/ws",
 	}
-
-	q := wsURL.Query()
-	q.Set("contractId", params.ContractID)
-	if params.Topic0 != "" {
-		q.Set("topic0", params.Topic0)
-	}
-	wsURL.RawQuery = q.Encode()
 
 	eventsChan := make(chan *SorobanEvent, 128)
 	errorsChan := make(chan error, 16)
@@ -194,17 +188,37 @@ func (c *Client) SubscribeToContract(ctx context.Context, params SubscribeToCont
 		done:       make(chan struct{}),
 	}
 
-	go c.runSubscriptionLoop(subCtx, wsURL.String(), eventsChan, errorsChan, sub.done)
+	go c.runSubscriptionLoop(subCtx, wsBase, params, eventsChan, errorsChan, sub.done)
 
 	return sub, nil
 }
 
-func (c *Client) runSubscriptionLoop(ctx context.Context, wsAddr string, events chan<- *SorobanEvent, errorsChan chan<- error, done <-chan struct{}) {
+// withJitter adds ±20% random jitter to a duration to avoid reconnect thundering herds.
+func withJitter(d time.Duration) time.Duration {
+	jitter := time.Duration(rand.Int63n(int64(d / 5)))
+	return d + jitter
+}
+
+func (c *Client) runSubscriptionLoop(
+	ctx context.Context,
+	wsBase url.URL,
+	params SubscribeToContractParams,
+	events chan<- *SorobanEvent,
+	errorsChan chan<- error,
+	done <-chan struct{},
+) {
 	defer close(events)
 	defer close(errorsChan)
 
-	backoff := 500 * time.Millisecond
-	maxBackoff := 30 * time.Second
+	const initialBackoff = 500 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+	backoff := initialBackoff
+	lastEventID := ""
+
+	origin := c.config.BaseURL
+	if !strings.HasPrefix(origin, "http://") && !strings.HasPrefix(origin, "https://") {
+		origin = "http://" + origin
+	}
 
 	for {
 		select {
@@ -215,18 +229,26 @@ func (c *Client) runSubscriptionLoop(ctx context.Context, wsAddr string, events 
 		default:
 		}
 
-		// Ensure origin header is set as required by some websocket implementations
-		origin := c.config.BaseURL
-		if !strings.HasPrefix(origin, "http://") && !strings.HasPrefix(origin, "https://") {
-			origin = "http://" + origin
+		// Build reconnect URL, appending cursor to resume from last seen event.
+		q := wsBase.Query()
+		q.Set("contractId", params.ContractID)
+		if params.Topic0 != "" {
+			q.Set("topic0", params.Topic0)
 		}
+		if lastEventID != "" {
+			q.Set("cursor", lastEventID)
+		}
+		wsAddr := wsBase
+		wsAddr.RawQuery = q.Encode()
+
+		isResume := lastEventID != ""
 
 		headers := http.Header{}
 		if c.config.APIKey != "" {
 			headers.Set("X-API-Key", c.config.APIKey)
 		}
 
-		config, err := websocket.NewConfig(wsAddr, origin)
+		config, err := websocket.NewConfig(wsAddr.String(), origin)
 		var conn *websocket.Conn
 		if err == nil {
 			config.Header = headers
@@ -239,13 +261,12 @@ func (c *Client) runSubscriptionLoop(ctx context.Context, wsAddr string, events 
 			default:
 			}
 
-			// Exponential backoff with cancellation awareness
 			select {
 			case <-ctx.Done():
 				return
 			case <-done:
 				return
-			case <-time.After(backoff):
+			case <-time.After(withJitter(backoff)):
 				backoff *= 2
 				if backoff > maxBackoff {
 					backoff = maxBackoff
@@ -254,37 +275,41 @@ func (c *Client) runSubscriptionLoop(ctx context.Context, wsAddr string, events 
 			}
 		}
 
-		// Reset backoff on successful connection
-		backoff = 500 * time.Millisecond
+		// Successful connection — reset backoff and fire lifecycle hook.
+		backoff = initialBackoff
+		if isResume && params.OnResumed != nil {
+			params.OnResumed(lastEventID)
+		} else if params.OnConnected != nil {
+			params.OnConnected()
+		}
 
-		// Read loop for this connection
+		// Read loop for this connection.
 		readErrChan := make(chan error, 1)
 		go func() {
 			for {
 				var msg []byte
-				err := websocket.Message.Receive(conn, &msg)
-				if err != nil {
+				if err := websocket.Message.Receive(conn, &msg); err != nil {
 					readErrChan <- err
 					return
 				}
 
 				var ev SorobanEvent
 				if err := json.Unmarshal(msg, &ev); err != nil {
-					// Pings might be empty or non-event frames, but they are not handled by Message.Receive usually,
-					// except control frames which x/net/websocket handles internally.
-					// Let's filter out non-JSON or empty payloads gracefully.
 					continue
+				}
+
+				if ev.ID != "" {
+					lastEventID = ev.ID
 				}
 
 				select {
 				case events <- &ev:
 				default:
-					// Slow consumer: skip or queue is full
+					// Slow consumer: drop rather than block the read loop.
 				}
 			}
 		}()
 
-		// Monitor read errors or termination
 		var readErr error
 		select {
 		case <-ctx.Done():
@@ -297,6 +322,10 @@ func (c *Client) runSubscriptionLoop(ctx context.Context, wsAddr string, events 
 			conn.Close()
 		}
 
+		if params.OnDisconnected != nil {
+			params.OnDisconnected()
+		}
+
 		if readErr != nil && readErr != io.EOF {
 			select {
 			case errorsChan <- fmt.Errorf("websocket read error: %w", readErr):
@@ -304,13 +333,16 @@ func (c *Client) runSubscriptionLoop(ctx context.Context, wsAddr string, events 
 			}
 		}
 
-		// Brief sleep before reconnecting
 		select {
 		case <-ctx.Done():
 			return
 		case <-done:
 			return
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(withJitter(backoff)):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
 }

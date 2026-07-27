@@ -42,6 +42,9 @@ type SorobanEvent struct {
 
 // SubscribeToContractParams options for real-time contract event subscription.
 type SubscribeToContractParams struct {
-	ContractID string
-	Topic0     string
+	ContractID     string
+	Topic0         string
+	OnConnected    func()
+	OnDisconnected func()
+	OnResumed      func(fromEventID string)
 }

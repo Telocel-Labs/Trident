@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
+import random
 from typing import Any, AsyncGenerator, Callable, Coroutine, Optional
 from urllib.parse import urlencode
 
 import aiohttp
 import websockets
+
+_INITIAL_BACKOFF = 0.5
+_MAX_BACKOFF = 30.0
+_JITTER_FACTOR = 0.2
 
 from .errors import TridentApiError
 from .types import Network, PaginatedEvents, SorobanEvent
@@ -104,30 +110,61 @@ class AsyncTridentClient:
         contract_id: str,
         *,
         topic_0: Optional[str] = None,
+        on_connected: Optional[Callable[[], Coroutine[Any, Any, None]]] = None,
+        on_disconnected: Optional[Callable[[], Coroutine[Any, Any, None]]] = None,
+        on_resumed: Optional[Callable[[str], Coroutine[Any, Any, None]]] = None,
     ) -> AsyncGenerator[SorobanEvent, None]:
         """Async generator that yields real-time events for a contract via WebSocket.
+
+        Reconnects with exponential backoff + jitter on disconnect, resuming
+        from the last received event id via the ``cursor`` query param.
 
         Usage::
 
             async for event in client.iter_events("CABC..."):
                 print(event)
         """
-        ws_base = (
-            self._api_url.replace("https://", "wss://").replace("http://", "ws://")
-        )
-        qs: dict[str, str] = {"contractId": contract_id}
-        if topic_0:
-            qs["topic0"] = topic_0
-        ws_url = f"{ws_base}/ws?{urlencode(qs)}"
-
+        ws_base = self._api_url.replace("https://", "wss://").replace("http://", "ws://")
         extra_headers = {"X-API-Key": self._api_key}
-        async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
-            async for message in ws:
-                try:
-                    raw = _json.loads(message)
-                    yield SorobanEvent.from_api(raw)
-                except Exception:
-                    continue
+        backoff = _INITIAL_BACKOFF
+        last_event_id: Optional[str] = None
+
+        while True:
+            qs: dict[str, str] = {"contractId": contract_id}
+            if topic_0:
+                qs["topic0"] = topic_0
+            if last_event_id:
+                qs["cursor"] = last_event_id
+            ws_url = f"{ws_base}/ws?{urlencode(qs)}"
+            is_resume = last_event_id is not None
+
+            try:
+                async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
+                    backoff = _INITIAL_BACKOFF
+                    if is_resume and last_event_id and on_resumed:
+                        await on_resumed(last_event_id)
+                    elif on_connected:
+                        await on_connected()
+
+                    async for message in ws:
+                        try:
+                            raw = _json.loads(message)
+                            event = SorobanEvent.from_api(raw)
+                            if event.id:
+                                last_event_id = event.id
+                            yield event
+                        except Exception:
+                            continue
+
+            except Exception:
+                pass
+
+            if on_disconnected:
+                await on_disconnected()
+
+            jitter = random.uniform(0, backoff * _JITTER_FACTOR)
+            await asyncio.sleep(min(backoff + jitter, _MAX_BACKOFF))
+            backoff = min(backoff * 2, _MAX_BACKOFF)
 
     async def subscribe_to_contract(
         self,
@@ -135,13 +172,23 @@ class AsyncTridentClient:
         on_event: Callable[[SorobanEvent], Coroutine[Any, Any, None]],
         *,
         topic_0: Optional[str] = None,
+        on_connected: Optional[Callable[[], Coroutine[Any, Any, None]]] = None,
+        on_disconnected: Optional[Callable[[], Coroutine[Any, Any, None]]] = None,
+        on_resumed: Optional[Callable[[str], Coroutine[Any, Any, None]]] = None,
     ) -> None:
         """Subscribe to real-time contract events, calling ``on_event`` for each.
 
-        Runs until the WebSocket connection closes or an exception is raised.
-        For a non-blocking version use :meth:`iter_events` in a task.
+        Reconnects with exponential backoff + jitter, resuming from the last
+        event id so no events are lost within the server retention window.
+        For a non-blocking version, wrap in ``asyncio.create_task``.
         """
-        async for event in self.iter_events(contract_id, topic_0=topic_0):
+        async for event in self.iter_events(
+            contract_id,
+            topic_0=topic_0,
+            on_connected=on_connected,
+            on_disconnected=on_disconnected,
+            on_resumed=on_resumed,
+        ):
             await on_event(event)
 
     # ------------------------------------------------------------------
