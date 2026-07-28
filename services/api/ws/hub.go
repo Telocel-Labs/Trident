@@ -147,17 +147,3 @@ func (h *Hub) ClientCount() int {
 	defer h.mu.RUnlock()
 	return len(h.clients)
 }
-
-// ShutdownAll closes all active client connections by calling shutdown on each
-// subscriber. This is called during graceful shutdown to ensure clients receive
-// a clean close instead of a TCP RST.
-func (h *Hub) ShutdownAll() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	for s := range h.clients {
-		s.shutdown()
-		delete(h.clients, s)
-	}
-	slog.Info("ws: shutdown complete, all clients disconnected")
-}

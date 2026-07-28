@@ -501,23 +501,27 @@ paths:
                   enum: [free, standard, premium, internal]
                   default: standard
                   description: Rate limit tier for this key
+                scope:
+                  type: string
+                  enum: [read, admin]
+                  default: read
+                  description: >
+                    Permission scope for the new key. Distinct from the
+                    ADMIN_API_KEY used to call this endpoint itself:
+                    scope controls what the *new* database-issued key can do
+                    on scope-gated data routes (see middleware.RequireScope).
+                expires_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+                  description: Optional expiry. Omit or null for a non-expiring key.
       responses:
         "201":
           description: API key created
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: string
-                    format: uuid
-                  key:
-                    type: string
-                    description: The raw API key (shown only once)
-                  key_prefix:
-                    type: string
-                    description: First 16 characters of key for reference
+                $ref: "#/components/schemas/ApiKey"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -539,34 +543,65 @@ paths:
               schema:
                 type: object
                 properties:
-                  keys:
+                  api_keys:
                     type: array
                     items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                          format: uuid
-                        key_prefix:
-                          type: string
-                        label:
-                          type: string
-                        network:
-                          type: string
-                        rate_limit_tier:
-                          type: string
-                        last_used_at:
-                          type: string
-                          format: date-time
-                        request_count:
-                          type: integer
-                        created_at:
-                          type: string
-                          format: date-time
+                      $ref: "#/components/schemas/ApiKey"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
   /v1/api-keys/{id}:
+    patch:
+      summary: Update an API key
+      description: Update the label, rate limit tier, scope, or expiry of an active key (admin only)
+      operationId: updateApiKey
+      tags:
+        - API Keys
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: API key ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                rate_limit_tier:
+                  type: string
+                  enum: [free, standard, premium, internal]
+                scope:
+                  type: string
+                  enum: [read, admin]
+                expires_at:
+                  type: string
+                  description: >
+                    RFC3339 timestamp to set a new expiry, or an empty string
+                    to clear an existing expiry. Omit the field to leave it
+                    unchanged.
+      responses:
+        "200":
+          description: API key updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
     delete:
       summary: Delete an API key
       description: Revoke and delete an API key (admin only)
@@ -590,6 +625,65 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           description: API key not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/api-keys/{id}/rotate:
+    post:
+      summary: Rotate an API key
+      description: >
+        Creates a new key that inherits the old key's label, network, rate
+        limit tier, and scope. The old key keeps authenticating for a grace
+        window (default 24h) so callers can switch over, then is
+        automatically revoked. Admin only.
+      operationId: rotateApiKey
+      tags:
+        - API Keys
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: API key ID to rotate
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grace_period_seconds:
+                  type: integer
+                  format: int64
+                  description: Overrides the default rotation grace window, in seconds.
+      responses:
+        "201":
+          description: New key created; old key enters its grace window
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rotated_from:
+                    type: string
+                    format: uuid
+                  grace_until:
+                    type: string
+                    format: date-time
+                  new_key:
+                    $ref: "#/components/schemas/ApiKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: API key not found, already revoked, or already rotated
           content:
             application/json:
               schema:
@@ -1023,6 +1117,63 @@ components:
           format: date-time
           description: Timestamp of last event for this contract
 
+    ApiKey:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        key:
+          type: string
+          description: The raw API key (only present in create/rotate responses, shown once)
+        key_prefix:
+          type: string
+          description: First 16 characters of key for reference
+        label:
+          type: string
+        network:
+          type: string
+        rate_limit_tier:
+          type: string
+        scope:
+          type: string
+          enum: [read, admin]
+          description: Permission scope enforced by middleware.RequireScope on data routes
+        created_by:
+          type: string
+          nullable: true
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        request_count:
+          type: integer
+          format: int64
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        grace_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set by rotation; the old key authenticates until this time, then auto-revokes.
+        rotated_from:
+          type: string
+          format: uuid
+          nullable: true
+        rotated_to:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
     ErrorResponse:
       type: object
       required:
@@ -1061,6 +1212,13 @@ components:
 
     NotFound:
       description: Requested resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    Forbidden:
+      description: Authenticated but the key's scope does not permit this operation
       content:
         application/json:
           schema:

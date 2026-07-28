@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,13 +68,52 @@ func authRedisCacheKey(hash string) string {
 	return fmt.Sprintf("apiauth:%s", hash)
 }
 
+// formatAuthCacheValue encodes a successful DB auth lookup for the Redis
+// cache. The format is "<uuid>:<network>:<scope>:<expires_at-unix-or-empty>"
+// (issue #314) — the trailing field lets a cache hit re-check expiry/grace
+// without a second DB round trip, in addition to the TTL cap applied when
+// the entry is written.
+func formatAuthCacheValue(id, network, scope string, expiresAt *time.Time) string {
+	exp := ""
+	if expiresAt != nil {
+		exp = strconv.FormatInt(expiresAt.Unix(), 10)
+	}
+	return strings.Join([]string{id, network, scope, exp}, ":")
+}
+
+// parseAuthCacheValue decodes a value written by formatAuthCacheValue. It
+// also accepts the legacy pre-#314 "<uuid>:<network>" format (scope defaults
+// to ScopeAdmin, no expiry) so a rolling deploy does not fail auth against
+// entries cached by an older process.
+func parseAuthCacheValue(cached string) (id, network, scope string, expiresAt *time.Time, ok bool) {
+	parts := strings.SplitN(cached, ":", 4)
+	if len(parts) < 2 || parts[0] == "" {
+		return "", "", "", nil, false
+	}
+	id, network = parts[0], parts[1]
+	scope = ScopeAdmin
+	if len(parts) >= 3 && parts[2] != "" {
+		scope = parts[2]
+	}
+	if len(parts) == 4 && parts[3] != "" {
+		if unix, err := strconv.ParseInt(parts[3], 10, 64); err == nil {
+			t := time.Unix(unix, 0)
+			expiresAt = &t
+		}
+	}
+	return id, network, scope, expiresAt, true
+}
+
 // NewDBAuth returns an authentication middleware that:
-//  1. Looks up the hashed API key in Redis cache (5 min TTL).
-//  2. Falls back to the api_keys database table (active keys only).
+//  1. Looks up the hashed API key in Redis cache (5 min TTL, capped shorter
+//     when the key's expires_at/grace_until is sooner).
+//  2. Falls back to the api_keys database table (active, non-expired,
+//     non-grace-expired keys only).
 //  3. Falls back to legacy HMAC-SHA256 env-var authentication (API_KEY_HASHES).
 //
-// On success, api_key_id and network are attached to the request context.
-// Unauthenticated requests receive 401 unless the path is excluded.
+// On success, api_key_id, network, and scope are attached to the request
+// context (see ScopeFromContext / RequireScope). Unauthenticated requests
+// receive 401 unless the path is excluded.
 func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -96,34 +136,78 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 
 			// ── 1. Redis cache ──────────────────────────────────────────────
 			dbHash := sha256KeyHash(key)
+			now := time.Now()
 			if cfg.Redis != nil {
 				if cached, err := cfg.Redis.Get(r.Context(), authRedisCacheKey(dbHash)).Result(); err == nil {
-					// Cached value format: "<uuid>:<network>"
-					parts := strings.SplitN(cached, ":", 2)
-					ctx := context.WithValue(r.Context(), contextKeyAPIKeyID, parts[0])
-					if len(parts) == 2 {
-						ctx = context.WithValue(ctx, contextKeyNetwork, parts[1])
+					if id, network, scope, expiresAt, ok := parseAuthCacheValue(cached); ok {
+						// Defense in depth: the Redis TTL is capped at write time so an
+						// entry never outlives its expires_at/grace_until, but re-check
+						// here too in case of clock skew between cache-set and now.
+						if expiresAt == nil || expiresAt.After(now) {
+							ctx := context.WithValue(r.Context(), contextKeyAPIKeyID, id)
+							ctx = context.WithValue(ctx, contextKeyNetwork, network)
+							ctx = withScope(ctx, scope)
+							next.ServeHTTP(w, r.WithContext(ctx))
+							return
+						}
 					}
-					next.ServeHTTP(w, r.WithContext(ctx))
-					return
 				}
 			}
 
-			// ── 2. Database lookup ──────────────────────────────────────────
+			// ── 2. Database lookup ───────────────────────────────────────────
 			if cfg.DB != nil {
-				var id, network string
+				// The lazy_revoke CTE deterministically retires a rotated-out key
+				// once its grace window has elapsed, without needing a background
+				// cron (issue #314): the UPDATE runs in the same round trip as the
+				// SELECT that enforces revoked_at/expires_at/grace_until.
+				var id, network, scope string
+				var expiresAt, graceUntil *time.Time
 				err := cfg.DB.QueryRow(r.Context(),
-					`SELECT id, network FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
+					`WITH lazy_revoke AS (
+					     UPDATE api_keys
+					     SET revoked_at = NOW()
+					     WHERE key_hash = $1
+					       AND revoked_at IS NULL
+					       AND grace_until IS NOT NULL
+					       AND grace_until <= NOW()
+					 )
+					 SELECT id, network, scope, expires_at, grace_until
+					 FROM api_keys
+					 WHERE key_hash = $1
+					   AND revoked_at IS NULL
+					   AND (expires_at IS NULL OR expires_at > NOW())
+					   AND (grace_until IS NULL OR grace_until > NOW())`,
 					dbHash,
-				).Scan(&id, &network)
+				).Scan(&id, &network, &scope, &expiresAt, &graceUntil)
 				if err == nil {
-					// Populate Redis cache so the next request is O(1).
-					if cfg.Redis != nil {
+					// Cap the Redis TTL at whichever of expires_at/grace_until is
+					// soonest, so a cached auth result can never outlive the
+					// DB-enforced validity window.
+					ttl := authCacheTTL
+					var cacheExpiry *time.Time
+					if expiresAt != nil {
+						cacheExpiry = expiresAt
+						if until := time.Until(*expiresAt); until < ttl {
+							ttl = until
+						}
+					}
+					if graceUntil != nil {
+						if cacheExpiry == nil || graceUntil.Before(*cacheExpiry) {
+							cacheExpiry = graceUntil
+						}
+						if until := time.Until(*graceUntil); until < ttl {
+							ttl = until
+						}
+					}
+					// Populate Redis cache so the next request is O(1), capped so it
+					// never outlives expires_at/grace_until (issue #314).
+					if cfg.Redis != nil && ttl > 0 {
 						cfg.Redis.Set(r.Context(), authRedisCacheKey(dbHash),
-							id+":"+network, authCacheTTL)
+							formatAuthCacheValue(id, network, scope, cacheExpiry), ttl)
 					}
 					ctx := context.WithValue(r.Context(), contextKeyAPIKeyID, id)
 					ctx = context.WithValue(ctx, contextKeyNetwork, network)
+					ctx = withScope(ctx, scope)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
@@ -133,7 +217,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 			validHashes := ParseKeyHashes(os.Getenv("API_KEY_HASHES"))
 			if len(validHashes) > 0 {
 				if _, ok := validHashes[hmacKeyHash(key)]; ok {
-					next.ServeHTTP(w, r)
+					// Legacy env-var keys predate scoping and are treated as
+					// admin-scoped so existing deployments relying on them for
+					// mutating routes keep working unchanged (issue #314).
+					ctx := withScope(r.Context(), ScopeAdmin)
+					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
 			}

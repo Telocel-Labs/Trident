@@ -15,6 +15,7 @@ type ErrorCode string
 const (
 	NOT_FOUND        ErrorCode = "NOT_FOUND"
 	UNAUTHORIZED     ErrorCode = "UNAUTHORIZED"
+	FORBIDDEN        ErrorCode = "FORBIDDEN"
 	RATE_LIMITED     ErrorCode = "RATE_LIMITED"
 	INVALID_ARGUMENT ErrorCode = "INVALID_ARGUMENT"
 	UNAVAILABLE      ErrorCode = "UNAVAILABLE"
@@ -83,10 +84,6 @@ func GRPCToHTTP(err error) (int, ErrorCode) {
 		// The backend did not answer within the call deadline: a gateway
 		// timeout, not an internal fault — clients may retry (issue #227).
 		return http.StatusGatewayTimeout, UNAVAILABLE
-	case codes.Unavailable:
-		// Transient transport failure to the backend; degrade to 503 so
-		// clients and load balancers treat it as retryable (issue #227).
-		return http.StatusServiceUnavailable, UNAVAILABLE
 	default:
 		return http.StatusInternalServerError, INTERNAL
 	}

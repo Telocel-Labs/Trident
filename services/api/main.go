@@ -207,11 +207,25 @@ func main() {
 	// evict the stale entry immediately instead of waiting for the TTL (#229).
 	tierCache := middleware.NewTierCache()
 
+	// Rotation grace window (issue #314): how long a rotated-out key keeps
+	// authenticating before it is lazily auto-revoked. Configurable via
+	// API_KEY_ROTATION_GRACE_HOURS; defaults to 24h (see
+	// handlers.defaultRotationGracePeriod) when unset or invalid.
+	rotationGrace := time.Duration(0)
+	if raw := os.Getenv("API_KEY_ROTATION_GRACE_HOURS"); raw != "" {
+		if hours, err := strconv.ParseFloat(raw, 64); err == nil && hours > 0 {
+			rotationGrace = time.Duration(hours * float64(time.Hour))
+		} else {
+			slog.Warn("invalid API_KEY_ROTATION_GRACE_HOURS, using default", "value", raw)
+		}
+	}
+
 	apiKeyCfg := handlers.APIKeyConfig{
-		AdminKey:       os.Getenv("ADMIN_API_KEY"),
-		DB:             pool,
-		Redis:          redisClient,
-		InvalidateTier: tierCache.Invalidate,
+		AdminKey:            os.Getenv("ADMIN_API_KEY"),
+		DB:                  pool,
+		Redis:               redisClient,
+		InvalidateTier:      tierCache.Invalidate,
+		RotationGracePeriod: rotationGrace,
 	}
 
 	webhookDB, err := newDB()
@@ -244,6 +258,7 @@ func main() {
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
 	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
+	mux.HandleFunc("POST /v1/api-keys/{id}/rotate", handlers.RotateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
 	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
 	mux.HandleFunc("GET /v1/contracts/{id}/spec", handlers.ContractSpec(schemaRegistryDB))
@@ -258,14 +273,20 @@ func main() {
 		sorobanCaller = sorobanrpc.NewClient(rpcURL)
 	}
 	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
+	// Webhook reads stay available to any authenticated key; the mutating
+	// endpoints below require an admin-scoped database key (issue #314) —
+	// this is the demonstration route for middleware.RequireScope, distinct
+	// from the separate ADMIN_API_KEY gate used by /v1/api-keys* and
+	// /v1/admin/* management endpoints.
+	requireAdminScope := middleware.RequireScope(middleware.ScopeAdmin)
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
-	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
+	mux.Handle("POST /v1/webhooks", requireAdminScope(createWebhookHandler(webhookDB)))
+	mux.Handle("DELETE /v1/webhooks/{id}", requireAdminScope(deleteWebhookHandler(webhookDB)))
+	mux.Handle("PATCH /v1/webhooks/{id}/pause", requireAdminScope(pauseWebhookHandler(webhookDB)))
+	mux.Handle("PATCH /v1/webhooks/{id}/resume", requireAdminScope(resumeWebhookHandler(webhookDB)))
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
+	mux.Handle("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", requireAdminScope(replayDeadLetterHandler(webhookDB)))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
