@@ -71,7 +71,7 @@ func NewClient(_ context.Context, addr string) (*Client, error) {
 			Timeout:             5 * time.Second,
 			PermitWithoutStream: true,
 		}),
-		grpc.WithChainUnaryInterceptor(requestIDUnaryInterceptor, retryUnaryInterceptor, metricsUnaryInterceptor),
+		grpc.WithChainUnaryInterceptor(traceContextUnaryInterceptor, requestIDUnaryInterceptor, retryUnaryInterceptor, metricsUnaryInterceptor),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial gRPC server: %w", err)

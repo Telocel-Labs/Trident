@@ -233,6 +233,7 @@ func main() {
 	handler = middleware.NewDBAuth(authDB)(handler)
 	handler = middleware.NewCompression()(handler)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
+	handler = middleware.TracingMiddleware(handler)
 	// RequestID + StructuredLogging are outermost so every response — including
 	// auth and rate-limit rejections — is assigned a request id, echoes it on
 	// X-Request-ID, and is captured in structured logs (issue #226). RequestID
