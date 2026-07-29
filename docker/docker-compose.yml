@@ -122,13 +122,16 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
     ports:
       - "${PORT}:${PORT}"
-    # Probe the health endpoint we just implemented. wget is used instead of
-    # curl because it is available in the scratch/alpine base images without
-    # adding an extra layer. The 4-second timeout matches the handler's
-    # 3-second per-check timeout plus one second of slack.
+    # Probe /v1/ready (issue #243), not /v1/health — compose's healthcheck
+    # gates other services' `depends_on: condition: service_healthy`, so it
+    # needs the readiness semantics (DB/Redis/gRPC reachable), not just
+    # liveness. wget is used instead of curl because it is available in the
+    # scratch/alpine base images without adding an extra layer. The
+    # 4-second timeout matches the handler's 3-second per-check timeout plus
+    # one second of slack.
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
-             "http://localhost:${PORT}/v1/health"]
+             "http://localhost:${PORT}/v1/ready"]
       interval: 15s
       timeout: 5s
       retries: 3

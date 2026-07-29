@@ -21,12 +21,16 @@ primary_region = "iad"
   auto_start_machines  = true
   min_machines_running = 1
 
+  # Fly has no separate liveness/readiness concept — this single check gates
+  # whether the proxy routes traffic to the machine, so it needs readiness
+  # semantics (issue #243): /v1/ready checks Postgres/Redis/gRPC reachability,
+  # not just /v1/health's cheap liveness check.
   [[http_service.checks]]
     interval     = "10s"
     timeout      = "5s"
     grace_period = "15s"
     method       = "GET"
-    path         = "/v1/health"
+    path         = "/v1/ready"
 
 [[vm]]
   size   = "shared-cpu-1x"
