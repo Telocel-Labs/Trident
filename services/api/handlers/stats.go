@@ -571,7 +571,10 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 	}
 	defer rows.Close()
 
-	var stats []*ContractStats
+	// Non-nil so a zero-row result serializes as JSON [] rather than null
+	// (issue #242) — the OpenAPI spec documents ContractStatsResponse.contracts
+	// as a non-nullable array.
+	stats := []*ContractStats{}
 	for rows.Next() {
 		var cs ContractStats
 		var lastSeenAt time.Time
@@ -651,7 +654,10 @@ func queryContractStatsFromRollup(ctx context.Context, db DBPool, params *valida
 	}
 	defer rows.Close()
 
-	var stats []*ContractStats
+	// Non-nil so a zero-row result serializes as JSON [] rather than null
+	// (issue #242) — the OpenAPI spec documents ContractStatsResponse.contracts
+	// as a non-nullable array.
+	stats := []*ContractStats{}
 	for rows.Next() {
 		var cs ContractStats
 		var lastSeenAt time.Time
