@@ -747,7 +747,7 @@ jobs:
 
           stellar contract invoke \
             --id "$CONTRACT_ID" --source admin --network local \
-            -- initialize --admin "$ADMIN_ADDR" --decimals 7 \
+            -- initialize --admin "$ADMIN_ADDR" --decimal 7 \
                 --name "E2E Token" --symbol E2E
 
           # The mint call is what the E2E assertion below waits for: it
