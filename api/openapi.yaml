@@ -59,6 +59,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -114,14 +116,21 @@ paths:
             maximum: 200
             default: 50
           description: Maximum number of events to return
-        - name: after
+        - name: cursor
           in: query
           schema:
             type: string
-          description: Opaque pagination cursor from previous response (for next page)
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: List of events with pagination metadata
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             application/json:
               schema:
@@ -130,6 +139,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -152,6 +163,13 @@ paths:
       responses:
         "200":
           description: Event details
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             application/json:
               schema:
@@ -171,6 +189,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -197,6 +217,13 @@ paths:
       responses:
         "200":
           description: Server-Sent Events stream
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             text/event-stream:
               schema:
@@ -205,6 +232,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -251,6 +280,13 @@ paths:
       responses:
         "200":
           description: Multiple event details
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             application/json:
               schema:
@@ -276,6 +312,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -298,6 +336,13 @@ paths:
       responses:
         "200":
           description: Contract event schema registry entry
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             application/json:
               schema:
@@ -306,6 +351,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -327,6 +374,13 @@ paths:
       responses:
         "200":
           description: Contract spec and detected interfaces
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             application/json:
               schema:
@@ -337,6 +391,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -358,6 +414,13 @@ paths:
       responses:
         "200":
           description: Latest known value per storage key
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             application/json:
               schema:
@@ -366,6 +429,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -393,6 +458,13 @@ paths:
       responses:
         "200":
           description: Recorded changes for the requested storage key
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
           content:
             application/json:
               schema:
@@ -401,6 +473,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -419,6 +493,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IndexerStatsResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -460,7 +536,19 @@ paths:
           description: Number of top contracts to return
       responses:
         "200":
-          description: Contract activity statistics
+          description: >-
+            Contract activity statistics. X-Cache indicates whether this
+            response was served from the 60s Redis response cache (HIT) or
+            freshly computed (MISS).
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/X-RateLimit-Reset"
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
           content:
             application/json:
               schema:
@@ -469,6 +557,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -522,6 +612,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
 
     get:
       summary: List API keys
@@ -565,6 +657,8 @@ paths:
                           format: date-time
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
 
   /v1/api-keys/{id}:
     delete:
@@ -594,6 +688,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
 
   /v1/admin/db:
     get:
@@ -613,6 +709,8 @@ paths:
                 type: object
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
 
   /metrics:
     get:
@@ -1044,6 +1142,60 @@ components:
               type: string
               description: Request ID for debugging
 
+  headers:
+    X-RateLimit-Limit:
+      description: >-
+        Requests allowed per window for this API key's rate-limit tier.
+        Present on every response from an endpoint secured by ApiKeyAuth
+        (2xx and 429 alike) once a valid X-API-Key was presented.
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+      example: 50
+
+    X-RateLimit-Remaining:
+      description: >-
+        Requests remaining in the current window for this API key. 0 on the
+        response that triggers a 429.
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+      example: 12
+
+    X-RateLimit-Reset:
+      description: >-
+        Unix timestamp (seconds) when the current rate-limit window resets.
+      required: true
+      schema:
+        type: integer
+        format: int64
+      example: 1732900000
+
+    Retry-After:
+      description: >-
+        Seconds to wait before retrying. Present on 429 (rate limit
+        exceeded, per-API-key or per-IP) and on 503 responses caused by the
+        global concurrency cap shedding load. Not present on a 503 caused by
+        an unavailable dependency (database/Redis/gRPC backend) — check the
+        error envelope's `error.code` to distinguish the two.
+      schema:
+        type: integer
+        minimum: 1
+      example: 1
+
+    X-Cache:
+      description: >-
+        Whether this response was served from the Redis response cache
+        (HIT) or freshly computed (MISS). Only emitted by endpoints that
+        cache their response.
+      required: true
+      schema:
+        type: string
+        enum: [HIT, MISS]
+      example: HIT
+
   responses:
     BadRequest:
       description: Invalid request parameters
@@ -1066,8 +1218,48 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
 
+    RateLimitExceeded:
+      description: >-
+        Rate limit exceeded for this API key's tier (error.code
+        RATE_LIMITED). Carries the same X-RateLimit-* headers as a
+        successful response (X-RateLimit-Remaining is 0) plus Retry-After.
+      headers:
+        X-RateLimit-Limit:
+          $ref: "#/components/headers/X-RateLimit-Limit"
+        X-RateLimit-Remaining:
+          $ref: "#/components/headers/X-RateLimit-Remaining"
+        X-RateLimit-Reset:
+          $ref: "#/components/headers/X-RateLimit-Reset"
+        Retry-After:
+          $ref: "#/components/headers/Retry-After"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    TooManyRequestsIPOnly:
+      description: >-
+        Per-IP rate limit exceeded (error.code RATE_LIMITED). Applies to
+        endpoints not covered by per-API-key limiting (public endpoints, or
+        admin endpoints authenticated via ADMIN_API_KEY rather than
+        X-API-Key) — only Retry-After is set, no X-RateLimit-* headers.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/Retry-After"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
     ServiceUnavailable:
-      description: Service temporarily unavailable
+      description: >-
+        Service temporarily unavailable — either a dependency (database,
+        Redis, gRPC backend) is down, or the server is shedding load under
+        the global concurrency cap. When load-shedding is the cause,
+        Retry-After is set; otherwise it is absent.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/Retry-After"
       content:
         application/json:
           schema:
