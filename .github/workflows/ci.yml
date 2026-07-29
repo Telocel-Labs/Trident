@@ -869,6 +869,13 @@ jobs:
       - name: Check every env var the code reads is documented
         run: bash scripts/check-env-reference.sh
 
+      # Catches two migrations sharing a version prefix before it reaches a
+      # real database. The rust-integration job applies migrations with a
+      # `for f in *.sql` psql loop rather than the sqlx migrator, so it cannot
+      # catch this on its own (issue #371).
+      - name: Check migration versions are unique
+        run: bash scripts/check-migration-versions.sh
+
   # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
