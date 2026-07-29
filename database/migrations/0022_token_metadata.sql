@@ -1,3 +1,13 @@
+-- Renumbered from 0018 to 0022 (issue #371). It was merged as a second 0018
+-- alongside 0018_contract_specs, and sqlx derives a migration's version from
+-- the filename prefix — so the pair collided on the primary key of
+-- _sqlx_migrations and `sqlx migrate run` aborted for everyone.
+--
+-- Forward-only and safe to re-apply: every statement below is guarded with
+-- IF NOT EXISTS, so a database that already applied this file under the old
+-- 0018 version records 0022 and makes no schema changes. Nothing here depends
+-- on 0018-0021, so the later position is not a behaviour change.
+--
 -- Issue #263: per-contract token metadata (name, symbol, decimals), resolved
 -- via a read-only `simulateTransaction` call against name()/symbol()/decimals()
 -- (SEP-41) and cached here so consumers can render amounts in human units
