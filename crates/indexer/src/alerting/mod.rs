@@ -31,6 +31,9 @@ const WEBHOOK_TIMEOUT_SECS: u64 = 5;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    /// Not currently emitted by lag alerting; kept for sinks that classify
+    /// non-actionable notifications.
+    #[allow(dead_code)]
     Info,
     Warning,
     Critical,
@@ -62,7 +65,7 @@ pub struct AlertState {
 }
 
 #[derive(Debug, Serialize)]
-struct WebhookPayload {
+pub struct WebhookPayload {
     alert: &'static str,
     severity: String,
     indexer: &'static str,
@@ -78,7 +81,7 @@ struct WebhookPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct RecoveryPayload {
+pub struct RecoveryPayload {
     alert: &'static str,
     lag_ledgers: u64,
     timestamp: String,
@@ -130,12 +133,6 @@ impl AlertSink for SlackWebhook {
             blocks: Vec<SlackBlock>,
         }
 
-        let color = match payload.severity.as_str() {
-            "critical" => "#FF0000",
-            "warning" => "#FFA500",
-            _ => "#CCCCCC",
-        };
-
         let blocks = vec![SlackBlock {
             kind: "section",
             text: serde_json::json!({
@@ -174,6 +171,11 @@ impl AlertSink for SlackWebhook {
 }
 
 /// PagerDuty Events API v2 sink.
+///
+/// Not constructed by [`Alerter::from_config`], which only has a webhook URL
+/// to work from — PagerDuty additionally needs a routing key, so it must be
+/// wired explicitly through [`Alerter::from_sinks`].
+#[allow(dead_code)]
 pub struct PagerDuty {
     pub routing_key: String,
 }
@@ -251,7 +253,7 @@ impl AlertSink for PagerDuty {
             payload: PDResolve {
                 r#type: "alert",
                 summary: payload.text.clone(),
-                source: "trident-indexer",
+                source: "trident-indexer".to_string(),
                 timestamp: payload.timestamp.clone(),
             },
         };
@@ -263,6 +265,10 @@ impl AlertSink for PagerDuty {
 /// The alerting subsystem. Constructed once in `main` and passed to
 /// `Streamer`. When no sinks are registered every method is a no-op.
 pub struct Alerter {
+    /// Configured fallback threshold. Evaluation reads the per-cycle value from
+    /// `AlertContext::lag_threshold` instead, so this is currently only the
+    /// record of what was configured.
+    #[allow(dead_code)]
     lag_threshold: u64,
     cooldown: Duration,
     http: Option<Client>,
@@ -271,6 +277,32 @@ pub struct Alerter {
 }
 
 impl Alerter {
+    /// Build an `Alerter` from the indexer's alert configuration.
+    ///
+    /// `webhook_url` is `Config::alert_webhook_url`; `None` (the default)
+    /// yields a disabled `Alerter` whose methods are all no-ops, which is why
+    /// this returns `Ok` rather than erroring on absent configuration.
+    ///
+    /// The sink is chosen from the URL's shape: Slack incoming webhooks get
+    /// the Slack blocks format, anything else gets the generic JSON payload.
+    /// `PagerDuty` is not reachable from here — it needs a routing key rather
+    /// than just a URL, so it must be wired via [`Alerter::from_sinks`].
+    pub fn from_config(
+        webhook_url: Option<String>,
+        lag_threshold: u64,
+        cooldown_minutes: u64,
+    ) -> Result<Self, TridentError> {
+        let (sinks, urls): (Vec<Box<dyn AlertSink>>, Vec<String>) = match webhook_url {
+            Some(url) if url.starts_with("https://hooks.slack.com/") => {
+                (vec![Box::new(SlackWebhook)], vec![url])
+            }
+            Some(url) => (vec![Box::new(GenericWebhook)], vec![url]),
+            None => (Vec::new(), Vec::new()),
+        };
+
+        Self::from_sinks(sinks, urls, lag_threshold, cooldown_minutes)
+    }
+
     /// Build an `Alerter` from the provided sinks and URLs.
     ///
     /// Returns `Ok(Alerter { sinks: [], .. })` when no sinks are configured —
@@ -474,7 +506,7 @@ mod tests {
     use chrono::Duration as CDuration;
 
     fn make_alerter(url: Option<&str>, threshold: u64, cooldown_minutes: u64) -> Alerter {
-        let sinks = if let Some(u) = url {
+        let sinks = if url.is_some() {
             vec![Box::new(GenericWebhook) as Box<dyn AlertSink>]
         } else {
             vec![]

@@ -446,6 +446,26 @@ impl RpcClient {
             .await
     }
 
+    /// Run a read-only host function call through `simulateTransaction`
+    /// (issue #263), used by `crate::token_metadata` to read SEP-41 token
+    /// metadata without ever signing or submitting a transaction.
+    ///
+    /// A simulation that the node rejects (e.g. the contract exposes no such
+    /// function) comes back as `Ok` with `error` set and `results` empty — that
+    /// is a normal "not a token" answer, not a transport failure, so it is left
+    /// for the caller to interpret. Only genuine RPC/transport failures are
+    /// returned as `Err`.
+    pub async fn simulate_transaction(
+        &self,
+        envelope_xdr: &str,
+    ) -> Result<SimulateTransactionResult, TridentError> {
+        let params = SimulateTransactionParams {
+            transaction: envelope_xdr,
+        };
+        self.call("simulateTransaction", 6, params, "simulateTransaction")
+            .await
+    }
+
     /// Fetch a batch of ledger entries (contract instance, contract code, or
     /// contract data) via `getLedgerEntries` (issues #260, #270). Keys not
     /// present on-chain (e.g. never written, or archived) are simply absent
