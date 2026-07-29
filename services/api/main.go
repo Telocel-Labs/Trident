@@ -14,6 +14,7 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/Depo-dev/trident/services/api/internal/profiling"
 	"github.com/Depo-dev/trident/services/api/internal/sorobanrpc"
 	"github.com/Depo-dev/trident/services/api/middleware"
@@ -311,11 +312,20 @@ func main() {
 	// Redis calls, logging — is spent on a request that's going to be
 	// rejected anyway.
 	handler = middleware.NewGlobalConcurrencyLimitFromEnv()(handler)
-
+	// Metrics middleware is the absolute outermost wrap (issue #58): it must
+	// see every response, including ones shed by GlobalConcurrencyLimit, to
+	// report accurate per-endpoint counts/latency.
+	handler = middleware.NewMetrics(mux)(handler)
 	// Opt-in, internal-only pprof server (off unless PPROF_ENABLED=true). It is
 	// never mounted on the public mux above (#299).
 	pprofSrv := profiling.Start()
 	defer profiling.Shutdown(pprofSrv)
+
+	// Internal Prometheus metrics server on METRICS_PORT (default 9091,
+	// issue #58) — separate port from the public API and from the legacy
+	// /metrics route mounted above.
+	metricsSrv := metrics.Start()
+	defer metrics.Shutdown(metricsSrv)
 
 	// Grace period mirrors Helm terminationGracePeriodSeconds (default 30s).
 	const shutdownGrace = 30 * time.Second
