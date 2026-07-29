@@ -36,7 +36,31 @@ import (
 // allow it to be.
 const contractStatsRollupRefreshInterval = 60 * time.Second
 
+// How often pgxpool saturation stats are polled into Prometheus gauges
+// (issue #238).
+const dbPoolMetricsPollInterval = 15 * time.Second
+
 const defaultDBPoolSize = 5
+
+// Pool lifecycle defaults (issue #238). Applied in buildPoolConfig unless
+// overridden by env vars.
+const (
+	defaultDBPoolMinConns              = 0
+	defaultDBPoolMaxConnLifetimeMS     = 1_800_000 // 30 min
+	defaultDBPoolMaxConnIdleTimeMS     = 300_000   // 5 min
+	defaultDBPoolHealthCheckPeriodMS   = 60_000    // 1 min, matches pgxpool's own default
+	dbPoolMaxConnLifetimeJitterPercent = 10        // spreads reconnects so the pool doesn't empty all at once
+)
+
+// Statement-timeout defaults (issue #238), shared with the Rust indexer
+// (crates/indexer/src/config.rs) via the same env vars so both services agree
+// on how long a query or idle transaction may hold a connection.
+const (
+	defaultStatementTimeoutMS         = 30_000
+	defaultIdleInTransactionTimeoutMS = 10_000
+	statementTimeoutMinMS             = 100
+	statementTimeoutMaxMS             = 3_600_000
+)
 
 // connErrRegexp matches a userinfo-bearing connection URI (scheme://user:pass@host)
 // so DB/Redis connection errors — which some drivers embed the DSN in — never
@@ -187,6 +211,13 @@ func main() {
 	// of a live GROUP BY on every cache miss (issue #257).
 	if pool != nil {
 		go runContractStatsRollupRefresh(ctx, pool)
+	}
+
+	// Periodically export pgxpool saturation stats (issue #238) — total/idle/
+	// acquired conns and acquire-wait time are the direct signal that a burst
+	// of slow queries is starving the pool.
+	if pool != nil {
+		go metrics.PollDBPool(ctx, pool, dbPoolMetricsPollInterval)
 	}
 
 	adminCfg := handlers.AdminConfig{
@@ -368,13 +399,55 @@ func main() {
 	slog.Info("shutdown complete")
 }
 
-func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
+// buildPoolConfig parses dsn and applies pool sizing, lifecycle, and
+// statement-timeout settings (issue #238). It does not connect — safe to
+// call from tests without a live database.
+func buildPoolConfig(dsn string, poolSize int32) (*pgxpool.Config, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
 	}
-	cfg.MaxConns = poolSize
 	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	cfg.MaxConns = poolSize
+	cfg.MinConns = envInt32("GO_API_DB_POOL_MIN_CONNS", defaultDBPoolMinConns)
+	cfg.MaxConnLifetime = envDurationMS("GO_API_DB_POOL_MAX_CONN_LIFETIME_MS", defaultDBPoolMaxConnLifetimeMS)
+	cfg.MaxConnLifetimeJitter = cfg.MaxConnLifetime * dbPoolMaxConnLifetimeJitterPercent / 100
+	cfg.MaxConnIdleTime = envDurationMS("GO_API_DB_POOL_MAX_CONN_IDLE_TIME_MS", defaultDBPoolMaxConnIdleTimeMS)
+	cfg.HealthCheckPeriod = envDurationMS("GO_API_DB_POOL_HEALTH_CHECK_PERIOD_MS", defaultDBPoolHealthCheckPeriodMS)
+
+	// Bound how long a single statement or an idle-in-transaction connection
+	// may hold a pool slot (issue #238) — a runaway query or a leaked
+	// transaction must not be able to stall the whole pool. Shared env vars
+	// with the Rust indexer (crates/indexer/src/config.rs) so both services
+	// agree; see #249 for database-level (role/cluster) coordination.
+	//
+	// These SETs run once per physical connection at AfterConnect time,
+	// before any transaction begins — safe for a direct DATABASE_URL
+	// connection. If DATABASE_URL is ever pointed at PgBouncer in
+	// transaction-pooling mode (today only PGBOUNCER_ADMIN_URL, the admin
+	// console, is used — see pgbouncer.go), this needs revisiting against
+	// PgBouncer's parameter-tracking behavior (#249, #256).
+	stmtTimeoutMS := envIntBounded("DB_STATEMENT_TIMEOUT_MS", defaultStatementTimeoutMS, statementTimeoutMinMS, statementTimeoutMaxMS)
+	idleTimeoutMS := envIntBounded("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", defaultIdleInTransactionTimeoutMS, statementTimeoutMinMS, statementTimeoutMaxMS)
+	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("SET statement_timeout = '%dms'", stmtTimeoutMS)); err != nil {
+			return fmt.Errorf("set statement_timeout: %w", err)
+		}
+		if _, err := conn.Exec(ctx, fmt.Sprintf("SET idle_in_transaction_session_timeout = '%dms'", idleTimeoutMS)); err != nil {
+			return fmt.Errorf("set idle_in_transaction_session_timeout: %w", err)
+		}
+		return nil
+	}
+
+	return cfg, nil
+}
+
+func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
+	cfg, err := buildPoolConfig(dsn, poolSize)
+	if err != nil {
+		return nil, err
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -394,6 +467,60 @@ func dbPoolSizeFromEnv() int32 {
 		slog.Warn("invalid GO_API_DB_POOL_SIZE; using default", "value", raw, "default", defaultDBPoolSize)
 	}
 	return defaultDBPoolSize
+}
+
+// envInt32 reads a non-negative int32 env var, falling back to def on
+// missing/invalid input (issue #238).
+func envInt32(key string, def int32) int32 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		slog.Warn("invalid env value; using default", "key", key, "value", raw, "default", def)
+		return def
+	}
+	return int32(n)
+}
+
+// envDurationMS reads a millisecond duration env var, falling back to defMS
+// on missing/invalid input (issue #238).
+func envDurationMS(key string, defMS int) time.Duration {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return time.Duration(defMS) * time.Millisecond
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		slog.Warn("invalid env value; using default", "key", key, "value", raw, "default_ms", defMS)
+		return time.Duration(defMS) * time.Millisecond
+	}
+	return time.Duration(n) * time.Millisecond
+}
+
+// envIntBounded reads an int env var clamped to [min, max], falling back to
+// def on missing/invalid input (issue #238). Mirrors the Rust indexer's
+// parse_bounded_u64 (crates/indexer/src/config.rs) so both services validate
+// DB_STATEMENT_TIMEOUT_MS/DB_IDLE_IN_TRANSACTION_TIMEOUT_MS the same way.
+func envIntBounded(key string, def, min, max int) int {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		slog.Warn("invalid env value; using default", "key", key, "value", raw, "default", def)
+		return def
+	}
+	if n < min || n > max {
+		slog.Warn("env value out of range; clamping", "key", key, "value", n, "min", min, "max", max)
+		if n < min {
+			return min
+		}
+		return max
+	}
+	return n
 }
 
 // runContractStatsRollupRefresh recomputes contract_stats_rollup on a fixed
