@@ -259,7 +259,8 @@ func main() {
 	handlers.SetInternalStatusDeps(pool, redisClient, hub)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB, redisClient, grpcClient))
+	mux.HandleFunc("GET /v1/health", handlers.Health())
+	mux.HandleFunc("GET /v1/ready", handlers.Ready(healthDB, redisClient, grpcClient))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
 	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)

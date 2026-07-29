@@ -49,27 +49,48 @@ type EventsLister interface {
 	ListEvents(ctx context.Context, in *gen.ListEventsRequest, opts ...grpc.CallOption) (*gen.ListEventsResponse, error)
 }
 
-// HealthChecks holds the per-dependency check results.
-type HealthChecks struct {
+// LivenessResponse is the JSON body for GET /v1/health.
+type LivenessResponse struct {
+	Status string `json:"status"`
+}
+
+// Health handles GET /v1/health — a liveness check (issue #243).
+//
+// Deliberately cheap: no dependency calls (no DB/Redis/gRPC), just confirms
+// the process is up and serving requests. This is what Kubernetes' liveness
+// probe should hit — restarting the pod never fixes an unreachable external
+// dependency, so liveness must not fail because Postgres/Redis/the gRPC
+// backend is down. For that, see Ready (GET /v1/ready).
+func Health() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, LivenessResponse{Status: "ok"})
+	}
+}
+
+// ReadyChecks holds the per-dependency check results.
+type ReadyChecks struct {
 	Postgres string `json:"postgres"`
 	Redis    string `json:"redis"`
 	GRPCAPI  string `json:"grpc_api"`
 }
 
-// HealthResponse is the JSON body for GET /v1/health.
-type HealthResponse struct {
-	Status     string       `json:"status"`
-	IndexerLag *int64       `json:"indexer_lag"`
-	Checks     HealthChecks `json:"checks"`
+// ReadyResponse is the JSON body for GET /v1/ready.
+type ReadyResponse struct {
+	Status     string      `json:"status"`
+	IndexerLag *int64      `json:"indexer_lag"`
+	Checks     ReadyChecks `json:"checks"`
 }
 
-// Health handles GET /v1/health.
+// Ready handles GET /v1/ready — a readiness check (issue #243).
 //
 // Runs Postgres, Redis, and gRPC checks concurrently with a shared
-// 3-second timeout. Returns 200 when all checks pass, 503 when any fail.
-// The indexer_lag field is populated from system_state when Postgres is
-// healthy and the chain tip is available in the cache; null otherwise.
-func Health(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.HandlerFunc {
+// 3-second timeout. Returns 200 when all checks pass, 503 when any fail —
+// this is what Kubernetes' readiness probe should hit, so a pod with a
+// broken dependency is pulled out of the Service's endpoint rotation
+// instead of continuing to receive traffic it can't serve. The indexer_lag
+// field is populated from system_state when Postgres is healthy and the
+// chain tip is available in the cache; null otherwise.
+func Ready(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		parentCtx := r.Context()
 
@@ -106,8 +127,8 @@ func Health(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.Ha
 
 		wg.Wait()
 
-		resp := HealthResponse{
-			Checks: HealthChecks{
+		resp := ReadyResponse{
+			Checks: ReadyChecks{
 				Postgres: resultString(pgErr),
 				Redis:    resultString(redisErr),
 				GRPCAPI:  resultString(grpcErr),
