@@ -46,23 +46,66 @@ security:
 paths:
   /v1/health:
     get:
-      summary: Health check
-      description: Returns indexer health status and last indexed ledger
+      summary: Liveness check
+      description: >-
+        Cheap process-liveness check (issue #243) — no dependency calls (no
+        Postgres/Redis/gRPC). Always 200 while the process is up and serving
+        requests. Intended for Kubernetes' liveness probe. For dependency
+        health (Postgres/Redis/gRPC), see GET /v1/ready instead.
       operationId: getHealth
       tags:
         - System
       security: []
       responses:
         "200":
-          description: Indexer is healthy or degraded
+          description: Process is alive
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthResponse"
+                $ref: "#/components/schemas/LivenessResponse"
         "429":
           $ref: "#/components/responses/TooManyRequestsIPOnly"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/ready:
+    get:
+      summary: Readiness check
+      description: >-
+        Verifies Postgres, Redis, and the gRPC backend concurrently, each
+        with a 3-second timeout (issue #243). Returns 503 if any dependency
+        check fails. Intended for Kubernetes' readiness probe / Fly's HTTP
+        service check, so a pod with a broken dependency is pulled out of
+        rotation instead of continuing to receive traffic it can't serve.
+      operationId: getReady
+      tags:
+        - System
+      security: []
+      responses:
+        "200":
+          description: All dependencies reachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "503":
+          description: >-
+            Either one or more dependencies is unreachable (ReadyResponse
+            body, status "degraded", the failing entry in checks set to
+            "error: ..."), or the server is shedding load under the global
+            concurrency cap (ErrorResponse body, Retry-After header set) —
+            the same outermost load-shedding behavior every endpoint shares.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/Retry-After"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ReadyResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
 
   /v1/events:
     get:
@@ -803,31 +846,53 @@ components:
           nullable: true
           description: Opaque cursor for next page (null if has_more is false)
 
-    HealthResponse:
+    LivenessResponse:
       type: object
       required:
         - status
-        - indexer
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: Always "ok" while the process is up — no dependency checks.
+
+    ReadyChecks:
+      type: object
+      required:
+        - postgres
+        - redis
+        - grpc_api
+      properties:
+        postgres:
+          type: string
+          description: '"ok" or "error: <message>"'
+        redis:
+          type: string
+          description: '"ok" or "error: <message>"'
+        grpc_api:
+          type: string
+          description: '"ok" or "error: <message>"'
+
+    ReadyResponse:
+      type: object
+      required:
+        - status
+        - indexer_lag
+        - checks
       properties:
         status:
           type: string
           enum: [ok, degraded]
-          description: Overall system status
-        indexer:
-          type: object
-          required:
-            - last_ledger_indexed
-          properties:
-            last_ledger_indexed:
-              type: integer
-              format: int64
-              nullable: true
-              description: Latest indexed ledger sequence
-            last_poll_at:
-              type: string
-              format: date-time
-              nullable: true
-              description: Timestamp of last successful indexer poll
+          description: '"degraded" when any dependency check in `checks` failed.'
+        indexer_lag:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            Ledgers behind chain tip, from system_state. Null when Postgres
+            is unreachable or the chain-tip cache hasn't been populated yet.
+        checks:
+          $ref: "#/components/schemas/ReadyChecks"
 
     IndexerStatsResponse:
       type: object
