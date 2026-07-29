@@ -7,6 +7,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeSlider is a deterministic in-memory stand-in for the Redis sliding
@@ -57,6 +60,76 @@ func TestPerIPRateLimit_ExceedingIPBlocked_OtherIPUnaffected(t *testing.T) {
 	// IP B is a distinct bucket and is unaffected by IP A's limit.
 	if code := do("5.6.7.8"); code != http.StatusOK {
 		t.Fatalf("request 1 for IP B: expected 200, got %d", code)
+	}
+}
+
+// TestPerIPRateLimit_RejectionRecordsPrometheusMetric verifies a 429 from the
+// per-IP limiter increments trident_ratelimit_rejections_total{limiter="per_ip"}
+// (issue #58).
+func TestPerIPRateLimit_RejectionRecordsPrometheusMetric(t *testing.T) {
+	handler := PerIPRateLimit(PerIPRateLimitConfig{
+		RPS:      1,
+		Window:   time.Second,
+		SliderFn: fakeSlider(t),
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	before := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("per_ip"))
+
+	do := func() int {
+		req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+		req.RemoteAddr = "8.8.8.8:1"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	do()         // allowed
+	code := do() // rejected
+
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("expected second request to be rejected, got %d", code)
+	}
+	if got := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("per_ip")); got != before+1 {
+		t.Errorf("per_ip rejections total: want %v, got %v", before+1, got)
+	}
+}
+
+// TestGlobalConcurrencyLimit_RejectionRecordsPrometheusMetric verifies a shed
+// request increments trident_ratelimit_rejections_total{limiter="global_concurrency"}.
+func TestGlobalConcurrencyLimit_RejectionRecordsPrometheusMetric(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := GlobalConcurrencyLimit(1)(slow)
+
+	before := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("global_concurrency"))
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+
+	<-started
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("global_concurrency")); got != before+1 {
+		t.Errorf("global_concurrency rejections total: want %v, got %v", before+1, got)
 	}
 }
 

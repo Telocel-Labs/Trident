@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -235,6 +236,7 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 
 			if !allowed {
 				rlRejected.Add(1)
+				metrics.RateLimitRejectionsTotal.WithLabelValues("per_key").Inc()
 				retryAfter := int64(math.Ceil(tcfg.Window.Seconds()))
 				w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
 				httputil.WriteErrorCtx(r.Context(), w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "rate limit exceeded")

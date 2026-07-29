@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -150,6 +152,26 @@ func TestTieredRateLimit_Rejects_Returns429WithHeaders(t *testing.T) {
 	}
 	if rec.Header().Get("X-RateLimit-Reset") == "" {
 		t.Error("X-RateLimit-Reset must be set on 429")
+	}
+}
+
+// TestTieredRateLimit_Rejects_RecordsPrometheusMetric verifies a 429 from the
+// per-key tiered limiter increments trident_ratelimit_rejections_total{limiter="per_key"}
+// (issue #58).
+func TestTieredRateLimit_Rejects_RecordsPrometheusMetric(t *testing.T) {
+	resetCounters()
+	before := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("per_key"))
+
+	cfg := RateLimitConfig{SliderFn: alwaysReject, Tiers: testTiers()}
+	mw := TieredRateLimit(cfg)(noop())
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(rec, apiKeyReq("key"))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("want 429, got %d", rec.Code)
+	}
+	if got := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("per_key")); got != before+1 {
+		t.Errorf("per_key rejections total: want %v, got %v", before+1, got)
 	}
 }
 
