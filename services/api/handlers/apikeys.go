@@ -18,6 +18,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// apiKeyQueryTimeout bounds the DB calls in the api-key admin handlers so a
+// runaway query can't hold a pool connection for the request's full budget
+// (issue #238).
+const apiKeyQueryTimeout = 5 * time.Second
+
 // APIKeyConfig wires the api-key handlers.
 type APIKeyConfig struct {
 	AdminKey string
@@ -116,9 +121,12 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			createdBy = &req.CreatedBy
 		}
 
+		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
+		defer cancel()
+
 		var id string
 		var createdAt time.Time
-		err := cfg.DB.QueryRow(r.Context(),
+		err := cfg.DB.QueryRow(ctx,
 			`INSERT INTO api_keys (key_hash, key_prefix, label, network, rate_limit_tier, created_by)
 			 VALUES ($1, $2, $3, $4, $5, $6)
 			 RETURNING id, created_at`,
@@ -153,7 +161,10 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
-		rows, err := cfg.DB.Query(r.Context(),
+		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
+		defer cancel()
+
+		rows, err := cfg.DB.Query(ctx,
 			`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
 			        last_used_at, request_count, revoked_at, created_at
 			 FROM api_keys
@@ -227,11 +238,14 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
+		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
+		defer cancel()
+
 		var k APIKeyResponse
 		var lastUsedAt *time.Time
 		var createdAt time.Time
 		var keyHash string
-		err := cfg.DB.QueryRow(r.Context(),
+		err := cfg.DB.QueryRow(ctx,
 			`UPDATE api_keys
 			 SET label           = COALESCE($2, label),
 			     rate_limit_tier = COALESCE($3, rate_limit_tier)
@@ -284,8 +298,11 @@ func DeleteAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
+		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
+		defer cancel()
+
 		var keyHash string
-		err := cfg.DB.QueryRow(r.Context(),
+		err := cfg.DB.QueryRow(ctx,
 			`UPDATE api_keys
 			 SET revoked_at = NOW()
 			 WHERE id = $1 AND revoked_at IS NULL

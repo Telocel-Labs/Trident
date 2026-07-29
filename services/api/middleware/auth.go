@@ -28,6 +28,12 @@ type DBAuthConfig struct {
 
 const authCacheTTL = 5 * time.Minute
 
+// authDBQueryTimeout bounds the DB fallback lookup in NewDBAuth (issue #238)
+// — this runs on nearly every request, so it gets a tight deadline rather
+// than the full request budget, matching handlers/status.go's convention for
+// other hot/lightweight DB reads.
+const authDBQueryTimeout = 2 * time.Second
+
 // ParseKeyHashes parses a comma-separated list of HMAC-SHA256 hex digests
 // (as stored in API_KEY_HASHES) into a set for O(1) lookup.
 func ParseKeyHashes(raw string) map[string]struct{} {
@@ -111,8 +117,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 
 			// ── 2. Database lookup ──────────────────────────────────────────
 			if cfg.DB != nil {
+				dbCtx, cancel := context.WithTimeout(r.Context(), authDBQueryTimeout)
+				defer cancel()
+
 				var id, network string
-				err := cfg.DB.QueryRow(r.Context(),
+				err := cfg.DB.QueryRow(dbCtx,
 					`SELECT id, network FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
 					dbHash,
 				).Scan(&id, &network)
