@@ -122,6 +122,7 @@ description is accurate. Keep this file honest by hand.
 | `RATE_LIMIT_FREE_RPS` | Optional | `10` | Requests/sec limit, free tier. |
 | `RATE_LIMIT_PRO_RPS` | Optional | `100` | Requests/sec limit, pro/standard tier. |
 | `RATE_LIMIT_INTERNAL_RPS` | Optional | `1000` | Requests/sec limit, internal tier. |
+| `TRUSTED_PROXY_ENABLED` | Optional | `false` | When `"true"`, per-IP rate limiting derives the client IP from the last hop of `X-Forwarded-For` instead of the socket peer (`services/api/middleware/abuse.go`). Only enable when the service sits behind a proxy that overwrites that header — otherwise a client can spoof it and evade per-IP limits. |
 | `RETENTION_AUDIT_LOG_DAYS` | Optional | `90` | Days to retain audit log rows. |
 | `RETENTION_PARSE_ERRORS_DAYS` | Optional | `30` | Days to retain parse-error rows. |
 | `RETENTION_WEBHOOK_DELIVERIES_DAYS` | Optional | `30` | Days to retain webhook delivery records. |
