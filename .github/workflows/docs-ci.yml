@@ -1,0 +1,40 @@
+name: Documentation CI
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'docs/site/**'
+      - '.github/workflows/docs-ci.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'docs/site/**'
+      - '.github/workflows/docs-ci.yml'
+
+jobs:
+  validate-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: 'sdk/typescript/package-lock.json'
+
+      - name: Validate TypeScript Code Examples
+        run: |
+          cd docs/site
+          npm install --no-save typescript @trident-indexer/sdk@file:../../sdk/typescript
+          npx tsc --noEmit
+
+      - name: Check for Broken Links
+        uses: lycheeverse/lychee-action@v1
+        with:
+          args: --verbose --no-progress 'docs/site/**/*.mdx' 'docs/site/**/*.json'
+          fail: true

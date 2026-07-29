@@ -1,0 +1,58 @@
+---
+title: "Prerequisites"
+description: "What you need before running a self-hosted Trident deployment."
+---
+
+## Required software
+
+| Software       | Minimum version | How to install                                  |
+|----------------|-----------------|-------------------------------------------------|
+| Docker         | 24+             | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
+| Docker Compose | v2 (`docker compose` command) | Included with Docker Desktop; on Linux: [docs.docker.com/compose/install](https://docs.docker.com/compose/install/) |
+| Git            | any             | [git-scm.com](https://git-scm.com/)            |
+
+<Note>
+No Rust, Go, or Node.js installation is required to **run** the stack. Everything runs inside Docker containers. You only need the native toolchains if you want to build from source for development.
+</Note>
+
+---
+
+## Infrastructure requirements
+
+### Minimum (testnet, single instance)
+
+| Resource | Minimum       | Recommended  |
+|----------|---------------|--------------|
+| CPU      | 2 vCPU        | 4 vCPU       |
+| RAM      | 2 GB          | 4 GB         |
+| Disk     | 20 GB SSD     | 100 GB SSD   |
+| Network  | 10 Mbit/s     | 100 Mbit/s   |
+
+### Postgres and Redis
+
+The Docker Compose stack includes Postgres and Redis containers. For production:
+- Use a managed Postgres service (e.g. Fly Postgres, RDS, Supabase) for easier backups and scaling
+- Use a managed Redis service (e.g. Upstash, Fly Redis) for persistence guarantees
+- If running your own containers, ensure volumes are backed up
+
+---
+
+## Network access
+
+The indexer needs outbound HTTPS access to the Soroban RPC endpoint:
+- **Testnet**: `https://soroban-testnet.stellar.org`
+- **Mainnet**: your chosen RPC provider
+
+The REST API listens on port `3000` by default. Expose it through a reverse proxy (nginx, Caddy, Fly.io) — never expose it directly to the internet without TLS.
+
+---
+
+## For production deployments
+
+Additional requirements for a production deployment:
+
+- **TLS certificate** — `fullchain.pem` and `privkey.pem` (the included nginx overlay expects these)
+- **DNS A record** pointing to your server's public IP
+- **Secrets management** — API key salt, admin key, and database passwords should be stored in a secrets manager (Fly secrets, AWS Secrets Manager, etc.), not in `.env` files committed to source control
+
+See the [Fly.io Deployment](/self-hosting/fly-io) guide for a complete production walkthrough.

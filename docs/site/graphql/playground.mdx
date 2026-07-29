@@ -1,0 +1,82 @@
+---
+title: "GraphQL Playground"
+description: "Explore and test the Trident GraphQL API interactively."
+---
+
+<Warning>
+**Pending #66.** The GraphQL Playground will be available once the GraphQL API ships in [issue #66](https://github.com/Telocel-Labs/Trident/issues/66).
+</Warning>
+
+## What is the Playground?
+
+The Trident GraphQL Playground is an interactive in-browser IDE for exploring the Trident GraphQL API. It provides:
+
+- **Schema explorer** — browse every type, field, and argument
+- **Query editor** — write and execute queries with autocomplete
+- **Variable editor** — supply typed variables for parameterised queries
+- **Response viewer** — see results formatted as JSON
+
+---
+
+## Accessing the Playground
+
+Once available, the playground will be at:
+
+```
+https://api.trident.telocel.com/playground
+```
+
+You will need your API key. Enter it in the **Headers** panel:
+
+```json
+{
+  "X-API-Key": "tdk_live_xxx"
+}
+```
+
+---
+
+## Example queries to try
+
+Once the playground is live, try these queries to get started:
+
+**Latest 5 events from any contract:**
+
+```graphql
+{
+  events(first: 5) {
+    edges {
+      node {
+        id
+        contractId
+        ledgerSequence
+        topics
+      }
+    }
+  }
+}
+```
+
+**Events from a specific contract:**
+
+```graphql
+{
+  events(
+    contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+    first: 10
+  ) {
+    edges {
+      node {
+        id
+        ledgerSequence
+        transactionHash
+        eventType
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+```

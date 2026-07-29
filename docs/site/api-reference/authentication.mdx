@@ -1,0 +1,116 @@
+---
+title: "Authentication"
+description: "How API key authentication works in Trident — the X-API-Key header, 401 vs 403 responses, and managing keys in self-hosted deployments."
+---
+
+Every Trident API endpoint (except `GET /v1/health`) requires authentication via an API key.
+
+---
+
+## The X-API-Key header
+
+Pass your API key as the `X-API-Key` header on every request:
+
+```bash
+curl https://api.trident.telocel.com/v1/events \
+  -H "X-API-Key: tdk_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+// The SDK sends X-API-Key automatically on every request.
+```
+
+<Warning>
+Never expose your API key in client-side code, public repositories, or browser environments. Always read it from an environment variable or a secrets manager.
+</Warning>
+
+---
+
+## Getting an API key
+
+### Hosted API
+
+Sign up at [trident.telocel.com](https://trident.telocel.com/signup). Free tier keys are issued immediately. Each key is tied to a rate-limit tier (see [Rate Limiting](/api-reference/rate-limiting)).
+
+### Self-hosted
+
+API keys in a self-hosted deployment are managed via environment variables:
+
+1. **Generate a salt** (do this once per deployment):
+   ```bash
+   openssl rand -hex 32
+   # → a3f7c2b1...
+   ```
+
+2. **Set the salt in `.env`**:
+   ```bash
+   API_KEY_SALT=a3f7c2b1...
+   ```
+
+3. **Hash your API keys** using HMAC-SHA256 with the salt:
+   ```bash
+   echo -n "your-raw-api-key" | openssl dgst -sha256 -hmac "a3f7c2b1..."
+   # → SHA2-256(stdin)= 9c1d3b...
+   ```
+
+4. **Set the hashes in `.env`**:
+   ```bash
+   API_KEY_HASHES=9c1d3b...,another-hash-here
+   ```
+
+The API compares incoming `X-API-Key` values (HMAC-hashed with `API_KEY_SALT`) against the list in `API_KEY_HASHES` using a constant-time comparison.
+
+---
+
+## Error responses
+
+### 401 Unauthorized
+
+Returned when the `X-API-Key` header is missing or the key value is not recognised.
+
+```json
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "missing or invalid API key"
+  }
+}
+```
+
+**Causes:**
+- Header omitted entirely
+- Key value is malformed (not the correct length/format)
+- Key has been revoked
+
+### 403 Forbidden
+
+Returned when the key is valid but does not have permission to access the requested resource or tier.
+
+```json
+{
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "this endpoint requires a Pro tier key"
+  }
+}
+```
+
+**Causes:**
+- Free-tier key attempting to access a Pro-only endpoint
+- Key's account is suspended
+
+---
+
+## Security recommendations
+
+- Store API keys in environment variables, never in source code
+- Rotate keys regularly (issue a new key, update deployments, revoke the old key)
+- Use different keys for development and production environments
+- In self-hosted mode, protect `API_KEY_SALT` with the same care as a database password — changing it invalidates all existing `API_KEY_HASHES`

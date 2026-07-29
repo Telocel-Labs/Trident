@@ -1,0 +1,63 @@
+---
+title: "Transport Selection"
+description: "How to choose between the REST and GraphQL transports when using the Trident SDK."
+---
+
+## Overview
+
+The Trident SDK currently uses the **REST API** transport by default for all `queryEvents`, `getEventById`, and `iterEvents` calls. GraphQL transport support will be added once the GraphQL API ships in [issue #66](https://github.com/Telocel-Labs/Trident/issues/66).
+
+WebSocket subscriptions (`subscribeToContract`) always use the WebSocket transport — they are not affected by the REST/GraphQL selection.
+
+---
+
+## REST transport (default)
+
+All SDK methods use the REST transport out of the box. No configuration is required.
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+  // transport defaults to REST
+});
+
+const result = await client.queryEvents({ limit: 10 });
+```
+
+---
+
+## GraphQL transport (coming in #66)
+
+Once the GraphQL API ships, you will be able to select GraphQL as the transport:
+
+```typescript
+// Future API — not yet available
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+  transport: "graphql", // coming in #66
+});
+```
+
+---
+
+## Which transport should I use?
+
+| Consideration         | REST                          | GraphQL                          |
+|-----------------------|-------------------------------|----------------------------------|
+| Current availability  | ✅ Available now              | 🔜 Coming in #66                |
+| Field selection       | Fixed response shape          | Select only the fields you need  |
+| Batch queries         | Separate requests             | Single document, multiple ops    |
+| Pagination            | `cursor` / `after` params     | Relay-style `Connection` types   |
+| Subscriptions         | Not applicable — both use WS  | Not applicable                   |
+| Tooling               | curl, any HTTP client         | GraphQL clients, Playground      |
+| Best for              | Simple scripts, CLIs, servers | Complex frontends, dashboards    |
+
+For most use cases, the REST transport is simpler and sufficient. Choose GraphQL when your application needs field-level selection or you are already using a GraphQL client library.

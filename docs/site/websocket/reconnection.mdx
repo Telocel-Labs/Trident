@@ -1,0 +1,107 @@
+---
+title: "Reconnection Behavior"
+description: "How the SDK handles WebSocket disconnects and how to implement reconnection in custom clients."
+---
+
+## SDK reconnection (automatic)
+
+The SDK reconnects automatically after unexpected disconnects using **exponential backoff**:
+
+| Attempt | Wait before reconnect |
+|---------|-----------------------|
+| 1st     | 500 ms                |
+| 2nd     | 1 000 ms              |
+| 3rd     | 2 000 ms              |
+| 4th     | 4 000 ms              |
+| 5th+    | 30 000 ms (max)       |
+
+The backoff resets to 500 ms after a successful reconnect that stays connected for more than 60 seconds.
+
+**Subscriptions are automatically re-registered** after every reconnect — you do not need to re-send subscription frames.
+
+Calling `subscription.unsubscribe()` cancels any pending reconnect immediately.
+
+### onError callback
+
+The `onError` callback is called when a reconnect attempt fails, but the subscription continues to retry:
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+const sub = client.subscribeToContract({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  onEvent: (event) => {
+    console.log("Event:", event.id);
+  },
+  onError: (err) => {
+    // Called on errors — the SDK will still attempt to reconnect
+    console.warn("WebSocket error (will retry):", err.message);
+  },
+});
+
+// Later:
+sub.unsubscribe(); // cancels all pending reconnects
+```
+
+---
+
+## Custom client reconnection
+
+If you are building a non-TypeScript client using raw WebSockets, implement your own reconnection loop:
+
+```python
+# Python example using websockets library
+import asyncio
+import json
+import websockets
+
+async def subscribe_with_reconnect(api_key: str, contract_id: str):
+    backoff = 0.5
+    max_backoff = 30.0
+
+    while True:
+        try:
+            url = f"wss://api.trident.telocel.com/ws?api_key={api_key}"
+            async with websockets.connect(url) as ws:
+                # Re-register subscription after every (re)connect
+                await ws.send(json.dumps({
+                    "type": "subscribe",
+                    "contractId": contract_id
+                }))
+
+                backoff = 0.5  # reset on successful connect
+                async for message in ws:
+                    data = json.loads(message)
+                    if data["type"] == "event":
+                        print("Event:", data["event"]["id"])
+        except websockets.ConnectionClosed as e:
+            print(f"Disconnected ({e.code}), reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+        except Exception as e:
+            print(f"Error: {e}, reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+asyncio.run(subscribe_with_reconnect("tdk_live_xxx", "CAAA..."))
+```
+
+---
+
+## What causes disconnects?
+
+| Cause                        | SDK behavior                                |
+|------------------------------|---------------------------------------------|
+| Network interruption         | Auto-reconnects with backoff               |
+| Server restart               | Auto-reconnects with backoff               |
+| Idle timeout (no traffic)    | Server sends `ping` every 30s to prevent this |
+| `unsubscribe()` called       | Connection closed, no reconnect            |
+| Invalid subscription frame   | Server sends `error` message, stays connected |
+| Rate limit exceeded          | Server closes with code `4029`, SDK reconnects after backoff |
+| Invalid API key              | Server closes with code `4001`, SDK calls `onError` and stops retrying |

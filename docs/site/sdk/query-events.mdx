@@ -1,0 +1,136 @@
+---
+title: "queryEvents()"
+description: "Query historical Soroban events with optional filtering by contract, topic, and ledger range."
+---
+
+## Signature
+
+```typescript
+queryEvents(params: QueryEventsParams): Promise<PaginatedEvents>
+```
+
+Returns a single page of events matching the given filters. Results are cursor-paginated — use `iterEvents` to drain all pages automatically.
+
+---
+
+## Parameters
+
+| Parameter    | Type     | Required | Description                                                                |
+|--------------|----------|----------|----------------------------------------------------------------------------|
+| `contractId` | `string` |          | Stellar contract address (C… strkey, 56 chars).                           |
+| `topic0`     | `string` |          | Filter by the first event topic (e.g. `"transfer"`, `"mint"`).            |
+| `topic1`     | `string` |          | Filter by the second event topic.                                          |
+| `ledgerFrom` | `number` |          | Only return events from this ledger sequence onward (inclusive).           |
+| `ledgerTo`   | `number` |          | Only return events up to and including this ledger sequence.               |
+| `after`      | `string` |          | Opaque pagination cursor from a previous `queryEvents` response.          |
+| `limit`      | `number` |          | Max events per page. Range: 1–200. Server default: 50.                    |
+
+---
+
+## Returns
+
+`Promise<PaginatedEvents>`
+
+```typescript
+interface PaginatedEvents {
+  /** Events matching the query on this page. */
+  events: SorobanEvent[];
+  /** Pass as `after` on the next call to fetch the next page. Null when no more pages exist. */
+  cursor: string | null;
+  /** True when more pages are available. */
+  hasMore: boolean;
+}
+```
+
+---
+
+## Throws
+
+`TridentError` on:
+- Network failure (`code: "INTERNAL"`)
+- Invalid API key (`code: "UNAUTHORIZED"`)
+- Rate limit exceeded (`code: "RATE_LIMITED"`)
+- Invalid parameters (`code: "INVALID_ARGUMENT"`)
+
+---
+
+## Examples
+
+### Basic query
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { PaginatedEvents } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+const result: PaginatedEvents = await client.queryEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  topic0: "transfer",
+  limit: 50,
+});
+
+console.log(`Found ${result.events.length} events`);
+```
+
+### Filter by ledger range
+
+```typescript
+const result = await client.queryEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  ledgerFrom: 12_000_000,
+  ledgerTo: 12_001_000,
+  limit: 200,
+});
+```
+
+### Manual pagination
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { PaginatedEvents, SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+let cursor: string | undefined;
+const allEvents: SorobanEvent[] = [];
+
+do {
+  const page: PaginatedEvents = await client.queryEvents({
+    contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    after: cursor,
+    limit: 200,
+  });
+  allEvents.push(...page.events);
+  cursor = page.cursor ?? undefined;
+} while (cursor);
+
+console.log(`Total: ${allEvents.length}`);
+```
+
+### Auto-paginate with iterEvents
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+for await (const event of client.iterEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  topic0: "transfer",
+})) {
+  console.log(event.id, event.transactionHash);
+}
+```

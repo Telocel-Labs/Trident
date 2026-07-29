@@ -1,0 +1,71 @@
+---
+title: "Connecting"
+description: "How to open a WebSocket connection to the Trident real-time event stream."
+---
+
+## Endpoint
+
+```
+GET /ws
+```
+
+Establishes a WebSocket connection for real-time Soroban event delivery. Send a subscription frame after the connection opens to start receiving events.
+
+---
+
+## Connection URL
+
+```
+wss://api.trident.telocel.com/ws
+```
+
+For self-hosted deployments:
+
+```
+ws://localhost:3000/ws
+```
+
+---
+
+## Authentication
+
+Pass your API key as a query parameter on the initial HTTP upgrade request:
+
+```
+wss://api.trident.telocel.com/ws?api_key=tdk_live_xxx
+```
+
+<Warning>
+Passing the key as a query parameter is unavoidable for WebSocket connections (browsers do not allow custom headers during the WebSocket handshake). Do not log or expose WebSocket connection URLs, as they contain the key.
+</Warning>
+
+### Alternative: send key in first message
+
+Some environments cannot set query parameters on WebSocket URLs. In that case, omit the query parameter and send your API key as the first message after connecting:
+
+```json
+{
+  "type": "auth",
+  "apiKey": "tdk_live_xxx"
+}
+```
+
+The server will respond with `{"type": "auth_ok"}` before processing any subscription frames.
+
+---
+
+## Connection limits
+
+| Tier     | Max concurrent WebSocket connections |
+|----------|--------------------------------------|
+| Free     | 5 per API key                        |
+| Pro      | 100 per API key                      |
+| Internal | 10 000 per API key                   |
+
+In self-hosted mode, the global cap is set by `MAX_WS_CONNECTIONS` (default: 1000).
+
+---
+
+## Next steps
+
+Once connected, send a [Subscription frame](/websocket/subscription-format) to begin receiving events.

@@ -1,0 +1,76 @@
+---
+title: "Subscription Format"
+description: "The JSON payload format for subscribing to contract events over a Trident WebSocket connection."
+---
+
+## Subscribing to a contract
+
+After the WebSocket connection is open, send a subscription frame to begin receiving events:
+
+```json
+{
+  "type": "subscribe",
+  "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  "topic0": "transfer"
+}
+```
+
+### Subscription frame schema
+
+| Field        | Type     | Required | Description                                                         |
+|--------------|----------|----------|---------------------------------------------------------------------|
+| `type`       | `string` | ✅       | Must be `"subscribe"`.                                              |
+| `contractId` | `string` | ✅       | Stellar contract address (C… strkey, 56 chars) to subscribe to.   |
+| `topic0`     | `string` |          | Optional topic filter applied server-side. Only events where the first topic matches this value are delivered. |
+
+### Server acknowledgement
+
+On a valid subscription, the server responds immediately:
+
+```json
+{
+  "type": "subscribed",
+  "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  "topic0": "transfer"
+}
+```
+
+On an invalid subscription (e.g. malformed `contractId`):
+
+```json
+{
+  "type": "error",
+  "code": "INVALID_ARGUMENT",
+  "message": "contractId must be a valid Soroban contract strkey"
+}
+```
+
+---
+
+## Multiple subscriptions
+
+A single WebSocket connection supports **multiple simultaneous subscriptions**. Send additional subscription frames for each contract:
+
+```json
+{ "type": "subscribe", "contractId": "CAAA...contract1" }
+{ "type": "subscribe", "contractId": "CBBB...contract2", "topic0": "mint" }
+```
+
+Each subscription is independent — events from all subscribed contracts arrive on the same connection, tagged with their `contractId`.
+
+---
+
+## Unsubscribing
+
+To stop receiving events from a specific contract without closing the connection:
+
+```json
+{
+  "type": "unsubscribe",
+  "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+}
+```
+
+The server responds with `{"type": "unsubscribed", "contractId": "..."}`.
+
+To stop all subscriptions, close the WebSocket connection.

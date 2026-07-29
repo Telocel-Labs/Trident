@@ -1,0 +1,76 @@
+---
+title: "Upgrading & Migrations"
+description: "Migration strategies, schema updates, and version compatibility guidelines for self-hosted Trident deployments."
+---
+
+## Overview
+
+When upgrading a self-hosted Trident deployment, care must be taken to ensure zero downtime for API consumers and data integrity across database migrations.
+
+---
+
+## Upgrade Workflow
+
+Always perform upgrades in the following sequential order:
+
+```
+1. Run Database Migrations ──► 2. Deploy Indexer & gRPC API ──► 3. Deploy Go API / SDK updates
+```
+
+---
+
+## Step 1: Database Migrations
+
+Trident uses goose / SQL-based migrations located in `database/migrations/`.
+
+Before deploying new binary releases, apply pending schema migrations against PostgreSQL:
+
+```bash
+# Using Docker
+docker run --rm -v $(pwd)/database/migrations:/migrations \
+  --net=host \
+  migrate/migrate \
+  -path=/migrations \
+  -database "$DATABASE_URL" up
+```
+
+Alternatively, `make dev` or standard Docker Compose setup automatically executes migrations prior to starting services.
+
+---
+
+## Step 2: Service Updates
+
+Update container images for the core services:
+
+```bash
+docker compose pull indexer grpc-api api
+docker compose up -d --no-deps indexer grpc-api
+```
+
+Verify indexer stability via metrics/health endpoint:
+```bash
+curl http://localhost:8080/healthz
+```
+
+---
+
+## Step 3: API & Front Office Updates
+
+Once the indexer and gRPC backend are running cleanly, update the Go API:
+
+```bash
+docker compose up -d --no-deps api
+```
+
+Verify public API health:
+```bash
+curl http://localhost:3000/v1/health
+```
+
+---
+
+## Breaking Changes & Rollbacks
+
+- Database migrations are designed to be backwards compatible for at least one minor release.
+- If a rollback is required, roll back service versions before reverting database migrations.
+- Refer to the [Changelog](/changelog) for specific release upgrade notes.

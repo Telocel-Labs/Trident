@@ -1,0 +1,99 @@
+---
+title: "TridentClient"
+description: "Constructor options and configuration for the TridentClient TypeScript SDK."
+---
+
+## Installation
+
+```bash
+npm install @trident-indexer/sdk
+# or
+yarn add @trident-indexer/sdk
+# or
+pnpm add @trident-indexer/sdk
+```
+
+---
+
+## Constructor
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient(config: TridentClientConfig);
+```
+
+---
+
+## TridentClientConfig
+
+| Option          | Type                                    | Required | Description                                                                      |
+|-----------------|-----------------------------------------|----------|----------------------------------------------------------------------------------|
+| `apiUrl`        | `string`                                | ✅       | Base URL of the Trident REST API. No trailing slash. Example: `https://api.trident.telocel.com` |
+| `apiKey`        | `string`                                | ✅       | API key sent as the `X-API-Key` header on every request.                        |
+| `network`       | `"mainnet" \| "testnet" \| "futurenet"` | ✅       | Stellar network to query. Included in WebSocket subscription frames.            |
+| `webSocketImpl` | `WebSocketConstructor`                  |          | Custom WebSocket implementation. Defaults to the global `WebSocket` (or `ws` on Node 18/20). |
+
+### webSocketImpl
+
+By default, the SDK uses:
+- **Browsers and Node.js 21+**: global `WebSocket`
+- **Node.js 18/20**: dynamically imports the `ws` package — install it separately: `npm install ws`
+
+Override with a custom implementation for testing or specific environments:
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import WebSocket from "ws";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+  webSocketImpl: WebSocket,
+});
+```
+
+---
+
+## Full example
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+// Query events
+const result = await client.queryEvents({ limit: 10 });
+console.log(result.events.length);
+
+// Get a single event
+const event = await client.getEventById({
+  id: "550e8400-e29b-41d4-a716-446655440000",
+});
+console.log(event.transactionHash);
+
+// Subscribe to live events
+const sub = client.subscribeToContract({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  onEvent: (e) => console.log(e.id),
+});
+sub.unsubscribe();
+```
+
+---
+
+## Methods
+
+| Method                  | Returns                    | Description                                 |
+|-------------------------|----------------------------|---------------------------------------------|
+| `queryEvents(params)`   | `Promise<PaginatedEvents>` | List events with optional filtering.        |
+| `getEventById(params)`  | `Promise<SorobanEvent>`    | Fetch a single event by UUID.               |
+| `iterEvents(params, options?)` | `AsyncIterable<SorobanEvent>` | Auto-paginating event iterator.  |
+| `subscribeToContract(params)` | `Subscription`       | Open real-time WebSocket subscription.      |
+
+See the individual pages for each method for full parameter and return type documentation.
