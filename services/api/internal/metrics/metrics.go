@@ -16,6 +16,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -76,7 +77,100 @@ var (
 		Name: "trident_ratelimit_rejections_total",
 		Help: "Total requests rejected by a rate limiter, by limiter.",
 	}, []string{"limiter"}) // limiter: per_key|per_ip|global_concurrency
+
+	// DB pool saturation metrics (issue #238), sourced from pgxpool.Pool.Stat()
+	// by PollDBPool. All exposed as Gauges — Stat() itself only returns
+	// point-in-time cumulative totals (not deltas), which Set() reflects
+	// directly; Prometheus rate()/increase() work the same over a
+	// monotonically-increasing Gauge as over a Counter.
+	DBPoolMaxConns = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_max_conns",
+		Help: "Configured maximum size of the Postgres connection pool.",
+	})
+	DBPoolTotalConns = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_total_conns",
+		Help: "Current total connections in the Postgres pool (idle + in-use + being established).",
+	})
+	DBPoolAcquiredConns = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_acquired_conns",
+		Help: "Connections currently acquired (in use) from the Postgres pool.",
+	})
+	DBPoolIdleConns = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_idle_conns",
+		Help: "Idle connections currently available in the Postgres pool.",
+	})
+	DBPoolConstructingConns = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_constructing_conns",
+		Help: "Connections currently being established for the Postgres pool.",
+	})
+	DBPoolAcquireCount = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_acquire_count",
+		Help: "Cumulative number of successful connection acquisitions from the Postgres pool.",
+	})
+	DBPoolEmptyAcquireCount = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_empty_acquire_count",
+		Help: "Cumulative number of acquisitions that had to wait because the Postgres pool had no idle connection — a direct saturation signal.",
+	})
+	DBPoolCanceledAcquireCount = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_canceled_acquire_count",
+		Help: "Cumulative number of connection acquisitions canceled before completion (e.g. caller's context expired while waiting).",
+	})
+	DBPoolAcquireDurationSeconds = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_acquire_duration_seconds",
+		Help: "Cumulative time spent acquiring connections from the Postgres pool, in seconds.",
+	})
+	DBPoolEmptyAcquireWaitSeconds = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_empty_acquire_wait_seconds",
+		Help: "Cumulative time acquisitions spent waiting for a connection because the Postgres pool was empty, in seconds — a direct saturation signal.",
+	})
+	DBPoolNewConnsCount = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_new_conns_count",
+		Help: "Cumulative number of new connections established for the Postgres pool.",
+	})
+	DBPoolMaxIdleDestroyCount = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_max_idle_destroy_count",
+		Help: "Cumulative number of connections destroyed for exceeding MaxConnIdleTime.",
+	})
+	DBPoolMaxLifetimeDestroyCount = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_db_pool_max_lifetime_destroy_count",
+		Help: "Cumulative number of connections destroyed for exceeding MaxConnLifetime.",
+	})
 )
+
+// PollDBPool periodically snapshots pool.Stat() into the DB pool gauges
+// above (issue #238) until ctx is done. Runs once immediately so the gauges
+// are populated before the first tick.
+func PollDBPool(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) {
+	report := func() {
+		stat := pool.Stat()
+		DBPoolMaxConns.Set(float64(stat.MaxConns()))
+		DBPoolTotalConns.Set(float64(stat.TotalConns()))
+		DBPoolAcquiredConns.Set(float64(stat.AcquiredConns()))
+		DBPoolIdleConns.Set(float64(stat.IdleConns()))
+		DBPoolConstructingConns.Set(float64(stat.ConstructingConns()))
+		DBPoolAcquireCount.Set(float64(stat.AcquireCount()))
+		DBPoolEmptyAcquireCount.Set(float64(stat.EmptyAcquireCount()))
+		DBPoolCanceledAcquireCount.Set(float64(stat.CanceledAcquireCount()))
+		DBPoolAcquireDurationSeconds.Set(stat.AcquireDuration().Seconds())
+		DBPoolEmptyAcquireWaitSeconds.Set(stat.EmptyAcquireWaitTime().Seconds())
+		DBPoolNewConnsCount.Set(float64(stat.NewConnsCount()))
+		DBPoolMaxIdleDestroyCount.Set(float64(stat.MaxIdleDestroyCount()))
+		DBPoolMaxLifetimeDestroyCount.Set(float64(stat.MaxLifetimeDestroyCount()))
+	}
+
+	report()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report()
+		}
+	}
+}
 
 // Port returns the port the metrics server listens on (METRICS_PORT, or
 // DefaultPort).
