@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
@@ -14,6 +15,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// schemaQueryTimeout bounds the DB calls in ContractEventSchemas so a
+// runaway query can't hold a pool connection for the request's full budget
+// (issue #238).
+const schemaQueryTimeout = 5 * time.Second
 
 const unknownSchemaCodeHash = "unknown"
 
@@ -94,19 +100,22 @@ func ContractEventSchemas(db SchemaRegistryDB) http.HandlerFunc {
 			return
 		}
 
+		ctx, cancel := context.WithTimeout(r.Context(), schemaQueryTimeout)
+		defer cancel()
+
 		network := middleware.NetworkFromContext(r.Context())
-		codeHash, err := resolveContractCodeHash(r.Context(), db, contractID, network)
+		codeHash, err := resolveContractCodeHash(ctx, db, contractID, network)
 		if err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "failed to load contract schema")
 			return
 		}
 
-		schemas, err := observeContractSchemas(r.Context(), db, contractID, network)
+		schemas, err := observeContractSchemas(ctx, db, contractID, network)
 		if err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "failed to load contract schema")
 			return
 		}
-		if err := persistContractSchemas(r.Context(), db, contractID, network, codeHash, schemas); err != nil {
+		if err := persistContractSchemas(ctx, db, contractID, network, codeHash, schemas); err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "failed to persist contract schema")
 			return
 		}
