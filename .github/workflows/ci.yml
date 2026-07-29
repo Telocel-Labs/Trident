@@ -660,7 +660,7 @@ jobs:
 
       - name: Build the reference token contract
         working-directory: contracts
-        run: cargo build --release --target wasm32v1-none -p token
+        run: cargo build --release --target wasm32v1-none -p trident-reference-token
 
       - name: Show sccache stats
         if: always()
@@ -740,7 +740,7 @@ jobs:
           RECIPIENT_ADDR=$(stellar keys address recipient)
 
           CONTRACT_ID=$(stellar contract deploy \
-            --wasm contracts/target/wasm32v1-none/release/token.wasm \
+            --wasm contracts/target/wasm32v1-none/release/trident_reference_token.wasm \
             --source admin \
             --network local)
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"

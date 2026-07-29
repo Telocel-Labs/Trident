@@ -14,7 +14,10 @@ COPY services/api/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /api .
 
 # ── runtime ──────────────────────────────────────────────────────────────────
-FROM alpine:3.19@sha256:c5b1261d6d3e43071626931fc004f70149baeba2c8ec672bd4f27761f8e1ad6b AS runtime
+# Was pinned to a stale alpine:3.19 digest, so the runtime image kept
+# shipping musl (CVE-2025-26519) and libcrypto3 (CVE-2024-6119) versions
+# that upstream had already patched. 3.22 clears both (issue #371).
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS runtime
 
 RUN adduser -S -u 1001 trident
 
