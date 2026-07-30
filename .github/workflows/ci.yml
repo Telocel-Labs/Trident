@@ -120,6 +120,26 @@ jobs:
       - name: go test (race)
         run: go test -race ./...
 
+      - name: REST handler coverage
+        run: |
+          go test ./handlers -coverprofile=handlers.out
+          go tool cover -func=handlers.out \
+            | awk '
+              /handlers\/events.go:.*ListEvents/ || /handlers\/events.go:.*GetEvent/ || /handlers\/health.go:.*Health/ {
+                coverage = $NF
+                sub(/%$/, "", coverage)
+                print
+                if ((coverage + 0) < 80) {
+                  failed = 1
+                }
+              }
+              END {
+                if (failed) {
+                  print "REST handler coverage must stay at or above 80% for ListEvents, GetEvent, and Health"
+                  exit 1
+                }
+              }'
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@3cfe3a4abbb849e10058ce4af15d205b6da42804 # v4.0.0
         with:
