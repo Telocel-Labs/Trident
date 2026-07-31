@@ -3,7 +3,7 @@
 
 services:
   postgres:
-    image: postgres:15-alpine@sha256:2d4c9e0e6b3cade6c0a5e0a8c0a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6
+    image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -38,7 +38,14 @@ services:
   # for the prepared-statement / session-variable caveats this implies.
   # ---------------------------------------------------------------------------
   pgbouncer:
-    image: pgbouncer/pgbouncer:1.22@sha256:7c8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f
+    # NOTE: pgbouncer/pgbouncer never published a 1.22 tag — its newest is
+    # 1.15.0 — and the digest previously pinned here did not exist either, so
+    # this service could not start at all (issue #371). Pinned to the real
+    # 1.15.0. If a newer PgBouncer is needed, edoburu/pgbouncer tracks
+    # upstream far more closely (v1.25.x), but it takes a different
+    # configuration contract than the PGBOUNCER_* variables set below, so
+    # switching is a deliberate change rather than a retag.
+    image: pgbouncer/pgbouncer:1.15.0@sha256:aa8a38b7b33e5fe70c679053f97a8e55c74d52b00c195f0880845e52b50ce516
     environment:
       DATABASES_HOST: postgres
       DATABASES_PORT: 5432

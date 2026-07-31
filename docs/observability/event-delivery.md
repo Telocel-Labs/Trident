@@ -43,6 +43,8 @@ pass resumes at the failed row rather than skipping past it.
 | `trident_indexer_rpc_timeouts_total` | counter | RPC calls aborted by the connect or request timeout |
 | `trident_indexer_rpc_active_endpoint` | gauge | Index of the RPC endpoint in use, `0` = primary |
 | `trident_indexer_rpc_failovers_total` | counter | Switches to a different RPC endpoint |
+| `trident_indexer_rpc_call_duration_seconds{method,endpoint}` | histogram | RPC call latency, labelled by method (`getEvents`, `getLedgers`, `getTransaction`, `getLedgerEntries`) and endpoint pool index. Recorded for every call regardless of outcome, so `_count` also gives per-method/per-endpoint call volume (issue #294) |
+| `trident_indexer_rpc_errors_total{method,error_type}` | counter | RPC failures labelled by method and `error_type`: `timeout`, `rate_limited`, `http_4xx`, `http_5xx`, `invalid_cursor`, `rpc_error`, `empty_result`, or `transport` (issue #294) |
 
 ## Alerting
 
@@ -65,3 +67,37 @@ condition. Tune both together.
 A sustained non-zero `trident_indexer_rpc_active_endpoint` is worth alerting on
 as well: the indexer is running on a fallback provider and the primary has not
 recovered.
+
+### RPC provider health (issue #294)
+
+`trident_indexer_rpc_call_duration_seconds` and `trident_indexer_rpc_errors_total`
+exist to answer one question ops otherwise has to guess at: is ingest lag
+because the chain is quiet, or because the RPC provider is degraded? The
+`method` and `error_type`/`endpoint` labels let a dashboard or query break a
+generic "RPC is slow" alert down into "which call, against which endpoint,
+failing how" without grepping logs.
+
+The `error_type` label is deliberately coarse (not the raw upstream message)
+so it's alertable and doesn't blow up cardinality:
+
+| `error_type` | Meaning |
+|---|---|
+| `timeout` | Connect or request timeout (`RpcHttpSettings`, issue #214) |
+| `rate_limited` | HTTP 429 |
+| `http_4xx` | Non-429 4xx response |
+| `http_5xx` | 5xx response |
+| `invalid_cursor` | JSON-RPC error whose message mentions the pagination cursor |
+| `rpc_error` | Any other JSON-RPC-level error |
+| `empty_result` | 200 OK with neither `result` nor `error` set |
+| `transport` | Non-timeout `reqwest` failure (connection reset, DNS, TLS, decode) |
+
+Full rule definitions live in `observability/rpc-alerts.yml`:
+
+- `TridentRPCHighErrorRate` — RPC error ratio above 10% for 5m (page).
+- `TridentRPCHighLatency` — p95 latency above 5s for a method, for 10m (ticket).
+- `TridentRPCFailoverActive` — running on a non-primary endpoint for 5m+ (ticket).
+- `TridentRPCRateLimited` — sustained `rate_limited` errors for 5m+ (ticket).
+
+A Grafana dashboard covering latency percentiles, per-method/endpoint call
+volume, error rate by type, and active-endpoint/failover status is in
+`observability/dashboards/rpc-health.json`.

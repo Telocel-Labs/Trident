@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Depo-dev/trident/services/api/gen"
+	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
@@ -47,8 +47,14 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(req.IDs) == 0 {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "ids must be a non-empty array")
+		return
+	}
+
 	// The limit applies to the ids as sent, duplicates included: a request
 	// over the cap is a client bug either way (issue #228).
+
 	if len(req.IDs) > batchEventsMaxIDs {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
 			fmt.Sprintf("maximum %d IDs per request", batchEventsMaxIDs))
@@ -94,7 +100,7 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		found bool
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
 	results := make([]result, len(ids))
@@ -103,7 +109,9 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
-			event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id})
+			event, err := grpcclient.CallWithRetry(ctx, 1, func(ctx context.Context) (*gen.Event, error) {
+				return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id})
+			})
 			if err != nil {
 				results[i] = result{id: id, found: false}
 				return

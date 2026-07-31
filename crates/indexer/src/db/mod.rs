@@ -742,6 +742,8 @@ pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertStat
     Ok(crate::alerting::AlertState {
         last_alert_at: row.0,
         alert_fired: row.1,
+        rpc_degraded_fired: false,
+        rpc_degraded_last_alert_at: None,
     })
 }
 

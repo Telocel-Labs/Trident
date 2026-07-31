@@ -12,7 +12,13 @@ primary_region = "iad"
   GRPC_ADDR = "trident-grpc-api.internal:50051"
 
 # Secrets (set via: fly secrets set -a trident-api KEY=value)
-# Required: DATABASE_URL, REDIS_URL, API_KEY_SALT, ADMIN_API_KEY, NETWORK
+# Required: DATABASE_URL, REDIS_URL, API_KEY_SALT (services/api/middleware/auth.go
+# HMACs incoming keys with this), ADMIN_API_KEY (guards /v1/admin/*)
+# Required for the legacy env-var auth path: API_KEY_HASHES (skip only if all
+# API keys are issued through the DB-backed /v1/admin/keys flow instead)
+# Optional: NETWORK (label only, used by GET /v1/stats/contracts response),
+# STELLAR_RPC_URL (enables POST /v1/admin/contracts/{id}/call),
+# PGBOUNCER_ADMIN_URL (enables GET /v1/admin/db pool stats)
 
 [http_service]
   internal_port        = 3000

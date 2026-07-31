@@ -53,6 +53,33 @@ global:
           property: ADMIN_API_KEY
 
 # ---------------------------------------------------------------------------
+# Database migrations (issue #308) — runs as a Helm pre-install/pre-upgrade
+# hook Job before any app Deployment rolls out, so the schema is always
+# migrated ahead of the app. Backed by `sqlx migrate run` (see
+# database/Dockerfile), which tracks applied migrations in the database's
+# own _sqlx_migrations table, so re-running it on every upgrade is a safe
+# no-op for migrations already applied. Set enabled: false if migrations
+# are managed by an external process instead (see docs/kubernetes.md).
+# ---------------------------------------------------------------------------
+migrations:
+  enabled: true
+  image:
+    repository: ghcr.io/telocel-labs/trident-migrate
+    tag: latest
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Matches the `useradd --system --uid 1001` in database/Dockerfile.
+  securityContextUid: 1001
+
+# ---------------------------------------------------------------------------
 # Indexer — 1 replica (distributed cursor not yet supported)
 # ---------------------------------------------------------------------------
 indexer:

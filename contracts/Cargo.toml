@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["token"]
+members = ["counter", "escrow", "nft", "token"]
+
+# counter/escrow/nft inherit soroban-sdk from here via `workspace = true`.
+# The block was missing, so those three could not load as workspace members
+# at all — which is why only `token` was listed and built (issue #371).
+[workspace.dependencies]
+soroban-sdk = "26.1.0"
 
 # Deliberately not a member of the root workspace (root Cargo.toml): Soroban
 # contracts build for wasm32-unknown-unknown with #![no_std] and their own

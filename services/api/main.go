@@ -40,6 +40,16 @@ const contractStatsRollupRefreshInterval = 60 * time.Second
 // (issue #238).
 const dbPoolMetricsPollInterval = 15 * time.Second
 
+// Usage rollup: re-aggregate audit_log into usage_rollup every 5 minutes,
+// covering the last 48h so late-arriving audit rows (the writer batches
+// asynchronously) and the UTC day boundary are always caught by the next run.
+const (
+	usageRollupInterval        = 5 * time.Minute
+	usageRollupLookback        = 48 * time.Hour
+	usageRollupRetention       = 400 * 24 * time.Hour
+	usageRollupCleanupInterval = 24 * time.Hour
+)
+
 const defaultDBPoolSize = 5
 
 // Pool lifecycle defaults (issue #238). Applied in buildPoolConfig unless
@@ -220,6 +230,16 @@ func main() {
 		go metrics.PollDBPool(ctx, pool, dbPoolMetricsPollInterval)
 	}
 
+	// Re-aggregate audit_log into usage_rollup so GET /v1/usage reads a
+	// pre-aggregated table, and bound that table's growth. Both loops and
+	// their four interval constants already existed but were never started —
+	// RunUsageRollupLoop's own doc comment says it is "called from main() as
+	// a background goroutine", and it was not.
+	if pool != nil {
+		go handlers.RunUsageRollupLoop(ctx, pool, usageRollupInterval, usageRollupLookback)
+		go runUsageRollupCleanup(ctx, pool)
+	}
+
 	adminCfg := handlers.AdminConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
 		DB:       pool,
@@ -299,7 +319,7 @@ func main() {
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
-	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
+	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
@@ -645,4 +665,34 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 			}
 		}
 	}()
+}
+
+// runUsageRollupCleanup bounds usage_rollup storage by deleting daily buckets
+// older than usageRollupRetention (~13 months) — generous relative to the
+// 90-day audit_log retention since usage_rollup is O(keys * days), not
+// O(requests).
+func runUsageRollupCleanup(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(usageRollupCleanupInterval)
+	defer ticker.Stop()
+
+	cleanup := func() {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(cleanupCtx,
+			`DELETE FROM usage_rollup WHERE period_start < NOW() - $1::interval`,
+			fmt.Sprintf("%d seconds", int64(usageRollupRetention.Seconds())),
+		); err != nil {
+			slog.Warn("usage rollup cleanup failed", "err", err)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			cleanup()
+			return
+		case <-ticker.C:
+			cleanup()
+		}
+	}
 }

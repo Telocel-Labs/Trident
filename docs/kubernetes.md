@@ -51,6 +51,11 @@ helm install trident ./helm/trident \
   --set grpcApi.image.tag=v0.1.0
 ```
 
+This first runs a migration Job to bring the schema up to date, then rolls
+out the app Deployments only once it succeeds — see
+[Database migrations](#migrations) below for details, including how to skip
+it if migrations are managed externally.
+
 ### 4. Verify the deployment
 
 ```bash
@@ -68,6 +73,84 @@ trident-grpc-api-6c8b7d5f4-klmno       1/1     Running   0          2m
 trident-indexer-5b4d9c3a2-pqrst        1/1     Running   0          2m
 trident-nginx-4a3c8b7d6-uvwxy          1/1     Running   0          2m
 ```
+
+## Database migrations {#migrations}
+
+Before any app Deployment (go-api/grpc-api/indexer) rolls out, `helm
+install`/`helm upgrade` runs a `pre-install,pre-upgrade` Helm hook Job
+(`helm/trident/templates/migration-job.yaml`) that applies
+`database/migrations/*.sql` against `DATABASE_URL` (read from
+`global.existingSecret`, same as every other component). This guarantees a
+deterministic schema-before-app ordering (issue #308) — you never get app
+pods starting against a schema they don't expect.
+
+### Why this is safe to run on every install/upgrade
+
+The Job's image (built from `database/Dockerfile`) runs `sqlx migrate run
+--source /migrations`, not a raw re-apply loop. `sqlx migrate run` records
+every applied migration in the database's own `_sqlx_migrations` tracking
+table, so re-running the Job on every `helm upgrade` only applies migrations
+that aren't already recorded there — a true no-op when nothing changed.
+This is the same mechanism `make migrate` uses locally when `sqlx-cli` is
+installed (see the Makefile's `migrate` target); the raw-`psql`-over-
+`schema.sql`-plus-migrations fallback in that same target is only used
+locally when `sqlx-cli` isn't available and is deliberately **not** what
+this Helm hook runs, since it isn't idempotent.
+
+### Hook behavior
+
+- `helm.sh/hook-weight: "-5"` runs it ahead of every other resource in the
+  chart.
+- `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded` deletes
+  a *successful* Job's Pod automatically (and any stale Job left from a
+  prior failed release, before creating the new one) but **deliberately
+  leaves a failed Job in place** — nothing in this chart marks the hook to
+  ignore failures, so a failing migration fails `helm install`/`helm
+  upgrade` outright and blocks the app Deployments from ever rolling out
+  against a schema that didn't migrate cleanly.
+- `restartPolicy: Never` with `backoffLimit: 2` bounds retries instead of
+  looping forever on a bad migration.
+
+### Debugging a failed migration Job
+
+Because a failed Job is left behind (`hook-succeeded`, not `hook-failed`,
+in the delete policy), you can inspect it after a failed release:
+
+```bash
+kubectl -n trident get jobs -l app.kubernetes.io/component=migrate
+kubectl -n trident logs job/trident-migrate
+kubectl -n trident describe job/trident-migrate
+```
+
+Once you've fixed the underlying issue (a bad migration file, an
+unreachable database, etc.), delete the failed Job and re-run
+`helm upgrade`/`helm install` — `before-hook-creation` will then replace it
+with a fresh attempt:
+
+```bash
+kubectl -n trident delete job trident-migrate
+helm upgrade trident ./helm/trident --reuse-values
+```
+
+### Disabling the hook for externally-managed migrations
+
+If migrations are already applied by a separate CI/CD pipeline, a DBA-owned
+process, or any other external mechanism, disable the chart's hook entirely
+so it doesn't also try to apply them:
+
+```bash
+helm upgrade trident ./helm/trident --reuse-values --set migrations.enabled=false
+```
+
+or in `custom-values.yaml`:
+
+```yaml
+migrations:
+  enabled: false
+```
+
+When disabled, the migration Job template renders nothing — no other
+chart behavior changes.
 
 ## Configuration
 
@@ -282,13 +365,17 @@ curl -X POST "$TRIDENT_HOST/v1/api-keys" \
 
 ## Secrets management {#secrets}
 
-Every deployment reads `DATABASE_URL`, `REDIS_URL`, and `ADMIN_API_KEY` from a
-single Kubernetes Secret named by `global.existingSecret` (default
-`trident-secrets`) via `secretKeyRef` — never from `values.yaml`, and never
-`COPY`'d into an image layer (see [crates/api/Dockerfile](../crates/api/Dockerfile),
-[crates/indexer/Dockerfile](../crates/indexer/Dockerfile), and
-[services/api/Dockerfile](../services/api/Dockerfile): each only copies the
-compiled binary out of its builder stage — no `.env` file, no secret, is ever
+Every deployment (and the migration hook Job — see
+[Database migrations](#migrations) above) reads `DATABASE_URL`, `REDIS_URL`,
+and `ADMIN_API_KEY` from a single Kubernetes Secret named by
+`global.existingSecret` (default `trident-secrets`) via `secretKeyRef` —
+never from `values.yaml`, and never `COPY`'d into an image layer (see
+[crates/api/Dockerfile](../crates/api/Dockerfile),
+[crates/indexer/Dockerfile](../crates/indexer/Dockerfile),
+[services/api/Dockerfile](../services/api/Dockerfile), and
+[database/Dockerfile](../database/Dockerfile): each only copies the compiled
+binary (or, for `database/Dockerfile`, the `sqlx` CLI and the migration
+`.sql` files) out of its builder stage — no `.env` file, no secret, is ever
 part of an image layer). How that one Secret gets *populated* is a separate
 choice, with three supported options:
 

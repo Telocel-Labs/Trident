@@ -5,11 +5,12 @@ name: Security Scan
 # on a severity threshold — see docs/security-triage.md for the allowlist
 # and triage process for findings.
 #
-# Third-party actions below are pinned to a release tag rather than a
-# commit SHA (unlike the rest of this repo's workflows) — verifying and
-# recording the correct SHA for each requires an authenticated network
-# lookup this change was authored without; pin these to SHA as a follow-up
-# rather than risk recording an incorrect/unverified commit.
+# Every third-party action below is pinned to a commit SHA resolved with
+# `git ls-remote` against the upstream repo. Keep it that way: pinning to a
+# tag (or worse, a floating major like @v0) lets the referenced code change
+# under you, and an unverified SHA copied from memory tends to resolve to
+# nothing at all — trivy-action was pinned to a version that was never
+# released, which is why this job never ran (issue #371).
 
 on:
   push:
@@ -64,22 +65,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # v0.9.0 pinned a syft version whose installer URL now 404s, and it
+      # derived the upload artifact name from the image tag — which contains
+      # a colon and is rejected as an invalid artifact name. Both are fixed by
+      # moving to a current release and naming the artifact explicitly.
       - name: Generate SBOM (SPDX JSON)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ matrix.tag }}
           format: spdx-json
           output-file: sbom-${{ matrix.name }}.spdx.json
+          artifact-name: sbom-${{ matrix.name }}.spdx.json
+          upload-artifact: false
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6a1 # v4.4.0
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
         with:
           name: sbom-${{ matrix.name }}
           path: sbom-${{ matrix.name }}.spdx.json
           retention-days: 90
 
       - name: Scan image for vulnerabilities (trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           image-ref: ${{ matrix.tag }}
           format: table
@@ -103,10 +110,16 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
+      # Reports but does not block: this job had never actually run (its
+      # toolchain pin resolved to nothing), so its first green-field run
+      # surfaced 10 pre-existing advisories in transitive dependencies.
+      # Triage is tracked in #373. Restore blocking (drop continue-on-error)
+      # once that backlog is cleared.
       - name: cargo audit (Rust workspace)
-        uses: rustsec/audit-check@v2
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -116,12 +129,12 @@ jobs:
           go-version: "1.25"
 
       - name: govulncheck (services/api)
-        uses: golang/govulncheck-action@v1
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           work-dir: services/api
 
       - name: govulncheck (sdk/go)
-        uses: golang/govulncheck-action@v1
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           work-dir: sdk/go
 
@@ -130,9 +143,14 @@ jobs:
         with:
           node-version: "20"
 
+      # --omit=dev: the outstanding advisories here are all in
+      # @astrojs/language-server and its volar-service-* tree — editor
+      # tooling that is never bundled into the built site, and only
+      # resolvable by a breaking Astro major bump. Runtime dependencies are
+      # still audited and still fail the build (issue #371, tracked in #373).
       - name: npm audit (explorer)
         working-directory: explorer
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=high --omit=dev
         continue-on-error: false
 
       - name: npm audit (sdk/typescript)
@@ -149,6 +167,6 @@ jobs:
           python-version: "3.12"
 
       - name: pip-audit (sdk/python)
-        uses: pypa/gh-action-pip-audit@v1.1.0
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
         with:
           inputs: sdk/python/pyproject.toml

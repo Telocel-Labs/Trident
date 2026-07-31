@@ -1,0 +1,77 @@
+{{- if .Values.migrations.enabled }}
+# Runs the sqlx-tracked migration chain (database/migrations/*.sql) as a
+# pre-install/pre-upgrade hook Job, so the schema is always up to date
+# before any app Deployment (go-api/grpc-api/indexer) rolls out (issue #308).
+#
+# Idempotent: `sqlx migrate run` (see database/Dockerfile) is backed by the
+# database's own _sqlx_migrations tracking table, so re-running this Job on
+# every `helm upgrade` only applies migrations that aren't already recorded
+# — it is safe to run unconditionally on every install/upgrade.
+#
+# Set migrations.enabled=false to skip this entirely for externally-managed
+# migrations (e.g. a separate CI/CD pipeline, or a DBA-owned migration
+# process) — see docs/kubernetes.md.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "trident.fullname" . }}-migrate
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Runs before every other resource in this chart and, within hooks,
+    # before anything with a higher weight. before-hook-creation ensures a
+    # leftover Job from a prior failed release doesn't collide with this
+    # one's fixed name; hook-succeeded (not hook-failed) means a failed Job
+    # is deliberately left behind for `kubectl logs`/`kubectl describe`
+    # debugging rather than being cleaned up automatically. Not setting
+    # hook-failed here is intentional: a failing hook already fails the
+    # `helm install`/`helm upgrade` by default, which is exactly the
+    # deterministic schema-before-app ordering this Job exists for.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        {{- include "trident.selectorLabels" (dict "root" . "component" "migrate") | nindent 8 }}
+    spec:
+      {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      restartPolicy: Never
+      securityContext:
+        {{- include "trident.podSecurityContext" (dict "uid" .Values.migrations.securityContextUid) | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- include "trident.containerSecurityContext" . | nindent 12 }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: DATABASE_URL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.migrations.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.migrations.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.migrations.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
