@@ -198,6 +198,16 @@ func main() {
 		go runContractStatsRollupRefresh(ctx, pool)
 	}
 
+	// Re-aggregate audit_log into usage_rollup so GET /v1/usage reads a
+	// pre-aggregated table, and bound that table's growth. Both loops and
+	// their four interval constants already existed but were never started —
+	// RunUsageRollupLoop's own doc comment says it is "called from main() as
+	// a background goroutine", and it was not.
+	if pool != nil {
+		go handlers.RunUsageRollupLoop(ctx, pool, usageRollupInterval, usageRollupLookback)
+		go runUsageRollupCleanup(ctx, pool)
+	}
+
 	adminCfg := handlers.AdminConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
 		DB:       pool,
@@ -276,7 +286,7 @@ func main() {
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
-	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
+	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))

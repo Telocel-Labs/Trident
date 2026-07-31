@@ -152,33 +152,47 @@ fn db_err(e: sqlx::Error) -> Status {
     Status::unavailable("database temporarily unavailable")
 }
 
+// Same rationale as `validate_start_id` above: `Status` is the gRPC surface's
+// error type, so boxing it here would only move the size to the caller.
+#[allow(clippy::result_large_err)]
 fn validate_list_events(req: &ListEventsRequest) -> Result<(), Status> {
     if req.contract_id.len() > 256 {
-        return Err(Status::invalid_argument("contract_id must be at most 256 characters"));
+        return Err(Status::invalid_argument(
+            "contract_id must be at most 256 characters",
+        ));
     }
 
     if req.topic_0.len() > 128 {
-        return Err(Status::invalid_argument("topic_0 must be at most 128 characters"));
+        return Err(Status::invalid_argument(
+            "topic_0 must be at most 128 characters",
+        ));
     }
 
     if req.topic_1.len() > 128 {
-        return Err(Status::invalid_argument("topic_1 must be at most 128 characters"));
+        return Err(Status::invalid_argument(
+            "topic_1 must be at most 128 characters",
+        ));
     }
 
     if req.network.len() > 64 {
-        return Err(Status::invalid_argument("network must be at most 64 characters"));
+        return Err(Status::invalid_argument(
+            "network must be at most 64 characters",
+        ));
     }
 
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_get_event(req: &GetEventRequest) -> Result<(), Status> {
     if req.id.is_empty() {
         return Err(Status::invalid_argument("id is required"));
     }
 
     if req.network.len() > 64 {
-        return Err(Status::invalid_argument("network must be at most 64 characters"));
+        return Err(Status::invalid_argument(
+            "network must be at most 64 characters",
+        ));
     }
 
     Ok(())

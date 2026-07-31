@@ -1,0 +1,13 @@
+[toolchain]
+# Pinned so CI and local builds agree on one rustc. Every Rust job in
+# .github/workflows/ci.yml uses dtolnay/rust-toolchain@...4cda84d5 tagged
+# `stable`, which resolves its version from this file when the step passes no
+# `toolchain:` input. This file is therefore what actually pins CI: without
+# it those jobs would float to whatever `stable` happens to be that day.
+#
+# 1.94 is the floor, set by the strictest dependency rather than by choice:
+# sqlx-cli 0.9.0 (installed by the rust CI job) requires rustc 1.94.0, and
+# soroban-sdk 26.1.0 requires 1.91.0. Lower it only if both are relaxed.
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32v1-none"]
