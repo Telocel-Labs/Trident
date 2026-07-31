@@ -35,6 +35,11 @@ type metadataCarrier struct {
 	md metadata.MD
 }
 
+// Compile-time check that metadataCarrier really satisfies the interface the
+// comment above claims. Without this the propagation import is unused and the
+// package does not build.
+var _ propagation.TextMapCarrier = metadataCarrier{}
+
 // Get retrieves a value by key.
 func (c metadataCarrier) Get(key string) string {
 	values := c.md.Get(key)
