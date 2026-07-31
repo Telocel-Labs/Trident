@@ -152,6 +152,8 @@ fn db_err(e: sqlx::Error) -> Status {
     Status::unavailable("database temporarily unavailable")
 }
 
+// Same rationale as `validate_start_id` above: `Status` is the gRPC surface's
+// error type, so boxing it here would only move the size to the caller.
 #[allow(clippy::result_large_err)]
 fn validate_list_events(req: &ListEventsRequest) -> Result<(), Status> {
     if req.contract_id.len() > 256 {

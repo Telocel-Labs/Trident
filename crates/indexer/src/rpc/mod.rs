@@ -1,10 +1,8 @@
 pub mod endpoints;
 pub mod health;
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
@@ -262,6 +260,11 @@ pub struct RpcClient {
     http: reqwest::Client,
     /// Health scorer for multi-RPC failover with dynamic scoring.
     scorer: Arc<RpcHealthScorer>,
+    /// Configured endpoints in priority order. The scorer keys endpoints by
+    /// URL in a HashMap, which has no stable ordering, so this list is what
+    /// gives each endpoint the positional index used to label per-endpoint
+    /// latency metrics (issue #294).
+    endpoints: Vec<String>,
 }
 
 impl RpcClient {
@@ -278,11 +281,12 @@ impl RpcClient {
         urls: Vec<String>,
         settings: &RpcHttpSettings,
     ) -> Result<Self, TridentError> {
-        let scorer = Arc::new(RpcHealthScorer::new(urls)?);
+        let scorer = Arc::new(RpcHealthScorer::new(urls.clone())?);
 
         Ok(Self {
             http: settings.build_client()?,
             scorer,
+            endpoints: urls,
         })
     }
 
@@ -291,21 +295,18 @@ impl RpcClient {
         &self.scorer
     }
 
-    /// Endpoint to use for the next request, after any pending recovery back to
-    /// a higher-priority endpoint. Also returns the endpoint's pool index, used
-    /// to label per-endpoint latency/error metrics (issue #294).
+    /// Select the healthiest endpoint for the next request. Also returns the
+    /// endpoint's position in the configured list, used to label per-endpoint
+    /// latency metrics (issue #294).
     fn select_endpoint(&self) -> (String, usize) {
-        let mut pool = self.pool.lock().expect("endpoint pool mutex poisoned");
-        let (url, changed) = pool.select();
-        let index = pool.active_index();
-        if changed {
-            metrics::set_rpc_active_endpoint(index);
-            tracing::info!(endpoint = %url, "Recovered to higher-priority RPC endpoint");
-        }
+        let url = self.scorer.select_best_endpoint();
+        let index = self
+            .endpoints
+            .iter()
+            .position(|candidate| candidate == &url)
+            .unwrap_or(0);
+        metrics::set_rpc_active_endpoint(index);
         (url, index)
-    /// Select the healthiest endpoint for the next request.
-    fn select_endpoint(&self) -> String {
-        self.scorer.select_best_endpoint()
     }
 
     /// Record a successful response from the given endpoint.
@@ -470,7 +471,7 @@ impl RpcClient {
         limit: u32,
         filters: &[EventFilter],
     ) -> Result<EventsPage, TridentError> {
-        let url = self.select_endpoint();
+        let (url, _endpoint_index) = self.select_endpoint();
         let params = GetEventsParams {
             start_ledger,
             filters,
@@ -484,7 +485,8 @@ impl RpcClient {
             params: &params,
         };
 
-        let result: Result<GetEventsResult, TridentError> = self.execute(&url, &req, "getEvents").await;
+        let result: Result<GetEventsResult, TridentError> =
+            self.execute(&url, &req, "getEvents").await;
         match &result {
             Ok(r) => {
                 self.record_success(&url, Some(r.latest_ledger));
@@ -547,18 +549,6 @@ impl RpcClient {
             .call("getLedgerEntries", 5, params, "getLedgerEntries")
             .await?;
         Ok(result.entries.unwrap_or_default())
-    }
-
-    /// Simulate a Soroban transaction via `simulateTransaction` (issue #263).
-    ///
-    /// Used for read-only host function calls (e.g., token name/symbol/decimals).
-    pub async fn simulate_transaction(
-        &self,
-        transaction: &str,
-    ) -> Result<SimulateTransactionResult, TridentError> {
-        let params = SimulateTransactionParams { transaction };
-        self.call("simulateTransaction", 4, params, "simulateTransaction")
-            .await
     }
 }
 
@@ -670,8 +660,10 @@ mod tests {
         )
         .unwrap();
 
-        // Two failures on the primary should cause it to be scored lower.
-        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+        // One 503 costs the primary 15 points (100 -> 85), which is already
+        // enough to put the untouched secondary ahead. Scoring fails over on
+        // the first failure, unlike the consecutive-failure threshold the
+        // superseded endpoint pool used.
         assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
 
         // The health scorer should now prefer the secondary endpoint.

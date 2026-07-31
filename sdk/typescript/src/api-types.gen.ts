@@ -202,7 +202,7 @@ export interface paths {
         };
         /**
          * Get indexer statistics
-         * @description Returns real-time indexer health metrics and throughput
+         * @description Returns real-time indexer health metrics, throughput, and the public data-freshness contract (lag_ledgers, lag_seconds_estimated, last_ledger_indexed) — see docs/observability/data-freshness.md
          */
         get: operations["getIndexerStats"];
         put?: never;
@@ -411,6 +411,11 @@ export interface components {
              * @description Number of ledgers behind chain tip
              */
             lag_ledgers?: number | null;
+            /**
+             * Format: double
+             * @description Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target ledger close time (~5s). Null whenever lag_ledgers is null. See docs/observability/data-freshness.md for the full freshness contract this field is part of.
+             */
+            lag_seconds_estimated?: number | null;
             /**
              * Format: int64
              * @description Cumulative events indexed
