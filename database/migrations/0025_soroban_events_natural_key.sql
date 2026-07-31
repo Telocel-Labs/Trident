@@ -11,7 +11,8 @@
 --      different contract_id or ledger_sequence values due to a bug).
 --   2. Provide a constraint target that mirrors the Stellar protocol guarantee:
 --      within a given network a (transaction_hash, event_index) pair
---      identifies exactly one event.
+--      identifies exactly one event. (Scoped per-partition in practice — see
+--      the note on ledger_sequence at the ALTER TABLE below.)
 --   3. Future-proof the schema against id-scheme changes without losing
 --      the correctness guarantee.
 --
@@ -50,6 +51,22 @@ BEGIN
 END $$;
 
 -- Add the unique constraint.
+--
+-- ledger_sequence is part of the key only because it has to be: migration
+-- 0017 made soroban_events RANGE-partitioned on that column, and PostgreSQL
+-- requires every unique constraint on a partitioned table to include the
+-- partition key. `UNIQUE (transaction_hash, event_index, network)` alone is
+-- rejected outright — the same trade-off 0017 already documents for the
+-- primary key, which became (ledger_sequence, id) for this reason.
+--
+-- What this costs: the constraint no longer catches the same
+-- (transaction_hash, event_index, network) triple appearing under two
+-- *different* ledger_sequence values. That would mean the indexer recorded
+-- one protocol event against two different ledgers, which is a distinct bug
+-- from the duplicate-insert case this migration exists to catch, and it is
+-- still caught by the pre-flight check above on any existing data. Within a
+-- ledger — where duplicates actually arise, from replays and overlapping
+-- code paths — the guarantee is unchanged.
 ALTER TABLE soroban_events
     ADD CONSTRAINT uq_soroban_events_tx_index_network
-    UNIQUE (transaction_hash, event_index, network);
+    UNIQUE (ledger_sequence, transaction_hash, event_index, network);
