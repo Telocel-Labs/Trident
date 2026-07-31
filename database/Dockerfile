@@ -22,7 +22,7 @@ RUN cargo install sqlx-cli --version ^0.7 --no-default-features --features rustl
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 # Same digest-pinned debian:bookworm-slim as the other runtime stages.
-FROM debian:bookworm-slim@sha256:89b32b4e9f3e7f5d4a7c2c5c9b5c5c4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e AS runtime
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \

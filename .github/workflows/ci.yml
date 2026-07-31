@@ -894,6 +894,13 @@ jobs:
       - name: Check migration versions are unique
         run: bash scripts/check-migration-versions.sh
 
+      # A fabricated placeholder digest ("...4e4e4e4e4e") sat in
+      # database/Dockerfile and only ever surfaced as a Docker build failure,
+      # because the tag beside it looked correct and nothing checked the digest
+      # itself. Shape check only — no registry calls (issue #371).
+      - name: Check base image digests are well-formed
+        run: bash scripts/check-image-digests.sh
+
   # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
