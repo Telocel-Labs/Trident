@@ -144,6 +144,14 @@ def generate_rust() -> None:
     )
     TARGETS["rust"].write_text(output)
 
+    # Run rustfmt over the result so this file is byte-identical to what
+    # `cargo fmt --all` produces. Without it the two CI jobs contradict each
+    # other: quicktype emits `use serde::{Serialize, Deserialize};`, rustfmt
+    # reorders that to `{Deserialize, Serialize}`, and whichever job ran last
+    # left the other one red — the Rust job on a formatting diff, or this
+    # script's own drift check on the reordered import.
+    run_checked(["rustfmt", "--edition", "2021", str(TARGETS["rust"])])
+
 
 def generate_typescript() -> None:
     run_checked(
