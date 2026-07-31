@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
 
@@ -120,8 +120,11 @@ jobs:
       - name: go test (race)
         run: go test -race ./...
 
+      # v8 is the first line of the action that supports golangci-lint v2. v4
+      # invokes it with `--out-format`, which v2 removed, so the lint aborted
+      # with "unknown flag" before checking anything (issue #371).
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@3cfe3a4abbb849e10058ce4af15d205b6da42804 # v4.0.0
+        uses: golangci/golangci-lint-action@25e2cdc5eb1d7a04fdc45ff538f1a00e960ae128 # v8.0.0
         with:
           version: v2.12.2
           working-directory: services/api
@@ -228,7 +231,7 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Cache Rust build artefacts
@@ -265,7 +268,7 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: wasm32v1-none
 
@@ -372,7 +375,7 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       # Shares the sccache object cache with the rust job (same workspace,
       # same Cargo.lock) so this job's build reuses objects already compiled
@@ -665,7 +668,7 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: wasm32v1-none
 
@@ -683,7 +686,7 @@ jobs:
 
       - name: Build the reference token contract
         working-directory: contracts
-        run: cargo build --release --target wasm32v1-none -p token
+        run: cargo build --release --target wasm32v1-none -p trident-reference-token
 
       - name: Show sccache stats
         if: always()
@@ -763,14 +766,14 @@ jobs:
           RECIPIENT_ADDR=$(stellar keys address recipient)
 
           CONTRACT_ID=$(stellar contract deploy \
-            --wasm contracts/target/wasm32v1-none/release/token.wasm \
+            --wasm contracts/target/wasm32v1-none/release/trident_reference_token.wasm \
             --source admin \
             --network local)
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
 
           stellar contract invoke \
             --id "$CONTRACT_ID" --source admin --network local \
-            -- initialize --admin "$ADMIN_ADDR" --decimals 7 \
+            -- initialize --admin "$ADMIN_ADDR" --decimal 7 \
                 --name "E2E Token" --symbol E2E
 
           # The mint call is what the E2E assertion below waits for: it
@@ -892,6 +895,20 @@ jobs:
       - name: Check every env var the code reads is documented
         run: bash scripts/check-env-reference.sh
 
+      # Catches two migrations sharing a version prefix before it reaches a
+      # real database. The rust-integration job applies migrations with a
+      # `for f in *.sql` psql loop rather than the sqlx migrator, so it cannot
+      # catch this on its own (issue #371).
+      - name: Check migration versions are unique
+        run: bash scripts/check-migration-versions.sh
+
+      # A fabricated placeholder digest ("...4e4e4e4e4e") sat in
+      # database/Dockerfile and only ever surfaced as a Docker build failure,
+      # because the tag beside it looked correct and nothing checked the digest
+      # itself. Shape check only — no registry calls (issue #371).
+      - name: Check base image digests are well-formed
+        run: bash scripts/check-image-digests.sh
+
   # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
@@ -913,7 +930,7 @@ jobs:
         run: helm template trident helm/trident
 
       - name: Create kind cluster
-        uses: helm/kind-action@v1.10.0
+        uses: helm/kind-action@0025e74a8c7512023d06dc019c617aa3cf561fde # v1.10.0
         with:
           cluster_name: trident-ci
 
@@ -924,6 +941,13 @@ jobs:
             --from-literal=REDIS_URL="redis://redis:6379" \
             --from-literal=ADMIN_API_KEY="ci-admin-key"
 
+      # migrations.enabled=false alongside the busybox image overrides: the
+      # migration Job is a pre-install hook, and Helm always waits on hooks
+      # regardless of --wait=false. It pulls the real migrate image and runs
+      # sqlx against postgres:5432, which does not exist in the kind cluster,
+      # so it can only ever burn the full --timeout and fail. This job checks
+      # that the chart renders and its resources are created, not that
+      # migrations run.
       - name: Install chart (CI values — nginx only, no image pull)
         run: |
           helm install trident helm/trident \
@@ -933,6 +957,7 @@ jobs:
             --set grpcApi.image.tag=latest \
             --set goApi.image.repository=busybox \
             --set goApi.image.tag=latest \
+            --set migrations.enabled=false \
             --wait=false \
             --timeout=60s
 
