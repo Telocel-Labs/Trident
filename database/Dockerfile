@@ -8,7 +8,7 @@
 # ── builder ──────────────────────────────────────────────────────────────────
 # Same base + digest pin as crates/api/Dockerfile and crates/indexer/Dockerfile
 # so the sqlx-cli install reuses the same cached layer conventions.
-FROM rust:1.88-slim@sha256:8474d3e6c65da3ac9f0a39c5c77db2ff6c8c9e3a6eb4dff09b5ed7ed6c0f2f33 AS builder
+FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
 
 # Native build deps for sqlx-cli's postgres feature (openssl-sys needs
 # pkg-config + libssl-dev + a C toolchain).
