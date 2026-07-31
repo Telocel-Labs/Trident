@@ -926,6 +926,13 @@ jobs:
             --from-literal=REDIS_URL="redis://redis:6379" \
             --from-literal=ADMIN_API_KEY="ci-admin-key"
 
+      # migrations.enabled=false alongside the busybox image overrides: the
+      # migration Job is a pre-install hook, and Helm always waits on hooks
+      # regardless of --wait=false. It pulls the real migrate image and runs
+      # sqlx against postgres:5432, which does not exist in the kind cluster,
+      # so it can only ever burn the full --timeout and fail. This job checks
+      # that the chart renders and its resources are created, not that
+      # migrations run.
       - name: Install chart (CI values — nginx only, no image pull)
         run: |
           helm install trident helm/trident \
@@ -935,6 +942,7 @@ jobs:
             --set grpcApi.image.tag=latest \
             --set goApi.image.repository=busybox \
             --set goApi.image.tag=latest \
+            --set migrations.enabled=false \
             --wait=false \
             --timeout=60s
 
