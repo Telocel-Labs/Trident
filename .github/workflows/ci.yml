@@ -569,6 +569,21 @@ jobs:
           echo ""
           echo "/v1/health returned 200 OK"
 
+      # Without this the job reports only curl's exit code, which says nothing
+      # about which service failed to come up. Runs only on failure.
+      - name: Dump stack state and logs on failure
+        if: failure()
+        run: |
+          cd docker
+          echo "::group::container status"
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci ps -a
+          echo "::endgroup::"
+          for svc in postgres redis grpc-api indexer api; do
+            echo "::group::${svc} logs"
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci logs --tail=120 "${svc}" || true
+            echo "::endgroup::"
+          done
+
       - name: Assert GET /v1/health returns status ok
         run: |
           RESPONSE=$(curl --silent --fail http://localhost:3000/v1/health)
@@ -821,6 +836,21 @@ jobs:
         run: |
           curl --silent --fail --retry 20 --retry-delay 5 --retry-connrefused \
             --max-time 10 http://localhost:3000/v1/health
+
+      # Same rationale as the smoke-test job: curl's exit code alone does not
+      # identify which service failed to start.
+      - name: Dump stack state and logs on failure
+        if: failure()
+        run: |
+          cd docker
+          echo "::group::container status"
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci ps -a
+          echo "::endgroup::"
+          for svc in postgres redis grpc-api indexer api; do
+            echo "::group::${svc} logs"
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci logs --tail=120 "${svc}" || true
+            echo "::endgroup::"
+          done
 
       - name: Poll /v1/events for the decoded mint event
         env:
