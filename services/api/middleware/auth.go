@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -67,6 +68,22 @@ func authRedisCacheKey(hash string) string {
 	return fmt.Sprintf("apiauth:%s", hash)
 }
 
+// withAuthenticatedKey attaches the authenticated key's id/network to ctx for
+// downstream handlers (contextKeyAPIKeyID/contextKeyNetwork) and, when idStr
+// parses as a UUID, also for the audit log writer (auditLogAPIKeyIDKey) so
+// audit_log.api_key_id — and anything derived from it, like per-key usage
+// rollups — is actually populated for DB-backed keys.
+func withAuthenticatedKey(ctx context.Context, idStr, network string) context.Context {
+	ctx = WithAPIKeyID(ctx, idStr)
+	if network != "" {
+		ctx = context.WithValue(ctx, contextKeyNetwork, network)
+	}
+	if id, err := uuid.Parse(idStr); err == nil {
+		ctx = WithAuditAPIKeyID(ctx, &id)
+	}
+	return ctx
+}
+
 // NewDBAuth returns an authentication middleware that:
 //  1. Looks up the hashed API key in Redis cache (5 min TTL).
 //  2. Falls back to the api_keys database table (active keys only).
@@ -100,10 +117,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 				if cached, err := cfg.Redis.Get(r.Context(), authRedisCacheKey(dbHash)).Result(); err == nil {
 					// Cached value format: "<uuid>:<network>"
 					parts := strings.SplitN(cached, ":", 2)
-					ctx := context.WithValue(r.Context(), contextKeyAPIKeyID, parts[0])
+					network := ""
 					if len(parts) == 2 {
-						ctx = context.WithValue(ctx, contextKeyNetwork, parts[1])
+						network = parts[1]
 					}
+					ctx := withAuthenticatedKey(r.Context(), parts[0], network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
@@ -122,8 +140,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 						cfg.Redis.Set(r.Context(), authRedisCacheKey(dbHash),
 							id+":"+network, authCacheTTL)
 					}
-					ctx := context.WithValue(r.Context(), contextKeyAPIKeyID, id)
-					ctx = context.WithValue(ctx, contextKeyNetwork, network)
+					ctx := withAuthenticatedKey(r.Context(), id, network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}

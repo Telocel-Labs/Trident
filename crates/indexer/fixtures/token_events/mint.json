@@ -1,0 +1,15 @@
+{
+  "name": "mint",
+  "topics": [
+    "AAAADwAAAARtaW50",
+    "AAAAEgAAAAAAAAAAMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+    "AAAAEgAAAAAAAAAAIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI="
+  ],
+  "data": "AAAACgAAAAAAAAAAAAAAAABMS0A=",
+  "expected": {
+    "event_type": "mint",
+    "admin": "GAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTHCM6",
+    "to": "GARCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCFRVX",
+    "amount": "5000000"
+  }
+}

@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // adminStatsTimeout bounds how long the admin endpoint waits on PgBouncer.
@@ -44,12 +46,12 @@ type AdminConfig struct {
 func AdminDB(cfg AdminConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.StatsFunc == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin DB endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin DB endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 			return
 		}
 
@@ -60,7 +62,7 @@ func AdminDB(cfg AdminConfig) http.HandlerFunc {
 		if err != nil {
 			// The PgBouncer admin console is the upstream here, so a failure to
 			// reach it is a bad-gateway condition rather than our own error.
-			writeJSON(w, http.StatusBadGateway, errorBody("could not read PgBouncer stats"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadGateway, httputil.UNAVAILABLE, "could not read PgBouncer stats")
 			return
 		}
 
@@ -77,24 +79,20 @@ func validAdminKey(expected, provided string) bool {
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(provided)) == 1
 }
 
-func errorBody(message string) map[string]any {
-	return map[string]any{"error": map[string]string{"message": message}}
-}
-
 // AdminKeyUsageResponse is the response for GET /v1/admin/keys/:id/usage.
 type AdminKeyUsageResponse struct {
-	APIKeyID           string                `json:"api_key_id"`
-	From               string                `json:"from"`
-	To                 string                `json:"to"`
-	TotalRequests      int64                 `json:"total_requests"`
-	SuccessfulRequests int64                 `json:"successful_requests"`
-	ByEndpoint         []AdminEndpointUsage  `json:"by_endpoint"`
+	APIKeyID           string               `json:"api_key_id"`
+	From               string               `json:"from"`
+	To                 string               `json:"to"`
+	TotalRequests      int64                `json:"total_requests"`
+	SuccessfulRequests int64                `json:"successful_requests"`
+	ByEndpoint         []AdminEndpointUsage `json:"by_endpoint"`
 }
 
 type AdminEndpointUsage struct {
-	Endpoint        string  `json:"endpoint"`
-	Requests        int64   `json:"requests"`
-	AvgDurationMs   float64 `json:"avg_duration_ms"`
+	Endpoint      string  `json:"endpoint"`
+	Requests      int64   `json:"requests"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
 }
 
 // AdminKeyUsage handles GET /v1/admin/keys/:id/usage.
@@ -104,41 +102,35 @@ type AdminEndpointUsage struct {
 func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin usage endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+			return
+		}
+
+		q := r.URL.Query()
+		if verr := validation.RejectUnknownParams(q, "from", "to"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
 		keyIDStr := r.PathValue("id")
-		if keyIDStr == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("missing api key id"))
+		if verr := validation.ValidateUUID("id", keyIDStr); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		keyID, err := uuid.Parse(keyIDStr)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid api key id"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "id must be a valid UUID v4")
 			return
 		}
 
-		fromStr := r.URL.Query().Get("from")
-		toStr := r.URL.Query().Get("to")
-		if fromStr == "" || toStr == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("from and to query parameters are required (RFC3339)"))
-			return
-		}
-
-		from, err := time.Parse(time.RFC3339, fromStr)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid from timestamp format, use RFC3339"))
-			return
-		}
-		to, err := time.Parse(time.RFC3339, toStr)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid to timestamp format, use RFC3339"))
+		from, to, verr := validation.ValidateTimeRange("from", "to", q.Get("from"), q.Get("to"))
+		if verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -152,7 +144,7 @@ func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 			keyID, from, to,
 		).Scan(&totalReqs)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query total requests"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to query total requests")
 			return
 		}
 
@@ -163,7 +155,7 @@ func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 			keyID, from, to,
 		).Scan(&successReqs)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query successful requests"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to query successful requests")
 			return
 		}
 
@@ -177,7 +169,7 @@ func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 			keyID, from, to,
 		)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query endpoint breakdown"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to query endpoint breakdown")
 			return
 		}
 		defer rows.Close()
@@ -186,7 +178,7 @@ func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 		for rows.Next() {
 			var eu AdminEndpointUsage
 			if err := rows.Scan(&eu.Endpoint, &eu.Requests, &eu.AvgDurationMs); err != nil {
-				writeJSON(w, http.StatusInternalServerError, errorBody("scan error"))
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "scan error")
 				return
 			}
 			byEndpoint = append(byEndpoint, eu)
@@ -194,8 +186,8 @@ func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 
 		resp := AdminKeyUsageResponse{
 			APIKeyID:           keyIDStr,
-			From:               fromStr,
-			To:                 toStr,
+			From:               from.UTC().Format(time.RFC3339),
+			To:                 to.UTC().Format(time.RFC3339),
 			TotalRequests:      totalReqs,
 			SuccessfulRequests: successReqs,
 			ByEndpoint:         byEndpoint,

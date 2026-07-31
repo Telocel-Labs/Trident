@@ -11,6 +11,8 @@ import (
 	"github.com/Depo-dev/trident/services/api/gen"
 	"github.com/Depo-dev/trident/services/api/handlers"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // MockEventsClient is a mock implementation of gen.EventsClient
@@ -41,9 +43,9 @@ func TestListEvents_NoParams_Returns200(t *testing.T) {
 	mock := &MockEventsClient{
 		ListEventsFunc: func(ctx context.Context, req *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
 			return &gen.ListEventsResponse{
-				Events:    []*gen.Event{},
+				Events:     []*gen.Event{},
 				NextCursor: "",
-				HasMore:   false,
+				HasMore:    false,
 			}, nil
 		},
 	}
@@ -388,5 +390,54 @@ func TestListEvents_InvalidCursor_Returns400(t *testing.T) {
 	}
 	if errObj, _ := body["error"].(map[string]any); errObj["code"] != "INVALID_ARGUMENT" {
 		t.Errorf("want code=INVALID_ARGUMENT, got %v", body["error"])
+	}
+}
+
+func TestGetEvent_DeadlineExceeded_Returns504(t *testing.T) {
+	handlers.SetEventsClient(&MockEventsClient{
+		GetEventFunc: func(ctx context.Context, req *gen.GetEventRequest) (*gen.Event, error) {
+			return nil, status.Error(codes.DeadlineExceeded, "deadline exceeded")
+		},
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events/550e8400-e29b-41d4-a716-446655440000", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusGatewayTimeout {
+		t.Errorf("want 504, got %d", rr.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["code"] != "UNAVAILABLE" {
+		t.Errorf("want code=UNAVAILABLE, got %v", body["error"])
+	}
+	if msg, _ := errObj["message"].(string); msg == "event not found" {
+		t.Error("a timeout must not be reported as 'event not found'")
+	}
+}
+
+func TestGetEvent_Unavailable_Returns503(t *testing.T) {
+	handlers.SetEventsClient(&MockEventsClient{
+		GetEventFunc: func(ctx context.Context, req *gen.GetEventRequest) (*gen.Event, error) {
+			return nil, status.Error(codes.Unavailable, "connection refused")
+		},
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events/550e8400-e29b-41d4-a716-446655440000", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("want 503, got %d", rr.Code)
 	}
 }

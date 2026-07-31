@@ -1,7 +1,33 @@
 openapi: 3.1.0
 info:
   title: Trident REST API
-  description: Real-time indexing and event querying for Soroban contract events
+  description: |
+    Real-time indexing and event querying for Soroban contract events.
+
+    ## Request validation
+
+    Every endpoint validates its parameters before doing any work and answers a
+    malformed request with `400` and the `ErrorResponse` envelope, where
+    `error.code` is `INVALID_ARGUMENT` and `error.message` names the field that
+    failed:
+
+    ```json
+    {"error": {"code": "INVALID_ARGUMENT", "message": "limit must be an integer between 1 and 200"}}
+    ```
+
+    Rules shared across endpoints:
+
+    - `contractId` — Stellar contract strkey: `C` followed by 55 uppercase
+      base32 characters.
+    - path ids — canonical UUID v4.
+    - ledger ranges — non-negative integers; the upper bound must be greater
+      than or equal to the lower bound.
+    - `limit` — an integer within the range documented for that endpoint.
+    - `cursor` — an opaque cursor from a previous response; anything else is
+      rejected rather than silently ignored.
+    - `network` — `testnet` or `mainnet`.
+    - Unknown query parameters are rejected, so a typo such as `?limitt=5`
+      fails loudly instead of silently changing the page size.
   version: 1.0.0
   contact:
     name: Trident Team
@@ -185,7 +211,17 @@ paths:
   /v1/events/batch:
     post:
       summary: Get multiple events by ID
-      description: Retrieve multiple events in a single request (up to 100)
+      description: |
+        Retrieve multiple events in a single request (up to 100 ids).
+
+        Batch contract:
+        - `events` and `missing` both preserve the request order of `ids`.
+        - Duplicate ids are deduplicated on first occurrence; each unique id
+          appears at most once in the response, in `events` or in `missing`.
+        - A request with more than 100 ids (duplicates included) is rejected
+          with `400 INVALID_ARGUMENT`; so is any id that is not a UUID v4.
+        - Ids that are valid but not indexed do not fail the request; they
+          are listed in `missing` and the found events are still returned.
       operationId: batchGetEvents
       tags:
         - Events
@@ -205,25 +241,163 @@ paths:
                     format: uuid
                   minItems: 1
                   maxItems: 100
-                  description: List of event UUIDs
+                  description: >-
+                    List of event UUIDs. Duplicates are deduplicated on first
+                    occurrence; the 100-id limit counts duplicates.
               example:
                 ids:
                   - 550e8400-e29b-41d4-a716-446655440000
                   - 550e8400-e29b-41d4-a716-446655440001
       responses:
         "200":
-          description: Multiple event details
+          description: |
+            Batch result. Always returns 200 even when some IDs are not found;
+            check `missing` for unresolved IDs.
           content:
             application/json:
               schema:
                 type: object
                 required:
                   - events
+                  - missing
                 properties:
                   events:
                     type: array
+                    description: Found events, in request order (deduplicated).
                     items:
                       $ref: "#/components/schemas/SorobanEvent"
+                  missing:
+                    type: array
+                    description: >-
+                      Ids that are valid UUIDs but not indexed, in request
+                      order. Empty array when every id was found.
+                    items:
+                      type: string
+                      format: uuid
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/contracts/{id}/events/schema:
+    get:
+      summary: Get per-contract event schemas
+      description: Returns the observed event names and typed field schemas for one contract version.
+      operationId: getContractEventSchemas
+      tags:
+        - Contracts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+      responses:
+        "200":
+          description: Contract event schema registry entry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractEventSchemaResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/contracts/{id}/spec:
+    get:
+      summary: Get a contract's parsed spec and detected interfaces
+      description: Returns the functions captured from a tracked contract's spec (contractmeta / SEP-48) and the standard interfaces detected from them (e.g. SEP-41 token, NFT).
+      operationId: getContractSpec
+      tags:
+        - Contracts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+      responses:
+        "200":
+          description: Contract spec and detected interfaces
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractSpecResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/contracts/{id}/storage:
+    get:
+      summary: Get a contract's latest storage snapshot values
+      description: Returns the most recently observed value for every storage key snapshotted for a tracked contract.
+      operationId: getContractStorageLatest
+      tags:
+        - Contracts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+      responses:
+        "200":
+          description: Latest known value per storage key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractStorageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/contracts/{id}/storage/history:
+    get:
+      summary: Get the change history of a single contract storage key
+      description: Returns every recorded change for one storage key, oldest first, for a tracked contract.
+      operationId: getContractStorageHistory
+      tags:
+        - Contracts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Storage key to fetch history for, as returned by the storage/spec endpoints
+      responses:
+        "200":
+          description: Recorded changes for the requested storage key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractStorageResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -234,7 +408,10 @@ paths:
   /v1/stats/indexer:
     get:
       summary: Get indexer statistics
-      description: Returns real-time indexer health metrics and throughput
+      description: >-
+        Returns real-time indexer health metrics, throughput, and the public
+        data-freshness contract (lag_ledgers, lag_seconds_estimated,
+        last_ledger_indexed) — see docs/observability/data-freshness.md
       operationId: getIndexerStats
       tags:
         - Statistics
@@ -586,6 +763,15 @@ components:
           format: int64
           nullable: true
           description: Number of ledgers behind chain tip
+        lag_seconds_estimated:
+          type: number
+          format: double
+          nullable: true
+          description: >-
+            Estimated wall-clock staleness in seconds: lag_ledgers times
+            Stellar's protocol-target ledger close time (~5s). Null whenever
+            lag_ledgers is null. See docs/observability/data-freshness.md for
+            the full freshness contract this field is part of.
         events_indexed_total:
           type: integer
           format: int64
@@ -606,6 +792,193 @@ components:
           format: date-time
           nullable: true
           description: Timestamp of last successful poll
+
+
+    TokenMetadataResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - is_token
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        network:
+          type: string
+          enum: [testnet, mainnet]
+          description: Network queried
+        is_token:
+          type: boolean
+          description: >-
+            True when the contract was resolved and implements the SEP-41
+            read interface. False for both "not yet resolved" and "resolved,
+            not a token".
+        name:
+          type: string
+          nullable: true
+          description: Token name, from name(). Null unless is_token is true.
+        symbol:
+          type: string
+          nullable: true
+          description: Token symbol, from symbol(). Null unless is_token is true.
+        decimals:
+          type: integer
+          format: int32
+          nullable: true
+          description: Token decimals, from decimals(). Null unless is_token is true.
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When this contract was last resolved. Null if never resolved.
+
+    ContractEventSchemaResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - code_hash
+        - events
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        network:
+          type: string
+          enum: [testnet, mainnet]
+          description: Network queried
+        code_hash:
+          type: string
+          description: Contract code hash for this schema version
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractEventSchema"
+          description: Observed event names and their typed field schemas
+
+    ContractEventSchema:
+      type: object
+      required:
+        - event_name
+        - fields
+      properties:
+        event_name:
+          type: string
+          description: Contract event name (topic_0)
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractEventFieldSchema"
+          description: Named fields for this event payload
+
+    ContractEventFieldSchema:
+      type: object
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          description: Stable field name for this event payload position or property
+        type:
+          type: string
+          description: Field type inferred from the contract interface or observed payloads
+
+    ContractSpecResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - code_hash
+        - has_spec
+        - contract_type
+        - interfaces
+        - functions
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        network:
+          type: string
+          enum: [testnet, mainnet]
+          description: Network queried
+        code_hash:
+          type: string
+          description: Deployed WASM code hash this spec was parsed from
+        has_spec:
+          type: boolean
+          description: Whether an embedded contractspecv0 section was found
+        contract_type:
+          type: string
+          description: Primary classification derived from detected interfaces (e.g. token, nft, custom)
+        interfaces:
+          type: array
+          items:
+            type: string
+          description: Every standard interface detected from the contract's spec functions
+        functions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractSpecFunction"
+          description: Functions captured from the contract's spec
+
+    ContractSpecFunction:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Exported function name
+
+    ContractStorageResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - values
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        network:
+          type: string
+          enum: [testnet, mainnet]
+          description: Network queried
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractStorageValue"
+          description: Storage snapshot values (latest, or full history when queried via /storage/history)
+
+    ContractStorageValue:
+      type: object
+      required:
+        - storage_key
+        - key
+        - ledger_sequence
+        - observed_at
+      properties:
+        storage_key:
+          type: string
+          description: Base64-encoded XDR LedgerKey this value was read from
+        key:
+          description: Human-readable decoded storage key
+        value:
+          description: Human-readable decoded value (absent when the entry was removed)
+        ledger_sequence:
+          type: integer
+          format: int64
+          description: Ledger sequence at which this value was observed
+        observed_at:
+          type: string
+          format: date-time
+          description: Timestamp this snapshot row was recorded
 
     ContractStatsResponse:
       type: object
@@ -694,6 +1067,13 @@ components:
 
     Unauthorized:
       description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    NotFound:
+      description: Requested resource was not found
       content:
         application/json:
           schema:

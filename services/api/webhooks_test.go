@@ -6,47 +6,61 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestVerifyWebhookSignature(t *testing.T) {
 	body := `{"hello":"world"}`
 	secret := "super-secret"
-	signature := "sha256=" + signWebhookBody(body, secret)
+	ts := time.Now().Unix()
+	signature := "sha256=" + signWebhookPayload(ts, body, secret)
 
-	if !verifyWebhookSignature(body, signature, secret) {
-		t.Fatalf("expected signature verification to succeed")
+	if !verifyWebhookSignature(ts, body, signature, secret) {
+		t.Fatal("expected signature verification to succeed")
 	}
 
-	if verifyWebhookSignature(body, "sha256=deadbeef", secret) {
-		t.Fatalf("expected signature verification to fail for a mismatched signature")
+	if verifyWebhookSignature(ts, body, "sha256=deadbeef", secret) {
+		t.Fatal("expected signature verification to fail for a mismatched signature")
+	}
+
+	// A different timestamp must not verify.
+	if verifyWebhookSignature(ts+1, body, signature, secret) {
+		t.Fatal("expected signature to fail when timestamp is different (replay protection)")
 	}
 }
 
-func TestDeliverWebhookSendsSignedPayload(t *testing.T) {
-	var gotBody []byte
-	var gotSignature string
-	var gotContentType string
+func TestDeliverWebhookSendsTimestampAndSignedPayload(t *testing.T) {
+	var (
+		gotBody      []byte
+		gotSignature string
+		gotTimestamp string
+		gotCT        string
+	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotContentType = r.Header.Get("Content-Type")
+		gotCT = r.Header.Get("Content-Type")
 		gotSignature = r.Header.Get("X-Trident-Signature")
+		gotTimestamp = r.Header.Get("X-Trident-Timestamp")
 		var err error
 		gotBody, err = io.ReadAll(r.Body)
 		if err != nil {
-			t.Fatalf("failed to read request body: %v", err)
+			t.Fatalf("read body: %v", err)
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	subscription := webhookSubscription{
-		ID:        "sub-123",
+	sub := webhookSubscription{
+		ID:        "sub-ts",
 		Secret:    "super-secret",
 		TargetURL: server.URL,
 	}
 	event := webhookEvent{
-		ID:              "evt-123",
+		ID:              "evt-ts",
 		ContractID:      "C123",
 		LedgerSequence:  55001,
 		Topic0:          "transfer",
@@ -55,28 +69,148 @@ func TestDeliverWebhookSendsSignedPayload(t *testing.T) {
 		Network:         "testnet",
 	}
 
-	if err := deliverWebhook(context.Background(), subscription, event); err != nil {
-		t.Fatalf("deliverWebhook returned error: %v", err)
+	if err := deliverWebhook(context.Background(), sub, event); err != nil {
+		t.Fatalf("deliverWebhook: %v", err)
 	}
 
-	if gotContentType != "application/json" {
-		t.Fatalf("expected application/json content type, got %q", gotContentType)
+	if gotCT != "application/json" {
+		t.Fatalf("unexpected Content-Type: %q", gotCT)
+	}
+	if gotTimestamp == "" {
+		t.Fatal("expected X-Trident-Timestamp header")
+	}
+	ts, err := strconv.ParseInt(gotTimestamp, 10, 64)
+	if err != nil || ts <= 0 {
+		t.Fatalf("X-Trident-Timestamp is not a valid unix second: %q", gotTimestamp)
 	}
 	if gotSignature == "" {
-		t.Fatalf("expected X-Trident-Signature header to be sent")
+		t.Fatal("expected X-Trident-Signature header")
 	}
-	if gotSignature != "sha256="+signWebhookBody(string(gotBody), subscription.Secret) {
-		t.Fatalf("unexpected signature header: %q", gotSignature)
+	expected := "sha256=" + signWebhookPayload(ts, string(gotBody), sub.Secret)
+	if gotSignature != expected {
+		t.Fatalf("signature mismatch: got %q, want %q", gotSignature, expected)
 	}
 
+	// Verify the payload structure.
 	var payload map[string]any
 	if err := json.Unmarshal(gotBody, &payload); err != nil {
-		t.Fatalf("payload was not valid JSON: %v", err)
+		t.Fatalf("payload not valid JSON: %v", err)
 	}
-	if payload["webhook_id"] != subscription.ID {
-		t.Fatalf("expected webhook_id to be set")
+	if payload["webhook_id"] != sub.ID {
+		t.Fatalf("expected webhook_id=%q, got %v", sub.ID, payload["webhook_id"])
 	}
 	if payload["event"].(map[string]any)["id"] != event.ID {
-		t.Fatalf("expected event id to be included in payload")
+		t.Fatalf("expected event.id=%q in payload", event.ID)
+	}
+	// Timestamp field must match the header.
+	if int64(payload["timestamp"].(float64)) != ts {
+		t.Fatalf("payload.timestamp %v != header timestamp %d", payload["timestamp"], ts)
+	}
+}
+
+func TestDeliverWebhookRetrySucceedsAfterTransientFailures(t *testing.T) {
+	var callCount atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := callCount.Add(1)
+		if n < 3 {
+			// Fail the first two attempts.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	sub := webhookSubscription{
+		ID:        "sub-retry",
+		Secret:    "s3cr3t",
+		TargetURL: server.URL,
+	}
+	event := webhookEvent{ID: "evt-retry", ContractID: "C1", Network: "testnet"}
+
+	err := deliverSubscriptionWithRetry(context.Background(), nil, sub, event)
+	if err != nil {
+		t.Fatalf("expected eventual success, got err: %v", err)
+	}
+	if got := int(callCount.Load()); got != 3 {
+		t.Fatalf("expected 3 HTTP calls (2 failures + 1 success), got %d", got)
+	}
+}
+
+func TestDeliverWebhookDeadLetterAfterMaxAttempts(t *testing.T) {
+	// Capture the log output to verify the dead-letter warning is emitted.
+	var callCount atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	sub := webhookSubscription{
+		ID:        "sub-dlq",
+		Secret:    "s3cr3t",
+		TargetURL: server.URL,
+	}
+	event := webhookEvent{ID: "evt-dlq", ContractID: "C1", Network: "testnet"}
+
+	err := deliverSubscriptionWithRetry(context.Background(), nil, sub, event)
+	// After max attempts an error should be returned.
+	if err == nil {
+		t.Fatal("expected error after exhausting retries, got nil")
+	}
+	if got := int(callCount.Load()); got != maxWebhookAttempts {
+		t.Fatalf("expected %d HTTP calls, got %d", maxWebhookAttempts, got)
+	}
+}
+
+func TestDeliverWebhookDeadLetterOnNetworkError(t *testing.T) {
+	// Point to a server that never responds.
+	sub := webhookSubscription{
+		ID:        "sub-net-dlq",
+		Secret:    "s3cr3t",
+		TargetURL: "http://127.0.0.1:0", // immediately refused
+	}
+	event := webhookEvent{ID: "evt-net-dlq", ContractID: "C1", Network: "testnet"}
+
+	err := deliverSubscriptionWithRetry(context.Background(), nil, sub, event)
+	if err == nil {
+		t.Fatal("expected error for unreachable endpoint")
+	}
+}
+
+func TestSignWebhookPayloadIsStable(t *testing.T) {
+	body := `{"id":"evt1"}`
+	secret := "my-secret"
+	ts := int64(1_700_000_000)
+
+	sig1 := signWebhookPayload(ts, body, secret)
+	sig2 := signWebhookPayload(ts, body, secret)
+	if sig1 != sig2 {
+		t.Fatalf("expected deterministic signature, got %q and %q", sig1, sig2)
+	}
+
+	// Different body → different signature.
+	sig3 := signWebhookPayload(ts, `{"id":"evt2"}`, secret)
+	if sig1 == sig3 {
+		t.Fatal("expected different signature for different body")
+	}
+
+	// Different secret → different signature.
+	sig4 := signWebhookPayload(ts, body, "other-secret")
+	if sig1 == sig4 {
+		t.Fatal("expected different signature for different secret")
+	}
+
+	// Signature must cover the timestamp — different ts ≠ same signature.
+	sig5 := signWebhookPayload(ts+1, body, secret)
+	if sig1 == sig5 {
+		t.Fatal("expected different signature for different timestamp")
+	}
+
+	// Must start with the hex representation (no prefix yet — raw hex from signWebhookPayload).
+	if strings.HasPrefix(sig1, "sha256=") {
+		t.Fatal("signWebhookPayload should return raw hex, not the sha256= prefixed form")
 	}
 }

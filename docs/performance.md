@@ -2,6 +2,32 @@
 
 This document describes the performance impact of the indexes added to `soroban_events` to support high-cardinality query patterns at scale.
 
+## API JSON Response Compression
+
+The Go API negotiates gzip or deflate response compression with `Accept-Encoding`
+for JSON responses larger than 1 KiB. Streaming endpoints such as
+`/v1/events/stream`, websocket upgrades, and non-JSON responses are excluded so
+SSE flushing semantics and protocol upgrades are not buffered.
+
+Representative benchmark:
+
+```bash
+cd services/api
+go test ./middleware -run '^$' -bench BenchmarkCompressionRepresentativeEvents -benchmem
+```
+
+Measured on a synthetic 100-event `GET /v1/events` JSON envelope:
+
+- Raw JSON: 63,989 bytes
+- gzip response: 1,288 bytes
+- Payload reduction: 98.0%
+- Benchmark throughput: 404,077 ns/op, 158.36 MB/s, 37 allocs/op
+
+The middleware sets `Vary: Accept-Encoding` so shared caches keep compressed and
+uncompressed representations separate. Response caches should store the
+uncompressed representation and allow this middleware to compress on the way
+out.
+
 ## Problem
 
 At small scales (< 10K rows), sequential scans are acceptable. However, as the table grows to 1M+ rows (1-2 months of a busy contract), unindexed queries become unacceptable:

@@ -4,20 +4,27 @@ use uuid::Uuid;
 
 const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
 
-/// Derive a deterministic UUID for an event from its indexer-internal composite key.
-///
-/// The UUID is derived from `(contract_id, ledger_sequence, event_index)`.
-/// See `crates/indexer/src/db/mod.rs` for the full rationale and the relationship
-/// to the natural key `(transaction_hash, event_index, network)`.
 fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid {
     let key = format!("{contract_id}:{ledger_sequence}:{event_index}");
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
-/// Insert a backfilled event.  Duplicate handling is identical to the indexer:
-/// - `ON CONFLICT (id) DO NOTHING` deduplicates replays.
-/// - The DB-level `UNIQUE (transaction_hash, event_index, network)` constraint
-///   (migration 0010) provides an independent protocol-level guard.
+/// Insert a backfilled event.
+///
+/// Duplicate handling uses two complementary strategies:
+/// - **Primary**: `ON CONFLICT (ledger_sequence, id) DO NOTHING` deduplicates
+///   replays, because `id` is a deterministic UUIDv5 of
+///   `(contract_id, ledger_sequence, event_index)`. The conflict target must
+///   include `ledger_sequence`: `soroban_events` is RANGE-partitioned on it
+///   (migration 0017), so the partition key is part of every unique index.
+/// - **Safety net**: `UNIQUE (transaction_hash, event_index, network)` at the
+///   DB layer (migration 0025) catches any case where the same protocol event
+///   would be inserted under a different derived `id`.
+///
+/// `network` must match the value used in `indexed_contracts` for this
+/// deployment (e.g. `"mainnet"` or `"testnet"`); the natural-key constraint is
+/// network-scoped because the same transaction hash can legitimately appear on
+/// more than one network.
 pub async fn insert_event(
     pool: &PgPool,
     event: &SorobanEvent,
@@ -41,7 +48,7 @@ pub async fn insert_event(
             (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
              event_index, event_type, topics, data, network)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (ledger_sequence, id) DO NOTHING
         "#,
     )
     .bind(id)

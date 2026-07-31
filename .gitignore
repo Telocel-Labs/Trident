@@ -30,3 +30,8 @@ Thumbs.db
 # Misc
 *.log
 dist/
+__pycache__/
+*.pyc
+
+# soroban-sdk test debug snapshots (contracts/)
+test_snapshots/

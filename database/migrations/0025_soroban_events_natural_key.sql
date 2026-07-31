@@ -1,4 +1,4 @@
--- Migration 0010: enforce natural-key uniqueness on soroban_events
+-- Migration 0025: enforce natural-key uniqueness on soroban_events
 -- ---------------------------------------------------------------------------
 -- Decision record
 -- ---------------

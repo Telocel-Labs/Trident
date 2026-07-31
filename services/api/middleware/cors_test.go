@@ -177,11 +177,11 @@ func TestCORS(t *testing.T) {
 	}
 }
 
-func TestNewCORSFromEnv(t *testing.T) {
+func TestNewCORSFromEnvLegacy(t *testing.T) {
 	t.Run("empty env = wildcard", func(t *testing.T) {
 		t.Setenv("ALLOWED_ORIGINS", "")
 		nextCalled := false
-		handler := NewCORSFromEnv()(okHandler(&nextCalled))
+		handler := NewCORSFromEnvLegacy()(okHandler(&nextCalled))
 
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Header.Set("Origin", "https://anything.com")
@@ -199,7 +199,7 @@ func TestNewCORSFromEnv(t *testing.T) {
 	t.Run("star env = wildcard", func(t *testing.T) {
 		t.Setenv("ALLOWED_ORIGINS", "*")
 		nextCalled := false
-		handler := NewCORSFromEnv()(okHandler(&nextCalled))
+		handler := NewCORSFromEnvLegacy()(okHandler(&nextCalled))
 
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Header.Set("Origin", "https://anything.com")
@@ -214,7 +214,7 @@ func TestNewCORSFromEnv(t *testing.T) {
 	t.Run("comma-separated list parsed and trimmed", func(t *testing.T) {
 		t.Setenv("ALLOWED_ORIGINS", " https://a.com , https://b.com ")
 		nextCalled := false
-		handler := NewCORSFromEnv()(okHandler(&nextCalled))
+		handler := NewCORSFromEnvLegacy()(okHandler(&nextCalled))
 
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Header.Set("Origin", "https://a.com")

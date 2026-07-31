@@ -1,0 +1,253 @@
+name: Staging Deploy
+
+# Merge to dev -> build+push images -> deploy to staging -> run migrations ->
+# smoke test staging (issue #313). See docs/deployment.md#staging for the
+# full write-up, including what is fully automated here vs. best-effort.
+#
+# IMPORTANT — partially stubbed pending issue #308:
+# The "run migrations" step below is a placeholder. Issue #308 ("database
+# migration job as a Helm hook") is still open/unimplemented — there is no
+# Helm pre-upgrade hook Job in helm/trident/templates yet. Until #308 lands,
+# this workflow runs migrations directly via `sqlx migrate run` against the
+# staging database from the runner (same mechanism CI's `rust` job already
+# uses), which is a reasonable stand-in but is NOT the same thing as an
+# in-cluster, chart-versioned migration hook that runs exactly once per
+# release and blocks the rollout on failure. Replace the "Run database
+# migrations" step with a `helm upgrade --wait` against the real hook once
+# #308 ships.
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch: {}
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  ORG: telocel-labs
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build + push images tagged for staging. Reuses the same Dockerfiles as the
+  # tag-triggered release.yml (issue #302, closed) but tags with the commit
+  # sha + a floating `staging` tag instead of a semver release tag.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build and push staging images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha: ${{ steps.sha.outputs.short }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3 # v3.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20 # v3.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push indexer
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: crates/indexer/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer:staging
+            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer:staging-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push gRPC API
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: crates/api/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api:staging
+            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api:staging-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Go API
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: services/api/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:staging
+            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:staging-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Detect whether staging deploy credentials are configured. Forked PRs and
+  # repos that haven't provisioned a staging cluster yet get a clean, visibly
+  # skipped run instead of a hard failure on every dev push.
+  # ---------------------------------------------------------------------------
+  check-staging-config:
+    name: Check staging secrets are configured
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          HAS_KUBECONFIG: ${{ secrets.STAGING_KUBECONFIG != '' }}
+        run: |
+          if [ "$HAS_KUBECONFIG" = "true" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::STAGING_KUBECONFIG is not set — skipping deploy+smoke test. See docs/deployment.md#staging."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Deploy to staging via Helm, then run migrations.
+  #
+  # Requires repo/org secret STAGING_KUBECONFIG (base64 kubeconfig with access
+  # to the staging namespace) and variable STAGING_NAMESPACE. Not configured
+  # in this environment — see check-staging-config above and docs/deployment.md.
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: [build-and-push, check-staging-config]
+    if: needs.check-staging-config.outputs.configured == 'true'
+    environment: staging
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Helm
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: "3.14.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.STAGING_KUBECONFIG }}" | base64 -d > "$HOME/.kube/config"
+
+      - name: Helm upgrade --install
+        run: |
+          helm upgrade --install trident-staging helm/trident \
+            -f helm/trident/values.yaml \
+            -f helm/trident/values-staging.yaml \
+            --namespace "${{ vars.STAGING_NAMESPACE || 'trident-staging' }}" \
+            --create-namespace \
+            --set indexer.image.tag=staging-${{ needs.build-and-push.outputs.sha }} \
+            --set grpcApi.image.tag=staging-${{ needs.build-and-push.outputs.sha }} \
+            --set goApi.image.tag=staging-${{ needs.build-and-push.outputs.sha }} \
+            --wait --timeout 5m
+
+      # STUBBED pending issue #308 — see the note at the top of this file.
+      # Runs migrations from the runner directly rather than via an in-cluster
+      # Helm hook. Requires STAGING_DATABASE_URL to be reachable from the
+      # runner (e.g. via a VPN/peering step not modeled here, or a public
+      # staging DB endpoint) — if your staging Postgres isn't runner-reachable,
+      # this step needs a `kubectl run`/Job variant instead.
+      - name: Run database migrations (stand-in for issue #308's Helm hook)
+        if: vars.STAGING_DATABASE_URL != ''
+        env:
+          DATABASE_URL: ${{ vars.STAGING_DATABASE_URL }}
+        run: |
+          cargo install sqlx-cli --no-default-features --features postgres || true
+          sqlx migrate run --source database/migrations
+
+  # ---------------------------------------------------------------------------
+  # Post-deploy smoke test against staging: health, a real query, the SSE
+  # stream endpoint, and an error path. Mirrors the shape of the `e2e` job's
+  # assertions in ci.yml (issue #301, closed) but points at the deployed
+  # staging URL instead of a local docker compose stack.
+  #
+  # A failing smoke test fails this job, which is a required check on the
+  # `environment: staging` deployment above — GitHub Environments can be
+  # configured with protection rules so a failed smoke test blocks promotion
+  # (see docs/deployment.md#staging for wiring that up in repo settings,
+  # which this workflow file cannot itself configure).
+  # ---------------------------------------------------------------------------
+  smoke-test-staging:
+    name: Smoke test staging
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: vars.STAGING_URL != ''
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Health check
+        run: |
+          curl --silent --fail --retry 10 --retry-delay 5 --retry-connrefused \
+            --max-time 10 "${{ vars.STAGING_URL }}/v1/health"
+
+      - name: Query path (GET /v1/events)
+        env:
+          STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          curl --silent --fail --max-time 10 \
+            -H "X-API-Key: ${STAGING_API_KEY}" \
+            "${{ vars.STAGING_URL }}/v1/events?limit=1" \
+            | python3 -c "import sys,json; json.load(sys.stdin); print('OK: /v1/events returned valid JSON')"
+
+      - name: Stream path (GET /v1/events/stream, bounded)
+        env:
+          STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          # Bounded read: the SSE stream never closes on its own, so cap wall
+          # time and treat "connected and received at least one byte or
+          # timed out cleanly" as success — this only proves the stream
+          # endpoint is reachable and doesn't immediately error, matching the
+          # canary's intent (issue #301) without needing a live event.
+          curl --silent --fail --max-time 8 \
+            -H "X-API-Key: ${STAGING_API_KEY}" \
+            "${{ vars.STAGING_URL }}/v1/events/stream" > /dev/null || \
+            { code=$?; [ "$code" -eq 28 ] && echo "OK: stream connected (bounded timeout reached)" || { echo "FAIL: stream endpoint errored (curl exit $code)"; exit 1; }; }
+
+      - name: Error path (invalid API key -> 401)
+        run: |
+          status=$(curl --silent -o /dev/null -w '%{http_code}' --max-time 10 \
+            -H "X-API-Key: definitely-not-a-valid-key" \
+            "${{ vars.STAGING_URL }}/v1/events?limit=1")
+          if [ "$status" != "401" ]; then
+            echo "FAIL: expected 401 for an invalid API key, got $status"
+            exit 1
+          fi
+          echo "OK: invalid API key correctly rejected with 401"
+
+  # ---------------------------------------------------------------------------
+  # Alert on a failed staging deploy/smoke test. Reuses ALERT_WEBHOOK_URL
+  # (already read by the indexer for lag alerts) as a generic ops webhook.
+  # ---------------------------------------------------------------------------
+  alert-on-failure:
+    name: Alert on staging failure
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, smoke-test-staging]
+    if: failure() && vars.STAGING_ALERT_WEBHOOK_URL != ''
+    steps:
+      - name: POST failure notification
+        run: |
+          curl --silent --fail --max-time 10 -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"Trident staging deploy/smoke test failed for ${{ github.sha }} — promotion to main blocked.\"}" \
+            "${{ vars.STAGING_ALERT_WEBHOOK_URL }}"

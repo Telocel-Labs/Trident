@@ -125,4 +125,10 @@ message StreamEventsRequest {
 
   // Optional topic_0 filter — only events whose first topic matches are pushed.
   string topic_0 = 2;
+
+  // Resume point: the last stream entry ID the client already received.
+  // Empty means "live tail" — only events published after subscribing, which
+  // is the previous behaviour. Mirrors SSE Last-Event-ID semantics so a
+  // reconnecting client can replay what it missed instead of losing it.
+  string start_id = 3;
 }

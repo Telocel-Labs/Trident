@@ -163,7 +163,10 @@ type ListEventsRequest struct {
 	// Opaque cursor from the previous response. Empty string on first call.
 	Cursor string `protobuf:"bytes,6,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	// Maximum number of events to return. Capped server-side at 200.
-	Limit         uint32 `protobuf:"varint,7,opt,name=limit,proto3" json:"limit,omitempty"`
+	Limit uint32 `protobuf:"varint,7,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Network scope derived from the authenticated API key ("testnet" | "mainnet").
+	// Enforced server-side; cannot be overridden by the caller.
+	Network       string `protobuf:"bytes,8,opt,name=network,proto3" json:"network,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -247,6 +250,13 @@ func (x *ListEventsRequest) GetLimit() uint32 {
 	return 0
 }
 
+func (x *ListEventsRequest) GetNetwork() string {
+	if x != nil {
+		return x.Network
+	}
+	return ""
+}
+
 type ListEventsResponse struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Events []*Event               `protobuf:"bytes,1,rep,name=events,proto3" json:"events,omitempty"`
@@ -312,7 +322,10 @@ func (x *ListEventsResponse) GetHasMore() bool {
 type GetEventRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// UUID of the event to fetch.
-	Id            string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Network scope derived from the authenticated API key ("testnet" | "mainnet").
+	// Enforced server-side; cannot be overridden by the caller.
+	Network       string `protobuf:"bytes,2,opt,name=network,proto3" json:"network,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -354,12 +367,24 @@ func (x *GetEventRequest) GetId() string {
 	return ""
 }
 
+func (x *GetEventRequest) GetNetwork() string {
+	if x != nil {
+		return x.Network
+	}
+	return ""
+}
+
 type StreamEventsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Contract address to subscribe to. Required.
 	ContractId string `protobuf:"bytes,1,opt,name=contract_id,json=contractId,proto3" json:"contract_id,omitempty"`
 	// Optional topic_0 filter — only events whose first topic matches are pushed.
-	Topic_0       string `protobuf:"bytes,2,opt,name=topic_0,json=topic0,proto3" json:"topic_0,omitempty"`
+	Topic_0 string `protobuf:"bytes,2,opt,name=topic_0,json=topic0,proto3" json:"topic_0,omitempty"`
+	// Resume point: the last stream entry ID the client already received.
+	// Empty means "live tail" — only events published after subscribing, which
+	// is the previous behaviour. Mirrors SSE Last-Event-ID semantics so a
+	// reconnecting client can replay what it missed instead of losing it.
+	StartId       string `protobuf:"bytes,3,opt,name=start_id,json=startId,proto3" json:"start_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -408,6 +433,13 @@ func (x *StreamEventsRequest) GetTopic_0() string {
 	return ""
 }
 
+func (x *StreamEventsRequest) GetStartId() string {
+	if x != nil {
+		return x.StartId
+	}
+	return ""
+}
+
 var File_proto_trident_proto protoreflect.FileDescriptor
 
 const file_proto_trident_proto_rawDesc = "" +
@@ -428,7 +460,7 @@ const file_proto_trident_proto_rawDesc = "" +
 	"\x04data\x18\t \x01(\tR\x04data\x12\x1d\n" +
 	"\n" +
 	"created_at\x18\n" +
-	" \x01(\tR\tcreatedAt\"\xd2\x01\n" +
+	" \x01(\tR\tcreatedAt\"\xec\x01\n" +
 	"\x11ListEventsRequest\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\tR\n" +
 	"contractId\x12\x17\n" +
@@ -438,18 +470,21 @@ const file_proto_trident_proto_rawDesc = "" +
 	"ledgerFrom\x12\x1b\n" +
 	"\tledger_to\x18\x05 \x01(\x04R\bledgerTo\x12\x16\n" +
 	"\x06cursor\x18\x06 \x01(\tR\x06cursor\x12\x14\n" +
-	"\x05limit\x18\a \x01(\rR\x05limit\"x\n" +
+	"\x05limit\x18\a \x01(\rR\x05limit\x12\x18\n" +
+	"\anetwork\x18\b \x01(\tR\anetwork\"x\n" +
 	"\x12ListEventsResponse\x12&\n" +
 	"\x06events\x18\x01 \x03(\v2\x0e.trident.EventR\x06events\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\tR\n" +
 	"nextCursor\x12\x19\n" +
-	"\bhas_more\x18\x03 \x01(\bR\ahasMore\"!\n" +
+	"\bhas_more\x18\x03 \x01(\bR\ahasMore\";\n" +
 	"\x0fGetEventRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"O\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
+	"\anetwork\x18\x02 \x01(\tR\anetwork\"j\n" +
 	"\x13StreamEventsRequest\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\tR\n" +
 	"contractId\x12\x17\n" +
-	"\atopic_0\x18\x02 \x01(\tR\x06topic02\xc5\x01\n" +
+	"\atopic_0\x18\x02 \x01(\tR\x06topic0\x12\x19\n" +
+	"\bstart_id\x18\x03 \x01(\tR\astartId2\xc5\x01\n" +
 	"\x06Events\x12E\n" +
 	"\n" +
 	"ListEvents\x12\x1a.trident.ListEventsRequest\x1a\x1b.trident.ListEventsResponse\x124\n" +

@@ -17,6 +17,21 @@ spec:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
+          # /internal/ (services/api/handlers/status.go) is cluster-internal
+          # only. It has its own X-Internal-Key auth, but this path is listed
+          # first and more specific so ingress-nginx matches it before the
+          # catch-all "/" below and returns 403 regardless of that check —
+          # defense in depth, mirroring docker/nginx/nginx.conf (issue #316,
+          # #320). Requires the ingress-nginx controller (the
+          # nginx.ingress.kubernetes.io/* annotations below are controller-
+          # specific); adapt to an equivalent construct for other controllers.
+          - path: /internal/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "trident.fullname" . }}-go-api
+                port:
+                  number: {{ .Values.goApi.service.port }}
           - path: /
             pathType: Prefix
             backend:

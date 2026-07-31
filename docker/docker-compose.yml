@@ -3,7 +3,7 @@
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:de13e74e14b98eb96bdf886791ae47686c3c5d29f9d5f85ea55206843e3fce26
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
@@ -38,7 +38,14 @@ services:
   # for the prepared-statement / session-variable caveats this implies.
   # ---------------------------------------------------------------------------
   pgbouncer:
-    image: pgbouncer/pgbouncer:1.22
+    # NOTE: pgbouncer/pgbouncer never published a 1.22 tag — its newest is
+    # 1.15.0 — and the digest previously pinned here did not exist either, so
+    # this service could not start at all (issue #371). Pinned to the real
+    # 1.15.0. If a newer PgBouncer is needed, edoburu/pgbouncer tracks
+    # upstream far more closely (v1.25.x), but it takes a different
+    # configuration contract than the PGBOUNCER_* variables set below, so
+    # switching is a deliberate change rather than a retag.
+    image: pgbouncer/pgbouncer:1.15.0@sha256:aa8a38b7b33e5fe70c679053f97a8e55c74d52b00c195f0880845e52b50ce516
     environment:
       DATABASES_HOST: postgres
       DATABASES_PORT: 5432
@@ -79,6 +86,12 @@ services:
       NETWORK: ${NETWORK}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
+      # Rows per batched INSERT when a page is committed (statement size only —
+      # the page is always one transaction).
+      DB_BATCH_SIZE: ${DB_BATCH_SIZE:-1000}
+      # Topic patterns added to the getEvents filter. Empty means no topic
+      # narrowing, which is the default.
+      INDEX_TOPIC_FILTERS: ${INDEX_TOPIC_FILTERS:-}
       METRICS_PORT: ${METRICS_PORT}
       LOG_LEVEL: ${LOG_LEVEL}
     ports:

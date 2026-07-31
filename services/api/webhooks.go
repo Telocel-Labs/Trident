@@ -15,12 +15,19 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
+	"github.com/Depo-dev/trident/services/api/validation"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 )
+
+const maxWebhookAttempts = 5
 
 type webhookSubscription struct {
 	ID         string     `json:"id"`
@@ -45,10 +52,11 @@ type webhookEvent struct {
 }
 
 type webhookPayload struct {
-	ID          string        `json:"id"`
-	WebhookID   string        `json:"webhook_id"`
-	Event       webhookEvent  `json:"event"`
-	DeliveredAt string        `json:"delivered_at"`
+	ID          string       `json:"id"`
+	WebhookID   string       `json:"webhook_id"`
+	Event       webhookEvent `json:"event"`
+	Timestamp   int64        `json:"timestamp"` // Unix seconds; also used in signature
+	DeliveredAt string       `json:"delivered_at"`
 }
 
 type webhookDelivery struct {
@@ -56,6 +64,8 @@ type webhookDelivery struct {
 	SubscriptionID string    `json:"subscriptionId"`
 	EventID        string    `json:"eventId"`
 	Attempt        int       `json:"attempt"`
+	Attempts       int       `json:"attempts"`
+	Status         string    `json:"status"`
 	StatusCode     *int      `json:"statusCode,omitempty"`
 	ResponseBody   string    `json:"responseBody,omitempty"`
 	DeliveredAt    time.Time `json:"deliveredAt"`
@@ -80,23 +90,32 @@ func resolveAPIKeyID(ctx context.Context, db *sql.DB, r *http.Request) (string, 
 }
 
 type webhookDeliveryResult struct {
-	Success     bool
-	StatusCode  int
+	Success      bool
+	StatusCode   int
 	ResponseBody string
-	Err         error
+	Err          error
 }
 
-func signWebhookBody(body string, secret string) string {
+// signWebhookPayload signs "${timestamp}.${body}" with the subscription secret
+// using HMAC-SHA256. The timestamp (Unix seconds) is also sent as the
+// X-Trident-Timestamp header so receivers can verify replay attacks:
+//
+//	mac := hmac.New(sha256.New, []byte(secret))
+//	mac.Write([]byte(fmt.Sprintf("%d.%s", timestamp, body)))
+//	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+func signWebhookPayload(timestamp int64, body string, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(body))
+	_, _ = fmt.Fprintf(mac, "%d.%s", timestamp, body)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func verifyWebhookSignature(body string, signature string, secret string) bool {
+// verifyWebhookSignature checks the HMAC-SHA256 signature over
+// "${timestamp}.${body}" against the X-Trident-Signature header value.
+func verifyWebhookSignature(timestamp int64, body string, signature string, secret string) bool {
 	if !strings.HasPrefix(signature, "sha256=") {
 		return false
 	}
-	expected := "sha256=" + signWebhookBody(body, secret)
+	expected := "sha256=" + signWebhookPayload(timestamp, body, secret)
 	return subtle.ConstantTimeCompare([]byte(signature), []byte(expected)) == 1
 }
 
@@ -282,20 +301,36 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 }
 
 func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSubscription, event webhookEvent) error {
-	for attempt := 1; attempt <= 5; attempt++ {
+	for attempt := 1; attempt <= maxWebhookAttempts; attempt++ {
+		start := time.Now()
 		result := performWebhookDelivery(ctx, sub, event)
-		if err := recordWebhookDelivery(ctx, db, sub.ID, event.ID, attempt, result); err != nil {
+		durationMs := time.Since(start).Milliseconds()
+
+		isLast := attempt == maxWebhookAttempts
+		status := "failed"
+		if result.Success {
+			status = "success"
+		} else if isLast {
+			status = "dead_lettered"
+		}
+
+		if err := recordWebhookDelivery(ctx, db, sub.ID, event.ID, attempt, status, result); err != nil {
 			slog.Warn("failed to record webhook delivery", "err", err)
 		}
+
+		handlers.RecordWebhookDelivery(result.Success, isLast && !result.Success, durationMs)
 		if result.Success {
 			return nil
 		}
-		if attempt == 5 {
-			if _, err := db.ExecContext(ctx, `UPDATE webhook_subscriptions SET paused_at = NOW() WHERE id = $1`, sub.ID); err != nil {
-				slog.Warn("failed to pause webhook subscription", "subscription_id", sub.ID, "err", err)
-			}
+		if isLast {
+			slog.Warn("webhook delivery dead-lettered after max attempts",
+				"subscription_id", sub.ID,
+				"event_id", event.ID,
+				"attempts", maxWebhookAttempts,
+			)
 			return result.Err
 		}
+
 		sleepDuration := time.Duration(1<<uint(attempt-1)) * time.Second
 		select {
 		case <-ctx.Done():
@@ -307,7 +342,8 @@ func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSu
 }
 
 func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event webhookEvent) webhookDeliveryResult {
-	payload, err := buildWebhookPayload(sub.ID, event)
+	now := time.Now().Unix()
+	payload, err := buildWebhookPayload(sub.ID, event, now)
 	if err != nil {
 		return webhookDeliveryResult{Err: err}
 	}
@@ -318,7 +354,8 @@ func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Trident-Signature", "sha256="+signWebhookBody(string(payload), sub.Secret))
+	req.Header.Set("X-Trident-Timestamp", strconv.FormatInt(now, 10))
+	req.Header.Set("X-Trident-Signature", "sha256="+signWebhookPayload(now, string(payload), sub.Secret))
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
@@ -335,17 +372,18 @@ func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event 
 	return webhookDeliveryResult{Success: false, StatusCode: resp.StatusCode, ResponseBody: responseBody, Err: fmt.Errorf("webhook returned status %d", resp.StatusCode)}
 }
 
-func buildWebhookPayload(subscriptionID string, event webhookEvent) ([]byte, error) {
+func buildWebhookPayload(subscriptionID string, event webhookEvent, timestamp int64) ([]byte, error) {
 	payload := webhookPayload{
-		ID:        fmt.Sprintf("wh_%d", time.Now().UnixNano()),
-		WebhookID: subscriptionID,
-		Event:     event,
+		ID:          fmt.Sprintf("wh_%d", time.Now().UnixNano()),
+		WebhookID:   subscriptionID,
+		Event:       event,
+		Timestamp:   timestamp,
 		DeliveredAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	return json.Marshal(payload)
 }
 
-func recordWebhookDelivery(ctx context.Context, db *sql.DB, subscriptionID string, eventID string, attempt int, result webhookDeliveryResult) error {
+func recordWebhookDelivery(ctx context.Context, db *sql.DB, subscriptionID string, eventID string, attempt int, status string, result webhookDeliveryResult) error {
 	if db == nil {
 		return nil
 	}
@@ -354,9 +392,9 @@ func recordWebhookDelivery(ctx context.Context, db *sql.DB, subscriptionID strin
 		statusCode = &result.StatusCode
 	}
 	_, err := db.ExecContext(ctx, `
-		INSERT INTO webhook_deliveries (subscription_id, event_id, attempt, status_code, response_body, success)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, subscriptionID, eventID, attempt, statusCode, truncateString(result.ResponseBody, 500), result.Success)
+		INSERT INTO webhook_deliveries (subscription_id, event_id, attempt, attempts, status, status_code, response_body, success)
+		VALUES ($1, $2, $3, $3, $4, $5, $6, $7)
+	`, subscriptionID, eventID, attempt, status, statusCode, truncateString(result.ResponseBody, 500), result.Success)
 	return err
 }
 
@@ -424,6 +462,10 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 			Network    string  `json:"network"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
@@ -461,12 +503,12 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 func deleteWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		result, err := db.ExecContext(r.Context(), `DELETE FROM webhook_subscriptions WHERE id = $1`, id)
@@ -486,12 +528,12 @@ func deleteWebhookHandler(db *sql.DB) http.HandlerFunc {
 func pauseWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		if _, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NOW() WHERE id = $1`, id); err != nil {
@@ -505,12 +547,12 @@ func pauseWebhookHandler(db *sql.DB) http.HandlerFunc {
 func resumeWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		if _, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NULL WHERE id = $1`, id); err != nil {
@@ -524,16 +566,16 @@ func resumeWebhookHandler(db *sql.DB) http.HandlerFunc {
 func deliveriesWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		rows, err := db.QueryContext(r.Context(), `
-			SELECT id, subscription_id, event_id, attempt, status_code, response_body, delivered_at, success
+			SELECT id, subscription_id, event_id, attempt, attempts, status, status_code, response_body, delivered_at, success
 			FROM webhook_deliveries
 			WHERE subscription_id = $1
 			ORDER BY delivered_at DESC
@@ -549,7 +591,7 @@ func deliveriesWebhookHandler(db *sql.DB) http.HandlerFunc {
 		for rows.Next() {
 			var delivery webhookDelivery
 			var statusCode sql.NullInt64
-			if err := rows.Scan(&delivery.ID, &delivery.SubscriptionID, &delivery.EventID, &delivery.Attempt, &statusCode, &delivery.ResponseBody, &delivery.DeliveredAt, &delivery.Success); err != nil {
+			if err := rows.Scan(&delivery.ID, &delivery.SubscriptionID, &delivery.EventID, &delivery.Attempt, &delivery.Attempts, &delivery.Status, &statusCode, &delivery.ResponseBody, &delivery.DeliveredAt, &delivery.Success); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -560,6 +602,137 @@ func deliveriesWebhookHandler(db *sql.DB) http.HandlerFunc {
 			deliveries = append(deliveries, delivery)
 		}
 		writeJSON(w, http.StatusOK, deliveries)
+	}
+}
+
+// deadLettersWebhookHandler handles GET /v1/webhooks/{id}/dead-letters.
+// Returns all dead-lettered deliveries for operator inspection.
+func deadLettersWebhookHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if id == "" {
+			http.Error(w, "missing webhook id", http.StatusBadRequest)
+			return
+		}
+		if db == nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		rows, err := db.QueryContext(r.Context(), `
+			SELECT id, subscription_id, event_id, attempt, attempts, status, status_code, response_body, delivered_at, success
+			FROM webhook_deliveries
+			WHERE subscription_id = $1 AND status = 'dead_lettered'
+			ORDER BY delivered_at DESC
+			LIMIT 200
+		`, id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() { _ = rows.Close() }()
+
+		var deliveries []webhookDelivery
+		for rows.Next() {
+			var delivery webhookDelivery
+			var statusCode sql.NullInt64
+			if err := rows.Scan(&delivery.ID, &delivery.SubscriptionID, &delivery.EventID, &delivery.Attempt, &delivery.Attempts, &delivery.Status, &statusCode, &delivery.ResponseBody, &delivery.DeliveredAt, &delivery.Success); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if statusCode.Valid {
+				code := int(statusCode.Int64)
+				delivery.StatusCode = &code
+			}
+			deliveries = append(deliveries, delivery)
+		}
+		if deliveries == nil {
+			deliveries = []webhookDelivery{}
+		}
+		writeJSON(w, http.StatusOK, deliveries)
+	}
+}
+
+// replayDeadLetterHandler handles POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay.
+// Re-attempts delivery of a single dead-lettered event and returns the result.
+func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		subID := r.PathValue("id")
+		deliveryIDStr := r.PathValue("deliveryId")
+		if subID == "" || deliveryIDStr == "" {
+			http.Error(w, "missing webhook id or delivery id", http.StatusBadRequest)
+			return
+		}
+		if db == nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Load the dead-lettered delivery.
+		var eventID string
+		var prevAttempts int
+		err := db.QueryRowContext(r.Context(), `
+			SELECT event_id, attempts FROM webhook_deliveries
+			WHERE id = $1 AND subscription_id = $2 AND status = 'dead_lettered'
+		`, deliveryIDStr, subID).Scan(&eventID, &prevAttempts)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Load the subscription.
+		var sub webhookSubscription
+		var topic0 sql.NullString
+		var pausedAt sql.NullTime
+		err = db.QueryRowContext(r.Context(), `
+			SELECT id, api_key_id, contract_id, topic0, target_url, secret, created_at, paused_at, network
+			FROM webhook_subscriptions WHERE id = $1
+		`, subID).Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &sub.CreatedAt, &pausedAt, &sub.Network)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if topic0.Valid {
+			sub.Topic0 = &topic0.String
+		}
+
+		// Load the original event.
+		var event webhookEvent
+		err = db.QueryRowContext(r.Context(), `
+			SELECT id, contract_id, ledger_sequence, topic0, data::text, transaction_hash, network
+			FROM soroban_events WHERE id = $1
+		`, eventID).Scan(&event.ID, &event.ContractID, &event.LedgerSequence, &event.Topic0, &event.TransactionHash, &event.TransactionHash, &event.Network)
+		if err != nil {
+			// If event can't be loaded, synthesise a minimal one for replay.
+			event.ID = eventID
+		}
+
+		start := time.Now()
+		result := performWebhookDelivery(r.Context(), sub, event)
+		handlers.RecordWebhookDelivery(result.Success, false, time.Since(start).Milliseconds())
+		status := "failed"
+		if result.Success {
+			status = "success"
+		}
+		replayAttempt := prevAttempts + 1
+		if err := recordWebhookDelivery(r.Context(), db, subID, eventID, replayAttempt, status, result); err != nil {
+			slog.Warn("failed to record replay delivery", "err", err)
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":       result.Success,
+			"status":        status,
+			"attempt":       replayAttempt,
+			"status_code":   result.StatusCode,
+			"response_body": truncateString(result.ResponseBody, 500),
+		})
 	}
 }
 

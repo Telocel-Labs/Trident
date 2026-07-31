@@ -1,0 +1,61 @@
+# Staging overlay for the Trident Helm chart (issue #313).
+#
+# Applied on top of values.yaml via:
+#   helm upgrade --install trident-staging helm/trident \
+#     -f helm/trident/values.yaml -f helm/trident/values-staging.yaml \
+#     --set indexer.image.tag=<sha> --set grpcApi.image.tag=<sha> --set goApi.image.tag=<sha>
+#
+# Scaled down from production defaults (single replicas, smaller resource
+# requests) since staging exists to validate the dev branch's deploy path and
+# run smoke tests, not to serve production load.
+
+indexer:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+grpcApi:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+goApi:
+  replicaCount: 1
+  hpa:
+    minReplicas: 1
+    maxReplicas: 3
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "250m"
+      memory: "128Mi"
+  podDisruptionBudget:
+    enabled: false
+  topologySpreadConstraints:
+    enabled: false
+
+nginx:
+  replicaCount: 1
+  podDisruptionBudget:
+    enabled: false
+
+ingress:
+  enabled: false
+
+# Staging still uses the existingSecret pattern (issue #305) — populate
+# trident-secrets in the staging namespace/cluster the same way as
+# production, just pointed at staging Postgres/Redis instances.
+global:
+  existingSecret: trident-secrets

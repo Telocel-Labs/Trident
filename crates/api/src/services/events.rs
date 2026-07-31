@@ -45,8 +45,62 @@ fn extract_context(metadata: &tonic::metadata::MetadataMap) -> opentelemetry::Co
 }
 
 const REDIS_STREAM_KEY: &str = "trident:events";
-const STREAM_CHANNEL_BUF: usize = 128;
+
+/// Default in-flight buffer per subscriber. Bounded so one slow consumer
+/// cannot make the server accumulate events without limit; when it fills, the
+/// consumer task blocks on send and stops reading Redis.
+const DEFAULT_STREAM_CHANNEL_BUF: usize = 128;
+
+/// How long a single blocking XREAD waits before looping. Short enough that a
+/// dropped client is noticed promptly, long enough to avoid busy polling.
+const XREAD_BLOCK_MS: usize = 5_000;
+
+/// Redis stream ID meaning "only entries added after this call".
+const STREAM_ID_LIVE_TAIL: &str = "$";
+
 const DEFAULT_NETWORK: &str = "testnet";
+
+/// Per-subscriber buffer size, overridable via `STREAM_CHANNEL_BUFFER`.
+fn stream_channel_buffer() -> usize {
+    std::env::var("STREAM_CHANNEL_BUFFER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_STREAM_CHANNEL_BUF)
+}
+
+/// Validate a client-supplied resume point.
+///
+/// Redis stream IDs are `<millis>-<seq>`. `0` (replay everything still in the
+/// stream) and `$` (live tail) are also accepted. Anything else is rejected
+/// rather than passed through, because Redis would answer a malformed ID with a
+/// connection-level error that the subscriber would see as an opaque failure.
+// `Status` is the error type the gRPC surface must return; boxing it here would
+// only move the size to the caller.
+#[allow(clippy::result_large_err)]
+fn validate_start_id(start_id: &str) -> Result<String, Status> {
+    if start_id.is_empty() {
+        return Ok(STREAM_ID_LIVE_TAIL.to_string());
+    }
+    if start_id == STREAM_ID_LIVE_TAIL || start_id == "0" {
+        return Ok(start_id.to_string());
+    }
+
+    let mut parts = start_id.split('-');
+    let valid = matches!((parts.next(), parts.next(), parts.next()), (Some(ms), Some(seq), None)
+        if !ms.is_empty()
+            && !seq.is_empty()
+            && ms.bytes().all(|b| b.is_ascii_digit())
+            && seq.bytes().all(|b| b.is_ascii_digit()));
+
+    if valid {
+        Ok(start_id.to_string())
+    } else {
+        Err(Status::invalid_argument(
+            "start_id must be a Redis stream ID (<millis>-<seq>), \"0\", or \"$\"",
+        ))
+    }
+}
 
 pub struct EventsServiceImpl {
     pub db: PgPool,
@@ -95,7 +149,53 @@ fn row_to_event(row: EventRow) -> Event {
 
 fn db_err(e: sqlx::Error) -> Status {
     tracing::error!(error = %e, "database error");
-    Status::internal("internal error")
+    Status::unavailable("database temporarily unavailable")
+}
+
+// Same rationale as `validate_start_id` above: `Status` is the gRPC surface's
+// error type, so boxing it here would only move the size to the caller.
+#[allow(clippy::result_large_err)]
+fn validate_list_events(req: &ListEventsRequest) -> Result<(), Status> {
+    if req.contract_id.len() > 256 {
+        return Err(Status::invalid_argument(
+            "contract_id must be at most 256 characters",
+        ));
+    }
+
+    if req.topic_0.len() > 128 {
+        return Err(Status::invalid_argument(
+            "topic_0 must be at most 128 characters",
+        ));
+    }
+
+    if req.topic_1.len() > 128 {
+        return Err(Status::invalid_argument(
+            "topic_1 must be at most 128 characters",
+        ));
+    }
+
+    if req.network.len() > 64 {
+        return Err(Status::invalid_argument(
+            "network must be at most 64 characters",
+        ));
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_get_event(req: &GetEventRequest) -> Result<(), Status> {
+    if req.id.is_empty() {
+        return Err(Status::invalid_argument("id is required"));
+    }
+
+    if req.network.len() > 64 {
+        return Err(Status::invalid_argument(
+            "network must be at most 64 characters",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Normalise a network string — defaults to "testnet" when empty.
@@ -104,6 +204,117 @@ fn resolve_network(network: &str) -> &str {
         DEFAULT_NETWORK
     } else {
         network
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redis stream consumer (issue #236)
+// ---------------------------------------------------------------------------
+
+/// What one subscriber asked for.
+struct StreamSubscription {
+    contract_id: String,
+    topic_0: Option<String>,
+    /// Validated Redis stream ID to read from.
+    start_id: String,
+}
+
+/// Read one field of a stream entry as a string, defaulting to empty.
+fn entry_field(entry: &redis::streams::StreamId, field: &str) -> String {
+    entry
+        .map
+        .get(field)
+        .and_then(|v| {
+            if let redis::Value::Data(b) = v {
+                String::from_utf8(b.clone()).ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Consume the indexer's Redis stream and push matching events to one
+/// subscriber until the client goes away.
+///
+/// Returns as soon as the receiving half is dropped — including while parked in
+/// a blocking XREAD — so a disconnected client leaves no task behind.
+async fn run_stream_consumer(
+    mut redis: redis::aio::ConnectionManager,
+    tx: tokio::sync::mpsc::Sender<Result<Event, Status>>,
+    subscription: StreamSubscription,
+) {
+    let StreamSubscription {
+        contract_id,
+        topic_0,
+        start_id,
+    } = subscription;
+    let mut last_id = start_id;
+
+    let opts = StreamReadOptions::default()
+        .block(XREAD_BLOCK_MS)
+        .count(100);
+
+    loop {
+        let ids = [last_id.clone()];
+        let reply: redis::RedisResult<StreamReadReply> = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            reply = redis.xread_options(&[REDIS_STREAM_KEY], &ids, &opts) => reply,
+        };
+
+        match reply {
+            Ok(StreamReadReply { keys }) => {
+                for stream_key in keys {
+                    for entry in stream_key.ids {
+                        last_id = entry.id.clone();
+
+                        if entry_field(&entry, "contract_id") != contract_id {
+                            continue;
+                        }
+
+                        let topics: Vec<String> =
+                            serde_json::from_str(&entry_field(&entry, "topics"))
+                                .unwrap_or_default();
+
+                        if let Some(ref t0) = topic_0 {
+                            if topics.first().map(String::as_str) != Some(t0.as_str()) {
+                                continue;
+                            }
+                        }
+
+                        let event = Event {
+                            id: String::new(),
+                            contract_id: entry_field(&entry, "contract_id"),
+                            ledger_sequence: entry_field(&entry, "ledger_sequence")
+                                .parse()
+                                .unwrap_or(0),
+                            ledger_timestamp: entry_field(&entry, "ledger_timestamp"),
+                            transaction_hash: entry_field(&entry, "transaction_hash"),
+                            event_index: entry_field(&entry, "event_index").parse().unwrap_or(0),
+                            event_type: entry_field(&entry, "event_type"),
+                            topics,
+                            data: entry_field(&entry, "data"),
+                            created_at: String::new(),
+                        };
+
+                        // Blocks once the bounded buffer fills, which is the
+                        // backpressure: a slow client stops us reading Redis
+                        // rather than growing an unbounded queue.
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Redis XREAD error in stream_events, retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = tx.closed() => return,
+                }
+            }
+        }
     }
 }
 
@@ -125,6 +336,11 @@ impl Events for EventsServiceImpl {
         let req = request.into_inner();
         let contract_id_attr = req.contract_id.clone();
         span.record("contract_id", contract_id_attr.as_str());
+
+        validate_list_events(&req).map_err(|e| {
+            tracing::warn!(error = %e, "invalid list_events request");
+            e
+        })?;
 
         async move {
             let limit = req.limit.clamp(1, 200) as i64;
@@ -215,6 +431,11 @@ impl Events for EventsServiceImpl {
         let db = self.db.clone();
         let req = request.into_inner();
 
+        validate_get_event(&req).map_err(|e| {
+            tracing::warn!(error = %e, "invalid get_event request");
+            e
+        })?;
+
         async move {
             let id = Uuid::parse_str(&req.id)
                 .map_err(|_| Status::invalid_argument("id must be a valid UUID"))?;
@@ -269,88 +490,21 @@ impl Events for EventsServiceImpl {
             Some(req.topic_0)
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BUF);
-        let mut redis = self.redis.clone();
+        // Resume from where the client left off when it supplies a start_id
+        // (issue #236); otherwise tail the stream live.
+        let last_id = validate_start_id(&req.start_id)?;
 
-        tokio::spawn(async move {
-            let mut last_id = "$".to_string();
-            let opts = StreamReadOptions::default().block(5_000).count(100);
+        let (tx, rx) = tokio::sync::mpsc::channel(stream_channel_buffer());
 
-            loop {
-                let reply: redis::RedisResult<StreamReadReply> = redis
-                    .xread_options(&[REDIS_STREAM_KEY], &[&last_id], &opts)
-                    .await;
-
-                match reply {
-                    Ok(StreamReadReply { keys }) => {
-                        for stream_key in keys {
-                            for entry in stream_key.ids {
-                                last_id = entry.id.clone();
-
-                                let get = |field: &str| -> String {
-                                    entry
-                                        .map
-                                        .get(field)
-                                        .and_then(|v| {
-                                            if let redis::Value::Data(b) = v {
-                                                String::from_utf8(b.clone()).ok()
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .unwrap_or_default()
-                                };
-
-                                if get("contract_id") != contract_id {
-                                    continue;
-                                }
-
-                                if let Some(ref t0) = topic_0_filter {
-                                    let topics_json = get("topics");
-                                    let topics: Vec<String> =
-                                        serde_json::from_str(&topics_json).unwrap_or_default();
-                                    if topics.first().map(String::as_str) != Some(t0.as_str()) {
-                                        continue;
-                                    }
-                                }
-
-                                let topics_json = get("topics");
-                                let topics: Vec<String> =
-                                    serde_json::from_str(&topics_json).unwrap_or_default();
-
-                                let event = Event {
-                                    id: String::new(),
-                                    contract_id: get("contract_id"),
-                                    ledger_sequence: get("ledger_sequence").parse().unwrap_or(0),
-                                    ledger_timestamp: get("ledger_timestamp"),
-                                    transaction_hash: get("transaction_hash"),
-                                    event_index: get("event_index").parse().unwrap_or(0),
-                                    event_type: get("event_type"),
-                                    topics,
-                                    data: get("data"),
-                                    created_at: String::new(),
-                                };
-
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Redis XREAD error in stream_events, retrying");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        if tx.is_closed() {
-                            return;
-                        }
-                    }
-                }
-
-                if tx.is_closed() {
-                    return;
-                }
-            }
-        });
+        tokio::spawn(run_stream_consumer(
+            self.redis.clone(),
+            tx,
+            StreamSubscription {
+                contract_id,
+                topic_0: topic_0_filter,
+                start_id: last_id,
+            },
+        ));
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
@@ -594,6 +748,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_events_empty_topic_0_is_valid() {
+        let (db_url, redis_url) = require_services!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CONTRACT_EMPTY_{}", uuid::Uuid::new_v4());
+        seed_events(&pool, &contract_id, "testnet", 2).await;
+
+        let svc = make_svc(&db_url, &redis_url).await;
+        let req = Request::new(ListEventsRequest {
+            contract_id: contract_id.clone(),
+            topic_0: String::new(),
+            network: "testnet".to_string(),
+            limit: 200,
+            ..Default::default()
+        });
+        let resp = svc.list_events(req).await.unwrap().into_inner();
+
+        assert_eq!(resp.events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_events_long_contract_id_returns_invalid_argument() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(ListEventsRequest {
+            contract_id: "X".repeat(257),
+            network: "testnet".to_string(),
+            limit: 200,
+            ..Default::default()
+        });
+        let err = svc.list_events(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_event_empty_id_returns_invalid_argument() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(GetEventRequest {
+            id: String::new(),
+            network: "testnet".to_string(),
+        });
+        let err = svc.get_event(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_events_with_invalid_cursor_returns_invalid_argument() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(ListEventsRequest {
+            contract_id: "CTEST".to_string(),
+            network: "testnet".to_string(),
+            cursor: "not-a-uuid".to_string(),
+            limit: 200,
+            ..Default::default()
+        });
+        let err = svc.list_events(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn db_error_returns_unavailable() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(GetEventRequest {
+            id: Uuid::new_v4().to_string(),
+            network: "nonexistent".to_string(),
+        });
+        let err = svc.get_event(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
     async fn get_malformed_uuid_returns_invalid_argument() {
         let (db_url, redis_url) = require_services!();
         let svc = make_svc(&db_url, &redis_url).await;
@@ -615,6 +851,7 @@ mod tests {
         let req = Request::new(StreamEventsRequest {
             contract_id: "CTEST_STREAM".to_string(),
             topic_0: String::new(),
+            start_id: String::new(),
         });
 
         let mut stream = svc.stream_events(req).await.unwrap().into_inner();
@@ -656,5 +893,126 @@ mod tests {
 
         assert_eq!(event.contract_id, "CTEST_STREAM");
         assert_eq!(event.ledger_sequence, 777);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resume, cancellation, and buffering (issue #236)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_start_id_means_live_tail() {
+        assert_eq!(validate_start_id("").unwrap(), "$");
+    }
+
+    #[test]
+    fn explicit_stream_ids_are_accepted() {
+        assert_eq!(validate_start_id("$").unwrap(), "$");
+        assert_eq!(validate_start_id("0").unwrap(), "0");
+        assert_eq!(
+            validate_start_id("1700000000000-0").unwrap(),
+            "1700000000000-0"
+        );
+    }
+
+    #[test]
+    fn malformed_start_ids_are_rejected() {
+        for bad in ["abc", "123", "1-2-3", "-1", "1-", "1700000000000-x"] {
+            let err =
+                validate_start_id(bad).expect_err(&format!("{bad:?} should have been rejected"));
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_resumes_from_a_supplied_start_id() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let mut pub_conn = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let contract = format!("CRESUME_{}", Uuid::new_v4());
+
+        // Published *before* subscribing: a live tail would never see this.
+        let first_id: String = redis::cmd("XADD")
+            .arg(REDIS_STREAM_KEY)
+            .arg("*")
+            .arg("contract_id")
+            .arg(&contract)
+            .arg("ledger_sequence")
+            .arg("500")
+            .arg("ledger_timestamp")
+            .arg("2024-01-01T00:00:00Z")
+            .arg("transaction_hash")
+            .arg("txresume")
+            .arg("event_index")
+            .arg("0")
+            .arg("event_type")
+            .arg("contract")
+            .arg("topics")
+            .arg(r#"["transfer"]"#)
+            .arg("data")
+            .arg("null")
+            .query_async(&mut pub_conn)
+            .await
+            .unwrap();
+
+        // Resume from just before that entry by decrementing the sequence part.
+        let (ms, _seq) = first_id.split_once('-').unwrap();
+        let resume_from = format!("{}-0", ms.parse::<u64>().unwrap() - 1);
+
+        let req = Request::new(StreamEventsRequest {
+            contract_id: contract.clone(),
+            topic_0: String::new(),
+            start_id: resume_from,
+        });
+        let mut stream = svc.stream_events(req).await.unwrap().into_inner();
+
+        let event: Event = tokio::time::timeout(Duration::from_secs(8), stream.next())
+            .await
+            .expect("timed out waiting for the replayed event")
+            .expect("stream ended unexpectedly")
+            .expect("stream returned error");
+
+        assert_eq!(event.contract_id, contract);
+        assert_eq!(
+            event.ledger_sequence, 500,
+            "resume must replay the entry published before subscribing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_receiver_stops_the_consumer() {
+        let (_db_url, redis_url) = require_services!();
+        let redis = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_connection_manager()
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(run_stream_consumer(
+            redis,
+            tx,
+            StreamSubscription {
+                contract_id: "CTEST_CANCEL".to_string(),
+                topic_0: None,
+                start_id: "$".to_string(),
+            },
+        ));
+
+        // Let the consumer park inside a blocking XREAD first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(rx);
+
+        // It selects on tx.closed(), so it must return well inside one XREAD
+        // block window (5s) rather than idling until that read returns.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("consumer did not stop after the receiver was dropped")
+            .expect("consumer task panicked");
     }
 }
