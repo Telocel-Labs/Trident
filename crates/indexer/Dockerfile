@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── builder ──────────────────────────────────────────────────────────────────
-FROM rust:1.88-slim@sha256:8474d3e6c65da3ac9f0a39c5c77db2ff6c8c9e3a6eb4dff09b5ed7ed6c0f2f33 AS builder
+FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
 
 WORKDIR /app
 
@@ -36,7 +36,7 @@ RUN find crates sdk -name '*.rs' -exec touch {} + \
     && cargo build --release -p trident-indexer
 
 # ── runtime ──────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim@sha256:89b32b4e9f3e7f5d4a7c2c5c9b5c5c4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e AS runtime
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \

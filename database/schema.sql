@@ -238,5 +238,22 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract_id ON webhook_subscriptions (contract_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_paused_at ON webhook_subscriptions (paused_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_id ON webhook_deliveries (subscription_id);
+
+-- ---------------------------------------------------------------------------
+-- usage_rollup
+-- Per-API-key daily usage rollup, aggregated from audit_log (migration 0010).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS usage_rollup (
+    api_key_id      UUID             NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    period_start    TIMESTAMPTZ      NOT NULL,
+    period_end      TIMESTAMPTZ      NOT NULL,
+    request_count   BIGINT           NOT NULL DEFAULT 0,
+    error_count     BIGINT           NOT NULL DEFAULT 0,
+    avg_duration_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (api_key_id, period_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_key_period ON usage_rollup (api_key_id, period_start DESC);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_delivered_at ON webhook_deliveries (delivered_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event_id ON webhook_deliveries (event_id);

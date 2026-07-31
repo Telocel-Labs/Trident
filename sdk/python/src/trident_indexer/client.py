@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 import requests
 import websocket  # websocket-client
 
+from ._config import redact_key, resolve_api_key, resolve_api_url
 from .errors import TridentApiError
 from .retry import (
     RetryConfig,
@@ -39,7 +40,9 @@ class TridentClient:
 
     Args:
         api_url: Base URL of the Trident REST API, e.g. ``"https://api.trident.example.com"``.
-        api_key: API key passed as ``X-API-Key`` on every request.
+            Falls back to the ``TRIDENT_BASE_URL`` environment variable when omitted.
+        api_key: API key passed as ``X-API-Key`` on every request. Falls back to
+            the ``TRIDENT_API_KEY`` environment variable when omitted.
         network: One of ``"mainnet"``, ``"testnet"``, or ``"futurenet"``.
         retry: Retry policy applied to idempotent (GET) requests. Honours
             ``Retry-After`` on 429/503 responses, falling back to exponential
@@ -51,17 +54,23 @@ class TridentClient:
 
     def __init__(
         self,
-        api_url: str,
-        api_key: str,
+        api_url: Optional[str] = None,
+        api_key: Optional[str] = None,
         network: Network = "testnet",
         retry: RetryOverride = None,
     ) -> None:
-        self._api_url = api_url.rstrip("/")
-        self._api_key = api_key
+        self._api_url = resolve_api_url(api_url)
+        self._api_key = resolve_api_key(api_key)
         self._network = network
         self._retry = retry
         self._session = requests.Session()
-        self._session.headers.update({"X-API-Key": api_key})
+        self._session.headers.update({"X-API-Key": self._api_key})
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"TridentClient(api_url={self._api_url!r}, "
+            f"api_key={redact_key(self._api_key)}, network={self._network!r})"
+        )
 
     # ------------------------------------------------------------------
     # Public methods
@@ -171,7 +180,7 @@ class TridentClient:
     def _get(
         self,
         path: str,
-        params: Optional[dict] = None,
+        params: Optional[dict[str, Any]] = None,
         retry: RetryOverride = None,
     ) -> Any:
         retry_cfg = resolve_retry_config(retry, self._retry)

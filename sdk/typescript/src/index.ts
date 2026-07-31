@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { parseApiError, TridentApiError, TridentError } from "./errors.js";
+import { redactKey, resolveApiKey, resolveApiUrl } from "./config.js";
 import { createSubscription } from "./subscription.js";
 import { iterEvents as iterEventsImpl } from "./iterator.js";
 import type { IterEventsOptions } from "./iterator.js";
@@ -14,6 +15,7 @@ import type { RetryConfig } from "./retry.js";
 
 export { TridentError, TridentApiError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
+export { ENV_API_KEY, ENV_BASE_URL, redactKey } from "./config.js";
 export { iterEvents, DEFAULT_MAX_PAGES } from "./iterator.js";
 export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
 export { DEFAULT_RETRY_CONFIG } from "./retry.js";
@@ -27,8 +29,10 @@ export type Network = "mainnet" | "testnet" | "futurenet";
 export type TransportType = "rest" | "graphql";
 
 export interface TridentClientConfig {
-  apiUrl: string;
-  apiKey: string;
+  /** Falls back to the TRIDENT_BASE_URL environment variable when omitted. */
+  apiUrl?: string;
+  /** Falls back to the TRIDENT_API_KEY environment variable when omitted. */
+  apiKey?: string;
   network: Network;
   webSocketImpl?: any;
   transport?: TransportType;
@@ -156,17 +160,31 @@ function apiEventToSorobanEvent(
 
 export class TridentClient {
   private readonly config: TridentClientConfig;
+  private readonly apiUrl: string;
+  private readonly apiKey: string;
   private readonly transport: "rest" | "graphql";
   private graphqlTransport?: any; // Lazy-loaded GraphQL transport
 
   constructor(config: TridentClientConfig) {
     this.config = config;
+    this.apiUrl = resolveApiUrl(config.apiUrl);
+    this.apiKey = resolveApiKey(config.apiKey);
     this.transport = config.transport ?? "rest";
+  }
+
+  /** Redacted string representation — never includes the raw API key. */
+  toString(): string {
+    return `TridentClient(apiUrl=${this.apiUrl}, apiKey=${redactKey(this.apiKey)})`;
+  }
+
+  /** Ensures Node's `console.log`/`util.inspect` also redact the API key. */
+  [Symbol.for("nodejs.util.inspect.custom")](): string {
+    return this.toString();
   }
 
   private get headers(): Record<string, string> {
     return {
-      "X-API-Key": this.config.apiKey,
+      "X-API-Key": this.apiKey,
       "Content-Type": "application/json",
     };
   }
@@ -234,7 +252,7 @@ export class TridentClient {
     }
     // Lazy load GraphQL transport only when needed
     const { GraphQLTransport } = await import("./transports/graphql.js");
-    this.graphqlTransport = new GraphQLTransport(this.config.apiUrl, this.config.apiKey);
+    this.graphqlTransport = new GraphQLTransport(this.apiUrl, this.apiKey);
     return this.graphqlTransport;
   }
 
@@ -364,7 +382,7 @@ export class TridentClient {
     }
 
     // REST transport (default) - use native WebSocket
-    const wsBase = this.config.apiUrl
+    const wsBase = this.apiUrl
       .replace(/^https:\/\//, "wss://")
       .replace(/^http:\/\//, "ws://");
 

@@ -94,13 +94,11 @@ impl Streamer {
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
             },
-            config.rpc_failover_threshold,
-            config.rpc_endpoint_cooldown,
         )?;
         tracing::info!(
             endpoints = config.stellar_rpc_urls.len(),
             primary = %config.stellar_rpc_url,
-            "RPC endpoint pool configured"
+            "RPC endpoint pool configured with health scoring"
         );
         let sac_registry = crate::parser::sac::SacRegistry::build(
             &config.tracked_sac_assets,
@@ -251,6 +249,12 @@ impl Streamer {
             if shutdown.is_cancelled() {
                 break;
             }
+
+            // Dead-man's-switch: ticks once per loop iteration regardless of
+            // poll outcome, so Prometheus can alert on a hung/crashed process
+            // even when lag itself still looks fine.
+            metrics::record_heartbeat();
+            metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
 
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
@@ -831,6 +835,7 @@ impl Streamer {
                         chain_tip_ledger: self.last_chain_tip,
                         lag_threshold: self.config.alert_lag_threshold,
                         network: self.config.network.clone(),
+                        rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
                     };
                     self.alerter.evaluate(&ctx, &mut alert_state).await;
                     if let Err(e) = db::set_alert_state(&self.db, &alert_state).await {

@@ -184,6 +184,11 @@ impl TridentClient {
     /// # });
     /// ```
     pub fn new(config: TridentConfig) -> Result<Self, TridentError> {
+        let config = config.resolved();
+        if config.api_key.is_empty() {
+            return Err(TridentError::MissingApiKey);
+        }
+
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
@@ -1231,6 +1236,15 @@ mod tests {
         use futures::stream;
         let sub = Subscription::new(stream::empty::<Result<SorobanEvent, TridentError>>());
         drop(sub);
+    }
+
+    #[test]
+    fn new_returns_missing_api_key_error_when_unset() {
+        let result = TridentClient::new(TridentConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(matches!(result, Err(TridentError::MissingApiKey)));
     }
 
     #[tokio::test]

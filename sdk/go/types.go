@@ -52,3 +52,33 @@ type SubscribeToContractParams struct {
 	ContractID string
 	Topic0     string
 }
+
+// BatchEventsResult is the response envelope for BatchGetEvents. Events and
+// Missing both preserve the request order of ids; duplicate ids are
+// deduplicated on first occurrence (issue #228).
+type BatchEventsResult struct {
+	Events  []*SorobanEvent `json:"events"`
+	Missing []string        `json:"missing"`
+}
+
+// IndexerStats mirrors the response of GET /v1/stats/indexer: real-time
+// indexer health, throughput, and ingest lag (issue #294). Pointer fields are
+// nil when the underlying value is not yet known (e.g. chain tip lookup
+// failed, or no poll has completed since startup).
+type IndexerStats struct {
+	// Status is one of "healthy", "lagging", or "stalled".
+	Status  string `json:"status"`
+	Network string `json:"network"`
+
+	LastLedgerIndexed *int64 `json:"last_ledger_indexed"`
+	ChainTipLedger    *int64 `json:"chain_tip_ledger"`
+	LagLedgers        *int64 `json:"lag_ledgers"`
+	// LagSecondsEstimated approximates wall-clock staleness as
+	// LagLedgers * average ledger close time. Nil whenever LagLedgers is nil.
+	LagSecondsEstimated *float64 `json:"lag_seconds_estimated"`
+
+	EventsIndexedTotal *int64  `json:"events_indexed_total"`
+	EventsLastPoll     *int64  `json:"events_last_poll"`
+	AvgPollDurationMs  *int64  `json:"avg_poll_duration_ms"`
+	LastPollAt         *string `json:"last_poll_at"`
+}

@@ -408,7 +408,10 @@ paths:
   /v1/stats/indexer:
     get:
       summary: Get indexer statistics
-      description: Returns real-time indexer health metrics and throughput
+      description: >-
+        Returns real-time indexer health metrics, throughput, and the public
+        data-freshness contract (lag_ledgers, lag_seconds_estimated,
+        last_ledger_indexed) — see docs/observability/data-freshness.md
       operationId: getIndexerStats
       tags:
         - Statistics
@@ -760,6 +763,15 @@ components:
           format: int64
           nullable: true
           description: Number of ledgers behind chain tip
+        lag_seconds_estimated:
+          type: number
+          format: double
+          nullable: true
+          description: >-
+            Estimated wall-clock staleness in seconds: lag_ledgers times
+            Stellar's protocol-target ledger close time (~5s). Null whenever
+            lag_ledgers is null. See docs/observability/data-freshness.md for
+            the full freshness contract this field is part of.
         events_indexed_total:
           type: integer
           format: int64

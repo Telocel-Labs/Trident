@@ -82,6 +82,28 @@ groups:
             trident_indexer_last_poll_timestamp_seconds has not advanced —
             the indexer process may be hung, crashed, or stuck retrying RPC.
 
+      # Direct threshold alert on sustained high lag (issue #293), independent
+      # of the error-budget/burn-rate math above: a straightforward "lag has
+      # been high for a while" signal for anyone not fluent in the SLO
+      # calculation, mirroring the fields exposed by GET /v1/stats/indexer
+      # (see docs/observability/data-freshness.md).
+      - alert: TridentIngestLagSustainedHigh
+        expr: trident_indexer_ledger_lag_seconds_estimated > 500
+        for: 10m
+        labels:
+          severity: page
+          slo: ingest-freshness
+        annotations:
+          summary: "Indexer ledger lag above 100 ledgers (~500s estimated) for 10m+"
+          description: >-
+            trident_indexer_ledger_lag_seconds_estimated (lag_ledgers * ~5s/
+            ledger, see docs/observability/data-freshness.md) has been above
+            {{ $value | humanizeDuration }} for 10 minutes straight — over
+            100 ledgers behind. Check
+            trident_indexer_rpc_errors_total / trident_indexer_rpc_active_endpoint
+            (observability/rpc-alerts.yml) for whether the RPC provider is
+            the cause.
+
   # ---------------------------------------------------------------------------
   # Stubbed — do not enable until issue #295 (RED metrics for services/api)
   # ships http_requests_total / http_request_duration_seconds with route and
