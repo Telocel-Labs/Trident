@@ -27,6 +27,15 @@ jobs:
           cache: 'npm'
           cache-dependency-path: 'sdk/typescript/package-lock.json'
 
+      # The examples import @trident-indexer/sdk via a file: dependency, which
+      # resolves to the SDK's built dist/ — and dist/ is gitignored, so without
+      # this step tsc fails with "Cannot find module '@trident-indexer/sdk'".
+      # Same reason the sdk-react job in ci.yml builds the TypeScript SDK
+      # before installing.
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
+        run: npm ci && npm run build
+
       - name: Validate TypeScript Code Examples
         run: |
           cd docs/site
