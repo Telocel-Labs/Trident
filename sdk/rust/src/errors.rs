@@ -8,6 +8,11 @@ pub enum TridentError {
     #[error("Unauthorized: invalid or missing API key")]
     Unauthorized,
 
+    #[error(
+        "API key is required; set TridentConfig.api_key or the TRIDENT_API_KEY environment variable"
+    )]
+    MissingApiKey,
+
     #[error("Not found")]
     NotFound,
 

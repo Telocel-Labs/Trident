@@ -9,13 +9,23 @@ primary_region = "iad"
   POLL_INTERVAL_MS  = "5000"
   INDEX_DIAGNOSTIC  = "false"
   METRICS_PORT      = "9090"
+  # crates/indexer/src/health.rs serves /healthz and /readyz on this port,
+  # separate from the Prometheus listener on METRICS_PORT (crates/indexer/src/
+  # config.rs defaults HEALTH_PORT to 8080 if unset; set explicitly here so the
+  # checks below stay in sync with it).
+  HEALTH_PORT       = "8080"
   LOG_LEVEL         = "info"
 
 # Secrets (set via: fly secrets set -a trident-indexer KEY=value)
-# Required: DATABASE_URL, REDIS_URL, STELLAR_RPC_URL, NETWORK
+# Required: DATABASE_URL, REDIS_URL, STELLAR_RPC_URL (or STELLAR_RPC_URLS)
+# Optional (defaults to "testnet" if unset — crates/indexer/src/config.rs):
+# NETWORK
 
-# No public HTTP — indexer is a worker process.
-# Prometheus metrics are available on the private network only.
+# No public HTTP — indexer is a worker process. Both the Prometheus listener
+# and the health/readiness listener are reachable only on the private 6PN
+# network. Fly's top-level [checks] section (rather than a [[services]] http
+# check) is used because it does not require a services.ports entry, i.e. it
+# does not force the port to be publicly routable.
 [[services]]
   protocol      = "tcp"
   internal_port = 9090
@@ -27,6 +37,29 @@ primary_region = "iad"
     interval     = "15s"
     timeout      = "2s"
     grace_period = "30s"
+
+# Readiness check: verifies the process is alive AND that it can reach both
+# Postgres and Redis (crates/indexer/src/health.rs readyz() runs `SELECT 1`
+# and a Redis PING). A bare TCP check on METRICS_PORT only proves the process
+# has a socket open, not that it is actually able to do its job.
+[checks]
+  [checks.readiness]
+    type         = "http"
+    port         = 8080
+    method       = "get"
+    path         = "/readyz"
+    interval     = "15s"
+    timeout      = "5s"
+    grace_period = "30s"
+
+  [checks.liveness]
+    type         = "http"
+    port         = 8080
+    method       = "get"
+    path         = "/healthz"
+    interval     = "15s"
+    timeout      = "5s"
+    grace_period = "10s"
 
 [[vm]]
   size   = "shared-cpu-1x"

@@ -80,6 +80,23 @@ async fn main() -> Result<(), trident_sdk::TridentError> {
 }
 ```
 
+## Configuration
+
+`api_url` and `api_key` can be left empty in `TridentConfig`; `TridentClient::new`
+falls back to the `TRIDENT_BASE_URL` / `TRIDENT_API_KEY` environment
+variables, with an explicit field always taking precedence:
+
+```rust
+use trident_sdk::{TridentClient, TridentConfig};
+
+// Reads TRIDENT_API_KEY / TRIDENT_BASE_URL from the environment.
+let client = TridentClient::new(TridentConfig::default())?;
+```
+
+If no API key is available from either source, `TridentClient::new` returns
+`Err(TridentError::MissingApiKey)`. The key is never logged: `TridentConfig`'s
+`Debug` implementation always redacts it (e.g. `***a1b2`).
+
 ## Publishing
 
 ```bash

@@ -476,24 +476,53 @@ fly secrets set -a trident-api     REDIS_URL="redis://..."
 
 #### 4. Set required secrets
 
-**gRPC API** (`trident-grpc-api`):
-```bash
-# DATABASE_URL already set by postgres attach
-```
+Each service reads its secrets from process environment; the lists below are
+cross-checked against the actual `env::var`/`os.Getenv` calls in each
+service's source, not just the comments in the `fly/*.toml` files.
 
-**Indexer** (`trident-indexer`):
+**gRPC API** (`trident-grpc-api`, Rust, `crates/api`):
+```bash
+# DATABASE_URL is set automatically by `fly postgres attach` (step 2).
+fly secrets set -a trident-grpc-api \
+  REDIS_URL="redis://..."
+```
+`crates/api/src/config.rs` requires `DATABASE_URL` and `GRPC_ADDR` at startup
+(missing either one makes the process exit immediately); `GRPC_ADDR` is set as
+a plain (non-secret) `[env]` value in `fly/grpc-api.toml` because it is not
+sensitive, only internal-network configuration. `REDIS_URL` is read directly
+in `crates/api/src/main.rs` via `.expect(...)`, so it is just as required in
+practice even though it is not part of `Config::from_env`.
+
+**Indexer** (`trident-indexer`, Rust, `crates/indexer`):
 ```bash
 fly secrets set -a trident-indexer \
-  STELLAR_RPC_URL="https://soroban-testnet.stellar.org" \
-  NETWORK="testnet"
+  REDIS_URL="redis://..." \
+  STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
+```
+`crates/indexer/src/config.rs` requires `DATABASE_URL`, `REDIS_URL`, and
+`STELLAR_RPC_URL` (or the multi-endpoint `STELLAR_RPC_URLS`). `NETWORK` is
+optional and defaults to `"testnet"` if unset — set it explicitly for
+mainnet deployments:
+```bash
+fly secrets set -a trident-indexer NETWORK="mainnet"
 ```
 
-**Go REST API** (`trident-api`):
+**Go REST API** (`trident-api`, Go, `services/api`):
 ```bash
 fly secrets set -a trident-api \
   API_KEY_SALT="$(openssl rand -hex 32)" \
-  ADMIN_API_KEY="$(openssl rand -hex 32)"
+  ADMIN_API_KEY="$(openssl rand -hex 32)" \
+  API_KEY_HASHES="<hex(hmac_sha256(salt, key)) list, comma-separated>"
 ```
+`services/api/main.go` does not hard-exit on a missing `DATABASE_URL` or
+`REDIS_URL` — it falls back to `redis://localhost:6379` and serves
+DB-backed endpoints as `503` — so those failure modes are silent unless you
+check logs; always set both explicitly in production. `API_KEY_SALT` is
+read by `services/api/middleware/auth.go` to HMAC every incoming API key.
+`API_KEY_HASHES` is the legacy env-var auth allowlist; skip it only if every
+API key is issued through the DB-backed `/v1/admin/keys` endpoints instead.
+Optional secrets: `STELLAR_RPC_URL` (enables the admin contract-call
+endpoint) and `PGBOUNCER_ADMIN_URL` (enables `GET /v1/admin/db`).
 
 #### 5. Run database migrations
 
@@ -525,15 +554,69 @@ fly deploy -c fly/api.toml     --remote-only
 ### Scaling
 
 ```bash
-fly scale count 2 -a trident-api       # scale Go API to 2 instances
+fly scale count 2 -a trident-api               # scale Go API to 2 instances
+fly scale count 2 -a trident-grpc-api          # scale gRPC API to 2 instances
 fly scale vm shared-cpu-2x -a trident-indexer  # upgrade indexer VM
+fly scale show -a trident-api                  # show current VM size / count
 ```
+
+The indexer should normally stay at `count = 1` — it is a single writer
+(issue #87); running more than one instance against the same database causes
+duplicate polling, not higher throughput. `trident-api` and `trident-grpc-api`
+are stateless request handlers and scale horizontally.
+
+Each `fly/*.toml` also pins a starting VM size under `[[vm]]` and
+`min_machines_running` under the service block:
+
+| App | VM size (`fly/*.toml`) | `min_machines_running` |
+|---|---|---|
+| `trident-api` | `shared-cpu-1x` / 512mb | 1 (always at least one machine up) |
+| `trident-grpc-api` | `shared-cpu-1x` / 256mb | not set (services block has no `http_service`; Fly autostarts on demand) |
+| `trident-indexer` | `shared-cpu-1x` / 512mb | not set — this is a worker, not scaled to zero on request traffic |
+
+Adjust the `[[vm]]` block or pass `fly scale vm <size> -a <app>` for a one-off
+resize; edit `min_machines_running` in the relevant toml and redeploy for a
+lasting change.
 
 ### Monitoring
 
 - **Indexer metrics**: accessible on the 6PN at `trident-indexer.internal:9090/metrics`
+- **Indexer health/readiness**: accessible on the 6PN at
+  `trident-indexer.internal:8080/healthz` (liveness) and `.../readyz`
+  (readiness — checks both Postgres and Redis connectivity; see
+  `crates/indexer/src/health.rs`). These are also wired into `fly/indexer.toml`
+  under the top-level `[checks]` section so Fly restarts the machine if
+  readiness fails, not just if the TCP port stops accepting connections.
 - **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
-- **Health check**: `GET /v1/health` (used by Fly's HTTP service check)
+- **Go API health check**: `GET /v1/health` (used by Fly's HTTP service check
+  in `fly/api.toml`)
+- **gRPC API**: no HTTP health endpoint exists in `crates/api` today; Fly's
+  check in `fly/grpc-api.toml` is a plain TCP check against port 50051. This
+  proves the socket is listening, not that gRPC calls actually succeed — if a
+  future gRPC health-checking service (`grpc.health.v1.Health`) is added to
+  `crates/api`, upgrade this to a real RPC-level check.
+
+### Configuration validation
+
+`flyctl config validate` requires an authenticated Fly session (an API access
+token), which is not available in every environment (for example, a CI
+sandbox with no Fly account). Where a live token is not available, at minimum
+confirm the TOML itself is well-formed, e.g.:
+
+```bash
+python3 -c "import tomllib; tomllib.load(open('fly/api.toml','rb'))"
+```
+
+Note: `fly/*.toml` are saved with a UTF-8 BOM; strip it first if your TOML
+parser rejects a leading BOM (Fly's own TOML parser accepts it fine). Once
+authenticated, always confirm with the real thing before deploying:
+
+```bash
+fly auth login
+fly config validate -c fly/api.toml
+fly config validate -c fly/grpc-api.toml
+fly config validate -c fly/indexer.toml
+```
 
 ### Updating secrets
 

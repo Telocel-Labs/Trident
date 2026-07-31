@@ -1,7 +1,15 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Duration;
 
 use crate::retry::RetryConfig;
+
+/// Environment variable consulted for the API key when
+/// [`TridentConfig::api_key`] is left empty.
+pub const ENV_API_KEY: &str = "TRIDENT_API_KEY";
+/// Environment variable consulted for the base URL when
+/// [`TridentConfig::api_url`] is left empty.
+pub const ENV_BASE_URL: &str = "TRIDENT_BASE_URL";
 
 /// Stellar network selection.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -24,7 +32,12 @@ impl Network {
 }
 
 /// Configuration for [`TridentClient`](crate::TridentClient).
-#[derive(Debug, Clone)]
+///
+/// Precedence for `api_key` / `api_url` is: the explicit field value set
+/// here, falling back to the `TRIDENT_API_KEY` / `TRIDENT_BASE_URL`
+/// environment variables (applied by
+/// [`TridentClient::new`](crate::TridentClient::new)) when left empty.
+#[derive(Clone)]
 pub struct TridentConfig {
     /// Base URL of the Trident REST API.
     pub api_url: String,
@@ -49,6 +62,50 @@ impl Default for TridentConfig {
             timeout: Duration::from_secs(30),
             retry: None,
         }
+    }
+}
+
+/// Returns a redacted form of an API key, safe to log or print.
+pub(crate) fn redact_key(key: &str) -> String {
+    if key.is_empty() {
+        return "<empty>".to_string();
+    }
+    if key.len() <= 4 {
+        return "***".to_string();
+    }
+    format!("***{}", &key[key.len() - 4..])
+}
+
+// Custom Debug impl: never print the raw API key.
+impl fmt::Debug for TridentConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TridentConfig")
+            .field("api_url", &self.api_url)
+            .field("api_key", &redact_key(&self.api_key))
+            .field("network", &self.network)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl TridentConfig {
+    /// Applies explicit-value-over-environment-variable precedence,
+    /// filling in `api_key` / `api_url` from `TRIDENT_API_KEY` /
+    /// `TRIDENT_BASE_URL` where they were left empty. Does not mutate
+    /// `self`.
+    pub(crate) fn resolved(&self) -> TridentConfig {
+        let mut resolved = self.clone();
+        if resolved.api_key.is_empty() {
+            if let Ok(v) = std::env::var(ENV_API_KEY) {
+                resolved.api_key = v;
+            }
+        }
+        if resolved.api_url.is_empty() {
+            if let Ok(v) = std::env::var(ENV_BASE_URL) {
+                resolved.api_url = v;
+            }
+        }
+        resolved
     }
 }
 
@@ -103,6 +160,7 @@ pub struct PaginatedEvents {
     pub has_more: bool,
 }
 
+/// Query parameters for the contract-stats endpoint.
 #[derive(Debug, Default, Clone)]
 pub struct ContractStatsQuery {
     pub from_ledger: Option<u64>,
@@ -111,6 +169,7 @@ pub struct ContractStatsQuery {
     pub limit: Option<u32>,
 }
 
+/// Per-dependency health, as reported by `GET /v1/health`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthChecks {
     pub postgres: String,
@@ -160,4 +219,73 @@ pub struct ContractStatsResponse {
     pub to_ledger: i64,
     pub network: String,
     pub generated_at: String,
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Env vars are process-global; serialize tests that touch them so
+    // `cargo test`'s default parallelism doesn't race.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn explicit_values_win_over_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(ENV_API_KEY, "env-key");
+        std::env::set_var(ENV_BASE_URL, "https://env.example.com");
+
+        let config = TridentConfig {
+            api_key: "explicit-key".into(),
+            api_url: "https://explicit.example.com".into(),
+            ..Default::default()
+        }
+        .resolved();
+
+        assert_eq!(config.api_key, "explicit-key");
+        assert_eq!(config.api_url, "https://explicit.example.com");
+
+        std::env::remove_var(ENV_API_KEY);
+        std::env::remove_var(ENV_BASE_URL);
+    }
+
+    #[test]
+    fn falls_back_to_env_when_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(ENV_API_KEY, "env-key");
+        std::env::set_var(ENV_BASE_URL, "https://env.example.com");
+
+        let config = TridentConfig {
+            api_key: String::new(),
+            api_url: String::new(),
+            ..Default::default()
+        }
+        .resolved();
+
+        assert_eq!(config.api_key, "env-key");
+        assert_eq!(config.api_url, "https://env.example.com");
+
+        std::env::remove_var(ENV_API_KEY);
+        std::env::remove_var(ENV_BASE_URL);
+    }
+
+    #[test]
+    fn debug_repr_redacts_api_key() {
+        let config = TridentConfig {
+            api_key: "super-secret-value".into(),
+            ..Default::default()
+        };
+
+        let repr = format!("{:?}", config);
+        assert!(!repr.contains("super-secret-value"));
+        assert!(repr.contains("***"));
+    }
+
+    #[test]
+    fn redact_key_handles_short_and_empty() {
+        assert_eq!(redact_key(""), "<empty>");
+        assert_eq!(redact_key("abc"), "***");
+        assert_eq!(redact_key("super-secret-value"), "***alue");
+    }
 }

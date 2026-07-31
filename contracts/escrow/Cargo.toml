@@ -12,4 +12,4 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-token = { path = "../token" }
+token = { path = "../token", package = "trident-reference-token" }

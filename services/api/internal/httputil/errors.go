@@ -89,8 +89,8 @@ func GRPCToHTTP(err error) (int, ErrorCode) {
 		// timeout, not an internal fault — clients may retry (issue #227).
 		return http.StatusGatewayTimeout, UNAVAILABLE
 	case codes.Unavailable:
-		// Transient transport failure to the backend; degrade to 503 so
-		// clients and load balancers treat it as retryable (issue #227).
+		// The backend is unreachable or refusing connections: a transient
+		// upstream outage, not an internal fault — clients may retry.
 		return http.StatusServiceUnavailable, UNAVAILABLE
 	default:
 		return http.StatusInternalServerError, INTERNAL

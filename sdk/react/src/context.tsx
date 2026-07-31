@@ -8,8 +8,10 @@ interface TridentContextValue {
 const TridentContext = createContext<TridentContextValue | null>(null);
 
 export interface TridentProviderProps {
-  apiUrl: string;
-  apiKey: string;
+  /** Falls back to the TRIDENT_BASE_URL environment variable when omitted (SSR only). */
+  apiUrl?: string;
+  /** Falls back to the TRIDENT_API_KEY environment variable when omitted (SSR only). */
+  apiKey?: string;
   network?: TridentClientConfig["network"];
   children: ReactNode;
 }

@@ -52,6 +52,15 @@ trident_indexer_ledger_lag
 **Error budget:** 30 days × (1 − 0.95) allowed-breach-time = 36 hours/month
 where p95 lag may exceed 30s before the budget is exhausted.
 
+**Public API contract:** the same lag figure (plus an estimated-seconds
+conversion, `trident_indexer_ledger_lag_seconds_estimated`) is exposed
+outside Prometheus too, as `lag_ledgers` / `lag_seconds_estimated` on
+`GET /v1/stats/indexer` — see `docs/observability/data-freshness.md` for the
+full public freshness contract (issue #294) and
+`TridentIngestLagSustainedHigh` in `observability/burn-rate-alerts.yml` for a
+direct threshold alert on sustained high lag, independent of the burn-rate
+math below (issue #293).
+
 **Dead-man's-switch (heartbeat) companion query** — catches a fully stalled
 indexer, which a lag metric alone can miss if the indexer stops updating its
 own gauge:

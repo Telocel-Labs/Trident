@@ -219,16 +219,16 @@ func TestIndexerStats_DBError_Returns503(t *testing.T) {
 
 func TestMetricsHandler_ExposesAllThreeGauges(t *testing.T) {
 	rec := httptest.NewRecorder()
-	MetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	MetricsHandler(nil, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 	body := rec.Body.String()
 	for _, metric := range []string{
-		"trident_indexer_lag_ledgers",
-		"trident_indexer_last_poll_timestamp_seconds",
-		"trident_indexer_events_total",
+		"trident_api_indexer_lag_ledgers",
+		"trident_api_indexer_last_poll_timestamp_seconds",
+		"trident_api_indexer_events_indexed",
 	} {
 		if !strings.Contains(body, metric) {
 			t.Errorf("metric %q not found in /metrics output", metric)

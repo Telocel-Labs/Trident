@@ -94,13 +94,11 @@ impl Streamer {
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
             },
-            config.rpc_failover_threshold,
-            config.rpc_endpoint_cooldown,
         )?;
         tracing::info!(
             endpoints = config.stellar_rpc_urls.len(),
             primary = %config.stellar_rpc_url,
-            "RPC endpoint pool configured"
+            "RPC endpoint pool configured with health scoring"
         );
         let sac_registry = crate::parser::sac::SacRegistry::build(
             &config.tracked_sac_assets,
@@ -252,6 +250,12 @@ impl Streamer {
                 break;
             }
 
+            // Dead-man's-switch: ticks once per loop iteration regardless of
+            // poll outcome, so Prometheus can alert on a hung/crashed process
+            // even when lag itself still looks fine.
+            metrics::record_heartbeat();
+            metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
+
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
@@ -312,7 +316,7 @@ impl Streamer {
             }
         }
 
-        tracing::info!("Streamer stopped cleanly");
+        tracing::info!(cursor, "Streamer stopped cleanly; cursor persisted");
         Ok(())
     }
 
@@ -503,10 +507,13 @@ impl Streamer {
             // Indices, not references, because `page_events` is still growing.
             let mut page_tokens: Vec<(usize, crate::parser::token_events::TokenEvent)> = Vec::new();
             for raw in &page.events {
+                let decode_start = Instant::now();
                 let parse_result = {
                     let _span = tracing::info_span!("parse_events").entered();
                     self.parser.parse_event_with_projection(raw)
                 };
+                metrics::record_decode_duration(decode_start.elapsed().as_secs_f64());
+
                 match parse_result {
                     Ok(Some(parsed)) => {
                         let event = parsed.event;
@@ -518,10 +525,17 @@ impl Streamer {
                                     contract_id = %event.contract_id,
                                     "Skipping event from unlisted contract"
                                 );
+                                // Unlisted contracts land in the "other" bucket to
+                                // bound cardinality (issue #212).
+                                metrics::record_events_by_contract("other", 1);
                                 skipped_in_page += 1;
                                 continue;
                             }
                         }
+                        // Allowlisted or index-all: record under the real contract_id.
+                        // In index-all mode cardinality is unbounded — operators should
+                        // configure an allowlist if per-contract metrics are needed.
+                        metrics::record_events_by_contract(&event.contract_id, 1);
                         // Events are accumulated and committed as one page,
                         // together with their outbox rows; the relay owns the
                         // Redis publish (issues #199, #200). Publishing inline
@@ -821,6 +835,7 @@ impl Streamer {
                         chain_tip_ledger: self.last_chain_tip,
                         lag_threshold: self.config.alert_lag_threshold,
                         network: self.config.network.clone(),
+                        rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
                     };
                     self.alerter.evaluate(&ctx, &mut alert_state).await;
                     if let Err(e) = db::set_alert_state(&self.db, &alert_state).await {
