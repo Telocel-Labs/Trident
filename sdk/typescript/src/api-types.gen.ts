@@ -781,7 +781,10 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Multiple event details */
+            /**
+             * @description Batch result. Always returns 200 even when some IDs are not found;
+             *     check `missing` for unresolved IDs.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;

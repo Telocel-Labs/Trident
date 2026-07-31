@@ -7,9 +7,15 @@ primary_region = "iad"
 
 [env]
   LOG_LEVEL = "info"
+  # trident-api (Rust) fails collect_required("GRPC_ADDR") at startup and
+  # crash-loops if this is unset (crates/api/src/config.rs). Must match
+  # [[services]] internal_port below.
+  GRPC_ADDR = "0.0.0.0:50051"
 
 # Secrets (set via: fly secrets set -a trident-grpc-api KEY=value)
-# Required: DATABASE_URL
+# Required: DATABASE_URL (set automatically by `fly postgres attach`),
+# REDIS_URL (crates/api/src/main.rs calls .expect("REDIS_URL is required")
+# and panics on startup if unset)
 
 [[services]]
   protocol = "tcp"

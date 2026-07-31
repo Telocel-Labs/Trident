@@ -192,6 +192,8 @@ jobs:
           python-version: "3.12"
       - name: Install package with test deps
         run: pip install -e ".[dev]"
+      - name: Type check (mypy --strict)
+        run: mypy
       - name: Test
         run: pytest -q
 
@@ -378,6 +380,12 @@ jobs:
         with:
           shared-key: rust-workspace
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: services/api/go.sum
+
       # Apply the real migration chain (0001..latest) — the same artifact CI's
       # `rust` job and production apply. This validates the migrations as an
       # ordered, idempotent chain and can never silently depend on a stale
@@ -457,6 +465,16 @@ jobs:
           tags: trident-indexer:ci
           cache-from: type=gha,scope=indexer
           cache-to: type=gha,mode=max,scope=indexer
+
+      - name: Build database migration image
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: database/Dockerfile
+          push: false
+          tags: trident-migrate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
   # E2E smoke test — full-stack Docker Compose + curl assertions
