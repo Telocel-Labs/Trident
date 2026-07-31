@@ -140,6 +140,70 @@ func TestHub_SlowClientDropsMessage(t *testing.T) {
 	}
 }
 
+// TestHub_SlowConsumerIsDisconnectedAfterThreshold simulates a consumer that
+// never reads: once its send buffer stays full for maxConsecutiveDrops
+// broadcasts in a row, the hub must call disconnect() exactly once and stop
+// tracking it (issue #224 AC: "test simulating a slow consumer that never
+// reads").
+func TestHub_SlowConsumerIsDisconnectedAfterThreshold(t *testing.T) {
+	h := NewHub()
+
+	c := &client{
+		contractID: "contract-stalled",
+		send:       make(chan []byte, 1),
+		closeSlow:  make(chan struct{}),
+	}
+	h.register(c)
+	c.send <- []byte("pre-fill") // fill the buffer; the client never drains it
+
+	for i := 0; i < maxConsecutiveDrops-1; i++ {
+		h.Broadcast("contract-stalled", []byte("dropped"))
+		select {
+		case <-c.closeSlow:
+			t.Fatalf("disconnected after %d drops, want %d", i+1, maxConsecutiveDrops)
+		default:
+		}
+	}
+
+	// This broadcast reaches the threshold and must trigger disconnect().
+	h.Broadcast("contract-stalled", []byte("final-drop"))
+
+	select {
+	case <-c.closeSlow:
+		// expected — the connection's write loop is signalled to close.
+	default:
+		t.Fatal("expected closeSlow to be closed after reaching the drop threshold")
+	}
+
+	// A second disconnect() call (e.g. a subsequent broadcast before
+	// unregister runs) must not panic on the already-closed channel.
+	c.disconnect()
+}
+
+// TestHub_SuccessfulSendResetsDropStreak verifies that a client which drains
+// its buffer between broadcasts never accumulates a streak, so a bursty but
+// otherwise-healthy consumer is never disconnected.
+func TestHub_SuccessfulSendResetsDropStreak(t *testing.T) {
+	h := NewHub()
+
+	c := &client{contractID: "contract-bursty", send: make(chan []byte, 1), closeSlow: make(chan struct{})}
+	h.register(c)
+
+	for i := 0; i < maxConsecutiveDrops*3; i++ {
+		c.send <- []byte("fill")
+		h.Broadcast("contract-bursty", []byte("dropped")) // buffer full -> dropped
+		<-c.send                                          // drain -> next send succeeds
+		h.Broadcast("contract-bursty", []byte("delivered"))
+		<-c.send
+
+		select {
+		case <-c.closeSlow:
+			t.Fatalf("iteration %d: client disconnected despite draining between broadcasts", i)
+		default:
+		}
+	}
+}
+
 // TestHub_ConcurrentRegisterUnregister exercises the hub under the race
 // detector (issue #60 AC: concurrent connects/disconnects must be safe under
 // `go test -race`). 50 goroutines each register and immediately unregister a

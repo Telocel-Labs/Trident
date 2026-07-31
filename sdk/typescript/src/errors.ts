@@ -7,17 +7,21 @@ export type TridentErrorCode =
   | "INVALID_ARGUMENT"
   | "TIMEOUT"
   | "INTERNAL"
-  | "ITERATION_LIMIT";
+  | "ITERATION_LIMIT"
+  | "RETRY_EXHAUSTED";
 
 export class TridentError extends Error {
   readonly code: TridentErrorCode;
   readonly cause?: unknown;
+  /** Number of attempts made before this error was thrown (>1 if retried). */
+  attempts: number;
 
   constructor(code: TridentErrorCode, message: string, cause?: unknown) {
     super(message);
     this.name = "TridentError";
     this.code = code;
     this.cause = cause;
+    this.attempts = 1;
   }
 }
 
@@ -30,6 +34,8 @@ export class TridentApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly field?: string;
+  /** Number of attempts made before this error was thrown (>1 if retried). */
+  attempts: number;
 
   constructor(status: number, code: string, message: string, field?: string) {
     super(message);
@@ -37,6 +43,7 @@ export class TridentApiError extends Error {
     this.status = status;
     this.code = code;
     this.field = field;
+    this.attempts = 1;
   }
 }
 

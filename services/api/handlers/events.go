@@ -8,10 +8,14 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/gen"
+	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 )
+
+// grpcCallTimeout is the per-call deadline applied to all gRPC backend requests.
+const grpcCallTimeout = 10 * time.Second
 
 // ListEventsResponse is the response envelope for GET /v1/events.
 type ListEventsResponse struct {
@@ -107,11 +111,12 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		grpcReq.LedgerTo = uint64(*params.LedgerTo)
 	}
 
-	// Call gRPC backend with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
-	resp, err := eventsClient.ListEvents(ctx, grpcReq)
+	resp, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.ListEventsResponse, error) {
+		return eventsClient.ListEvents(ctx, grpcReq)
+	})
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc ListEvents failed", "err", err)
@@ -158,12 +163,11 @@ func GetEvent(w http.ResponseWriter, r *http.Request) {
 	// Network enforced from authenticated API key context.
 	network := middleware.NetworkFromContext(r.Context())
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
-	event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{
-		Id:      id,
-		Network: network,
+	event, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.Event, error) {
+		return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 	})
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)

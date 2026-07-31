@@ -67,7 +67,15 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 	}
 }
 
-func NewCORSFromEnv() func(http.Handler) http.Handler {
+// NewCORSFromEnv constructs a CORS middleware from the pre-validated allowed
+// origins list. Call ValidateAllowedOrigins at startup before using this.
+func NewCORSFromEnv(allowedOrigins []string) func(http.Handler) http.Handler {
+	return CORS(allowedOrigins)
+}
+
+// NewCORSFromEnvLegacy is the old env-var-only constructor kept for backward
+// compatibility during migration. Prefer ValidateAllowedOrigins + NewCORSFromEnv.
+func NewCORSFromEnvLegacy() func(http.Handler) http.Handler {
 	raw := os.Getenv("ALLOWED_ORIGINS")
 	if raw == "" || raw == "*" {
 		return CORS(nil)

@@ -1,0 +1,22 @@
+# Pre-commit hooks for Trident
+# https://pre-commit.com
+#
+# Install once per clone:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually against all files:
+#   pre-commit run --all-files
+#
+# The gitleaks hook runs the same scan that CI runs, catching secrets before
+# they are committed. The .gitleaks.toml allowlist covers the intentionally
+# committed CI test credentials in .env.ci.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+        name: Detect secrets with gitleaks
+        description: Scans staged files for committed secrets using gitleaks
+        args: ["--config", ".gitleaks.toml"]

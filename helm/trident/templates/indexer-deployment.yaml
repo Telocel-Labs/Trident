@@ -17,14 +17,21 @@ spec:
         {{- include "trident.selectorLabels" (dict "root" . "component" "indexer") | nindent 8 }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "trident.podSecurityContext" (dict "uid" .Values.indexer.securityContextUid) | nindent 8 }}
       containers:
         - name: indexer
           image: "{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- include "trident.containerSecurityContext" . | nindent 12 }}
           ports:
             - name: metrics
               containerPort: {{ .Values.indexer.metricsPort }}
               protocol: TCP
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -46,6 +53,9 @@ spec:
             {{- toYaml .Values.indexer.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.indexer.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.indexer.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

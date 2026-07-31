@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["token"]
+
+# Deliberately not a member of the root workspace (root Cargo.toml): Soroban
+# contracts build for wasm32-unknown-unknown with #![no_std] and their own
+# release profile, which does not belong alongside the indexer/api services.
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

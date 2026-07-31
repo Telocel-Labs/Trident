@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // mockStatsDB implements DBPool for stats handler tests.
@@ -216,16 +219,16 @@ func TestIndexerStats_DBError_Returns503(t *testing.T) {
 
 func TestMetricsHandler_ExposesAllThreeGauges(t *testing.T) {
 	rec := httptest.NewRecorder()
-	MetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	MetricsHandler(nil, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 	body := rec.Body.String()
 	for _, metric := range []string{
-		"trident_indexer_lag_ledgers",
-		"trident_indexer_last_poll_timestamp_seconds",
-		"trident_indexer_events_total",
+		"trident_api_indexer_lag_ledgers",
+		"trident_api_indexer_last_poll_timestamp_seconds",
+		"trident_api_indexer_events_indexed",
 	} {
 		if !strings.Contains(body, metric) {
 			t.Errorf("metric %q not found in /metrics output", metric)
@@ -251,4 +254,90 @@ func TestContractsStats_CacheHit_Returns200(t *testing.T) {
 // TestContractsStats_RequiresAuth validates auth middleware
 func TestContractsStats_RequiresAuth(t *testing.T) {
 	t.Skip("requires database and redis integration")
+}
+
+// TestContractStatsRollup_MatchesLiveAggregation seeds soroban_events for a
+// unique contract, refreshes contract_stats_rollup, and asserts the
+// rollup-backed query returns the same event_count/last_seen_ledger as the
+// live aggregation it replaces for the default (unfiltered) query (issue
+// #257). Opt-in like the Rust indexer's DB tests: skipped unless
+// TEST_DATABASE_URL is set, since the `go` CI job does not run a Postgres
+// service.
+func TestContractStatsRollup_MatchesLiveAggregation(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+
+	contractID := fmt.Sprintf("CROLLUPTEST_%d", time.Now().UnixNano())
+	const network = "testnet"
+
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM soroban_events WHERE contract_id = $1", contractID)
+		_, _ = pool.Exec(ctx, "DELETE FROM contract_stats_rollup WHERE contract_id = $1", contractID)
+	})
+
+	seedEvent := `
+		INSERT INTO soroban_events
+			(contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+			 event_index, event_type, network, topics, data)
+		VALUES ($1, $2, $3, $4, 0, 'contract', $5, '[]', '{}')
+	`
+	for i, seq := range []int64{100, 101, 102} {
+		ts := time.Unix(1_700_000_000+seq, 0).UTC()
+		if _, err := pool.Exec(ctx, seedEvent, contractID, seq, ts, fmt.Sprintf("tx%d", i), network); err != nil {
+			t.Fatalf("seed event: %v", err)
+		}
+	}
+
+	if err := RefreshContractStatsRollup(ctx, pool); err != nil {
+		t.Fatalf("refresh rollup: %v", err)
+	}
+
+	params := &validation.QueryStatsParams{Network: network, Limit: 100}
+
+	rollupStats, populated, err := queryContractStatsFromRollup(ctx, pool, params)
+	if err != nil {
+		t.Fatalf("rollup query: %v", err)
+	}
+	if !populated {
+		t.Fatalf("rollup should be populated for network %q after refresh", network)
+	}
+
+	liveStats, err := queryContractStats(ctx, pool, params)
+	if err != nil {
+		t.Fatalf("live query: %v", err)
+	}
+
+	var rollupRow, liveRow *ContractStats
+	for _, cs := range rollupStats {
+		if cs.ContractID == contractID {
+			rollupRow = cs
+		}
+	}
+	for _, cs := range liveStats {
+		if cs.ContractID == contractID {
+			liveRow = cs
+		}
+	}
+
+	if rollupRow == nil || liveRow == nil {
+		t.Fatalf("seeded contract missing from results: rollup=%v live=%v", rollupRow, liveRow)
+	}
+	if rollupRow.EventCount != liveRow.EventCount {
+		t.Errorf("event_count mismatch: rollup=%d live=%d", rollupRow.EventCount, liveRow.EventCount)
+	}
+	if rollupRow.LastSeenLedger != liveRow.LastSeenLedger {
+		t.Errorf("last_seen_ledger mismatch: rollup=%d live=%d", rollupRow.LastSeenLedger, liveRow.LastSeenLedger)
+	}
+	if rollupRow.EventCount != 3 {
+		t.Errorf("expected 3 seeded events, got event_count=%d", rollupRow.EventCount)
+	}
 }

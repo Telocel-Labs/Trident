@@ -149,7 +149,39 @@ fn row_to_event(row: EventRow) -> Event {
 
 fn db_err(e: sqlx::Error) -> Status {
     tracing::error!(error = %e, "database error");
-    Status::internal("internal error")
+    Status::unavailable("database temporarily unavailable")
+}
+
+fn validate_list_events(req: &ListEventsRequest) -> Result<(), Status> {
+    if req.contract_id.len() > 256 {
+        return Err(Status::invalid_argument("contract_id must be at most 256 characters"));
+    }
+
+    if req.topic_0.len() > 128 {
+        return Err(Status::invalid_argument("topic_0 must be at most 128 characters"));
+    }
+
+    if req.topic_1.len() > 128 {
+        return Err(Status::invalid_argument("topic_1 must be at most 128 characters"));
+    }
+
+    if req.network.len() > 64 {
+        return Err(Status::invalid_argument("network must be at most 64 characters"));
+    }
+
+    Ok(())
+}
+
+fn validate_get_event(req: &GetEventRequest) -> Result<(), Status> {
+    if req.id.is_empty() {
+        return Err(Status::invalid_argument("id is required"));
+    }
+
+    if req.network.len() > 64 {
+        return Err(Status::invalid_argument("network must be at most 64 characters"));
+    }
+
+    Ok(())
 }
 
 /// Normalise a network string — defaults to "testnet" when empty.
@@ -291,6 +323,11 @@ impl Events for EventsServiceImpl {
         let contract_id_attr = req.contract_id.clone();
         span.record("contract_id", contract_id_attr.as_str());
 
+        validate_list_events(&req).map_err(|e| {
+            tracing::warn!(error = %e, "invalid list_events request");
+            e
+        })?;
+
         async move {
             let limit = req.limit.clamp(1, 200) as i64;
             let network = resolve_network(&req.network);
@@ -379,6 +416,11 @@ impl Events for EventsServiceImpl {
 
         let db = self.db.clone();
         let req = request.into_inner();
+
+        validate_get_event(&req).map_err(|e| {
+            tracing::warn!(error = %e, "invalid get_event request");
+            e
+        })?;
 
         async move {
             let id = Uuid::parse_str(&req.id)
@@ -685,6 +727,88 @@ mod tests {
         let req = Request::new(GetEventRequest {
             id: Uuid::new_v4().to_string(),
             network: "testnet".to_string(),
+        });
+        let err = svc.get_event(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn list_events_empty_topic_0_is_valid() {
+        let (db_url, redis_url) = require_services!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CONTRACT_EMPTY_{}", uuid::Uuid::new_v4());
+        seed_events(&pool, &contract_id, "testnet", 2).await;
+
+        let svc = make_svc(&db_url, &redis_url).await;
+        let req = Request::new(ListEventsRequest {
+            contract_id: contract_id.clone(),
+            topic_0: String::new(),
+            network: "testnet".to_string(),
+            limit: 200,
+            ..Default::default()
+        });
+        let resp = svc.list_events(req).await.unwrap().into_inner();
+
+        assert_eq!(resp.events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_events_long_contract_id_returns_invalid_argument() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(ListEventsRequest {
+            contract_id: "X".repeat(257),
+            network: "testnet".to_string(),
+            limit: 200,
+            ..Default::default()
+        });
+        let err = svc.list_events(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_event_empty_id_returns_invalid_argument() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(GetEventRequest {
+            id: String::new(),
+            network: "testnet".to_string(),
+        });
+        let err = svc.get_event(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_events_with_invalid_cursor_returns_invalid_argument() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(ListEventsRequest {
+            contract_id: "CTEST".to_string(),
+            network: "testnet".to_string(),
+            cursor: "not-a-uuid".to_string(),
+            limit: 200,
+            ..Default::default()
+        });
+        let err = svc.list_events(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn db_error_returns_unavailable() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(GetEventRequest {
+            id: Uuid::new_v4().to_string(),
+            network: "nonexistent".to_string(),
         });
         let err = svc.get_event(req).await.unwrap_err();
 

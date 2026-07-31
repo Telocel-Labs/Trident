@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── builder ──────────────────────────────────────────────────────────────────
-FROM rust:1.88-slim AS builder
+FROM rust:1.88-slim@sha256:8474d3e6c65da3ac9f0a39c5c77db2ff6c8c9e3a6eb4dff09b5ed7ed6c0f2f33 AS builder
 
 WORKDIR /app
 
@@ -36,13 +36,16 @@ RUN find crates sdk -name '*.rs' -exec touch {} + \
     && cargo build --release -p trident-indexer
 
 # ── runtime ──────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:89b32b4e9f3e7f5d4a7c2c5c9b5c5c4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 1001 --no-create-home trident
 
 COPY --from=builder /app/target/release/trident-indexer /usr/local/bin/trident-indexer
+
+USER trident
 
 EXPOSE 9090
 

@@ -1,17 +1,22 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0009) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0013) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ---------------------------------------------------------------------------
--- soroban_events
+-- soroban_events  (migration 0017: RANGE-partitioned by ledger_sequence)
 -- Primary store for every indexed Soroban contract event.
+--
+-- Partition key: ledger_sequence — deterministic, aligns with the ingest
+-- cursor, makes retention a cheap partition DROP rather than a bulk DELETE.
+-- PK is (ledger_sequence, id) because PostgreSQL requires all partition key
+-- columns to appear in every unique constraint.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS soroban_events (
-    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    id                  UUID        NOT NULL DEFAULT gen_random_uuid(),
     contract_id         TEXT        NOT NULL,
     ledger_sequence     BIGINT      NOT NULL,
     ledger_timestamp    TIMESTAMPTZ NOT NULL,
@@ -23,8 +28,9 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     topic_0             TEXT        GENERATED ALWAYS AS (topics ->> 0) STORED,
     topic_1             TEXT        GENERATED ALWAYS AS (topics ->> 1) STORED,
     data                JSONB       NOT NULL DEFAULT '{}',
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (ledger_sequence, id)
+) PARTITION BY RANGE (ledger_sequence);
 
 -- Indexes — canonical set produced by migrations 0004 and 0009.
 -- network isolation (0004)
@@ -75,6 +81,7 @@ CREATE TABLE IF NOT EXISTS indexed_contracts (
     label           TEXT,
     index_from      BIGINT      NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_indexed_contracts_id_network UNIQUE (contract_id, network)
 );
 
@@ -110,7 +117,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at     TIMESTAMPTZ,
     request_count    BIGINT      NOT NULL DEFAULT 0,
     revoked_at       TIMESTAMPTZ,                    -- NULL means active; set to revoke
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);
@@ -173,6 +181,30 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_unpublished
     WHERE published = FALSE;
 
 -- ---------------------------------------------------------------------------
+-- updated_at trigger  (migration 0016)
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_system_state_updated_at
+    BEFORE UPDATE ON system_state
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_indexed_contracts_updated_at
+    BEFORE UPDATE ON indexed_contracts
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_api_keys_updated_at
+    BEFORE UPDATE ON api_keys
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_webhook_subscriptions_updated_at
+    BEFORE UPDATE ON webhook_subscriptions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
 -- webhook_subscriptions
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS webhook_subscriptions (
@@ -183,6 +215,7 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
     target_url   TEXT        NOT NULL,
     secret       TEXT        NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     paused_at    TIMESTAMPTZ,
     network      TEXT        NOT NULL DEFAULT 'testnet'
 );
@@ -190,7 +223,11 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id              BIGSERIAL   PRIMARY KEY,
     subscription_id UUID        NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
-    event_id        UUID        NOT NULL REFERENCES soroban_events(id),
+    -- event_id is a logical FK to soroban_events(id); the DB-level constraint
+    -- was dropped in migration 0017 because soroban_events is now partitioned
+    -- by ledger_sequence, and PostgreSQL does not allow a global UNIQUE (id)
+    -- on a partitioned table. Referential integrity is upheld by the application.
+    event_id        UUID        NOT NULL,
     attempt         INT         NOT NULL DEFAULT 1,
     status_code     INT,
     response_body   TEXT,
@@ -201,4 +238,22 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract_id ON webhook_subscriptions (contract_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_paused_at ON webhook_subscriptions (paused_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_id ON webhook_deliveries (subscription_id);
+
+-- ---------------------------------------------------------------------------
+-- usage_rollup
+-- Per-API-key daily usage rollup, aggregated from audit_log (migration 0010).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS usage_rollup (
+    api_key_id      UUID             NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    period_start    TIMESTAMPTZ      NOT NULL,
+    period_end      TIMESTAMPTZ      NOT NULL,
+    request_count   BIGINT           NOT NULL DEFAULT 0,
+    error_count     BIGINT           NOT NULL DEFAULT 0,
+    avg_duration_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (api_key_id, period_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_key_period ON usage_rollup (api_key_id, period_start DESC);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_delivered_at ON webhook_deliveries (delivered_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event_id ON webhook_deliveries (event_id);

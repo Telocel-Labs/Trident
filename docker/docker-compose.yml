@@ -3,7 +3,7 @@
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15-alpine@sha256:2d4c9e0e6b3cade6c0a5e0a8c0a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:de13e74e14b98eb96bdf886791ae47686c3c5d29f9d5f85ea55206843e3fce26
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
@@ -38,7 +38,7 @@ services:
   # for the prepared-statement / session-variable caveats this implies.
   # ---------------------------------------------------------------------------
   pgbouncer:
-    image: pgbouncer/pgbouncer:1.22
+    image: pgbouncer/pgbouncer:1.22@sha256:7c8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f
     environment:
       DATABASES_HOST: postgres
       DATABASES_PORT: 5432

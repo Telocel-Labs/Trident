@@ -46,10 +46,14 @@ spec:
         {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 8 }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "trident.podSecurityContext" (dict "uid" .Values.nginx.securityContextUid) | nindent 8 }}
       containers:
         - name: nginx
           image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- include "trident.containerSecurityContext" . | nindent 12 }}
           ports:
             - name: http
               containerPort: 80
@@ -58,6 +62,15 @@ spec:
             - name: nginx-config
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
+            # nginx needs to write its pidfile, proxy/cache temp files, and
+            # client body buffers — all under paths readOnlyRootFilesystem
+            # would otherwise block.
+            - name: var-run
+              mountPath: /var/run
+            - name: var-cache-nginx
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
           livenessProbe:
             {{- toYaml .Values.nginx.livenessProbe | nindent 12 }}
           readinessProbe:
@@ -68,6 +81,12 @@ spec:
         - name: nginx-config
           configMap:
             name: {{ include "trident.fullname" . }}-nginx-config
+        - name: var-run
+          emptyDir: {}
+        - name: var-cache-nginx
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.nginx.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -97,4 +116,19 @@ spec:
       port: {{ .Values.nginx.service.port }}
       targetPort: http
       protocol: TCP
+{{- if and .Values.nginx.podDisruptionBudget.enabled (gt (int .Values.nginx.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "trident.fullname" . }}-nginx
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nginx
+spec:
+  minAvailable: {{ .Values.nginx.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 6 }}
+{{- end }}
 {{- end }}

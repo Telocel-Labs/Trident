@@ -56,11 +56,17 @@ chrono = { version = "0.4", features = ["serde"] }
 # Hex encoding for bytes values
 hex = "0.4"
 
+# SHA-256 for SAC contract id derivation (issue #262)
+sha2 = "0.10"
+
 # Retry logic with exponential backoff
 tokio-retry = "0.3"
 
 # CancellationToken for graceful shutdown
 tokio-util = "0.7"
+
+# Async trait support for pluggable alert sinks
+async-trait = "0.1"
 
 # Prometheus /metrics endpoint
 metrics = "0.24"

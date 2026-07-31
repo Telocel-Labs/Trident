@@ -15,8 +15,11 @@ import (
 
 	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
+	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -37,9 +40,10 @@ func (g *atomicGauge) Get() float64 {
 }
 
 var (
-	metricLagLedgers        atomicGauge
-	metricLastPollTimestamp atomicGauge
-	metricEventsTotal       atomicGauge
+	metricLagLedgers          atomicGauge
+	metricLagSecondsEstimated atomicGauge
+	metricLastPollTimestamp   atomicGauge
+	metricEventsTotal         atomicGauge
 
 	// Webhook delivery counters (#241).
 	metricWebhookSuccess    atomic.Int64
@@ -47,31 +51,30 @@ var (
 	metricWebhookDeadLetter atomic.Int64
 	metricWebhookDurationMs atomic.Int64
 	metricWebhookTotal      atomic.Int64
+
+	// SSE slow-consumer disconnects (#224). SSE has no shared per-message
+	// drop path like the WS hub — a stalled SSE client is detected by the
+	// write deadline in Stream() failing, which always means "disconnect",
+	// so there is no separate drop counter to pair this with.
+	metricSSESlowConsumerDisconnects atomic.Int64
 )
 
-// RecordWebhookDelivery updates the webhook delivery counters. Call after
-// every attempted delivery.
-func RecordWebhookDelivery(success bool, deadLetter bool, durationMs int64) {
-	metricWebhookDurationMs.Add(durationMs)
-	metricWebhookTotal.Add(1)
-	switch {
-	case deadLetter:
-		metricWebhookDeadLetter.Add(1)
-	case success:
-		metricWebhookSuccess.Add(1)
-	default:
-		metricWebhookFailed.Add(1)
-	}
-}
-
-// MetricsHandler exposes indexer gauges, webhook counters, and gRPC client
-// counters in text format. Mount at GET /metrics (or /v1/metrics).
-func MetricsHandler() http.HandlerFunc {
+// MetricsHandler exposes the Go API's Prometheus metrics in text format:
+// indexer-status gauges (populated as a side effect of GET /v1/stats/indexer;
+// note the trident_api_indexer_* prefix, which avoids colliding with the
+// indexer's own same-named counters/gauges of a different type), HTTP
+// request count/latency (all routes, via middleware.PrometheusHTTP), gRPC
+// client call count/latency, DB connection pool utilisation, and the
+// trident:events Redis Stream length. Mount at GET /metrics.
+func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_lag_ledgers gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
+		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_lag_seconds_estimated Estimated wall-clock lag: lag_ledgers * average ledger close time (issue #294).\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_lag_seconds_estimated gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_indexer_lag_seconds_estimated %g\n", metricLagSecondsEstimated.Get())
 		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
@@ -94,11 +97,42 @@ func MetricsHandler() http.HandlerFunc {
 		var meanMs float64
 		if total > 0 {
 			meanMs = float64(metricWebhookDurationMs.Load()) / float64(total)
+
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_lag_ledgers gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_last_poll_timestamp_seconds gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_events_indexed Cumulative events indexed, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_events_indexed gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_events_indexed %g\n", metricEventsTotal.Get())
+
+		middleware.WriteHTTPMetrics(w)
+		middleware.WriteGRPCClientMetrics(w)
+
+		if pool != nil {
+			stat := pool.Stat()
+			writeGauge(w, "trident_api_db_pool_acquired_connections", "Connections currently checked out of the API's Postgres pool.", float64(stat.AcquiredConns()))
+			writeGauge(w, "trident_api_db_pool_idle_connections", "Idle (available) connections in the API's Postgres pool.", float64(stat.IdleConns()))
+			writeGauge(w, "trident_api_db_pool_total_connections", "Total connections (idle + acquired) currently open in the API's Postgres pool.", float64(stat.TotalConns()))
+			writeGauge(w, "trident_api_db_pool_max_connections", "Configured maximum size of the API's Postgres pool.", float64(stat.MaxConns()))
 		}
-		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_delivery_mean_duration_ms Mean delivery round-trip latency in milliseconds.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_delivery_mean_duration_ms gauge\n")
-		_, _ = fmt.Fprintf(w, "trident_webhook_delivery_mean_duration_ms %g\n", meanMs)
+
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if length, err := rdb.XLen(ctx, eventStreamKey).Result(); err == nil {
+				writeGauge(w, "trident_api_redis_stream_length", "Length of the trident:events Redis Stream (indexer -> API consumer backlog).", float64(length))
+			}
+		}
 	}
+}
+
+func writeGauge(w http.ResponseWriter, name, help string, value float64) {
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n", name, help)
+	_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", name)
+	_, _ = fmt.Fprintf(w, "%s %g\n", name, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,17 +256,25 @@ func indexerStatus(lastPollAt *time.Time, lagLedgers *int64) string {
 // Response
 // ---------------------------------------------------------------------------
 
+// avgLedgerCloseSeconds is Stellar's protocol-target ledger close time, used
+// to convert ledger-count lag into an estimated wall-clock staleness figure
+// (issue #294). Kept in sync with crates/indexer/src/metrics.rs's
+// AVG_LEDGER_CLOSE_SECONDS; see docs/observability/data-freshness.md for the
+// full freshness contract.
+const avgLedgerCloseSeconds = 5.0
+
 // IndexerStatsResponse is the JSON body for GET /v1/stats/indexer.
 type IndexerStatsResponse struct {
-	LastLedgerIndexed  *int64  `json:"last_ledger_indexed"`
-	ChainTipLedger     *int64  `json:"chain_tip_ledger"`
-	LagLedgers         *int64  `json:"lag_ledgers"`
-	EventsIndexedTotal *int64  `json:"events_indexed_total"`
-	EventsLastPoll     *int64  `json:"events_last_poll"`
-	AvgPollDurationMs  *int64  `json:"avg_poll_duration_ms"`
-	LastPollAt         *string `json:"last_poll_at"`
-	Status             string  `json:"status"`
-	Network            string  `json:"network"`
+	LastLedgerIndexed   *int64   `json:"last_ledger_indexed"`
+	ChainTipLedger      *int64   `json:"chain_tip_ledger"`
+	LagLedgers          *int64   `json:"lag_ledgers"`
+	LagSecondsEstimated *float64 `json:"lag_seconds_estimated"`
+	EventsIndexedTotal  *int64   `json:"events_indexed_total"`
+	EventsLastPoll      *int64   `json:"events_last_poll"`
+	AvgPollDurationMs   *int64   `json:"avg_poll_duration_ms"`
+	LastPollAt          *string  `json:"last_poll_at"`
+	Status              string   `json:"status"`
+	Network             string   `json:"network"`
 }
 
 // ---------------------------------------------------------------------------
@@ -265,9 +307,12 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		chainTip := globalChainTipCache.get(r.Context())
 
 		var lagLedgers *int64
+		var lagSecondsEstimated *float64
 		if chainTip != nil && stats.lastLedgerIndexed != nil {
 			lag := *chainTip - *stats.lastLedgerIndexed
 			lagLedgers = &lag
+			estimated := float64(lag) * avgLedgerCloseSeconds
+			lagSecondsEstimated = &estimated
 		}
 
 		status := indexerStatus(stats.lastPollAt, lagLedgers)
@@ -275,6 +320,9 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		// Update Prometheus gauges with latest observed values.
 		if lagLedgers != nil {
 			metricLagLedgers.Set(float64(*lagLedgers))
+		}
+		if lagSecondsEstimated != nil {
+			metricLagSecondsEstimated.Set(*lagSecondsEstimated)
 		}
 		if stats.lastPollAt != nil {
 			metricLastPollTimestamp.Set(float64(stats.lastPollAt.Unix()))
@@ -290,15 +338,16 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		}
 
 		resp := IndexerStatsResponse{
-			LastLedgerIndexed:  stats.lastLedgerIndexed,
-			ChainTipLedger:     chainTip,
-			LagLedgers:         lagLedgers,
-			EventsIndexedTotal: stats.eventsIndexedTotal,
-			EventsLastPoll:     stats.eventsLastPoll,
-			AvgPollDurationMs:  stats.pollDurationMs,
-			LastPollAt:         lastPollAtStr,
-			Status:             status,
-			Network:            os.Getenv("NETWORK"),
+			LastLedgerIndexed:   stats.lastLedgerIndexed,
+			ChainTipLedger:      chainTip,
+			LagLedgers:          lagLedgers,
+			LagSecondsEstimated: lagSecondsEstimated,
+			EventsIndexedTotal:  stats.eventsIndexedTotal,
+			EventsLastPoll:      stats.eventsLastPoll,
+			AvgPollDurationMs:   stats.pollDurationMs,
+			LastPollAt:          lastPollAtStr,
+			Status:              status,
+			Network:             os.Getenv("NETWORK"),
 		}
 
 		httpStatus := http.StatusOK
@@ -399,11 +448,29 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 
-		stats, err := queryContractStats(ctx, db, params)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "database query failed", "err", err)
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
-			return
+		// The maintained rollup (issue #257) only represents the full,
+		// unfiltered event history per contract, so it can only answer the
+		// default "all time" query. Any explicit ledger-range filter falls
+		// back to the live aggregate below, which the rollup cannot cover.
+		isDefaultRange := q.Get("from_ledger") == "" && q.Get("to_ledger") == ""
+
+		var stats []*ContractStats
+		var err error
+		usedRollup := false
+		if isDefaultRange {
+			stats, usedRollup, err = queryContractStatsFromRollup(ctx, db, params)
+			if err != nil {
+				slog.ErrorContext(r.Context(), "rollup query failed; falling back to live aggregation", "err", err)
+				usedRollup = false
+			}
+		}
+		if !usedRollup {
+			stats, err = queryContractStats(ctx, db, params)
+			if err != nil {
+				slog.ErrorContext(r.Context(), "database query failed", "err", err)
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
+				return
+			}
 		}
 
 		// Get the latest ledger for the response metadata if to_ledger was not explicitly set
@@ -452,7 +519,19 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 // row-level join against soroban_events: the two tables share no per-row key
 // (metering is one row per transaction, events are one row per emitted
 // event), so the join key is contract_id + the same ledger range.
+//
+// Index usage: the WHERE clause on (network, ledger_sequence) uses
+// idx_soroban_events_network_contract (migration 0004) for partition pruning
+// when a ledger range is supplied; the GROUP BY + ORDER BY event_count DESC is
+// a computed aggregate and is not index-backed — this is expected for an
+// aggregation query. The LIMIT cap prevents runaway result sets (#255).
 func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, error) {
+	// Belt-and-suspenders: clamp limit even if the caller skips ValidateQueryStats.
+	limit := params.Limit
+	if limit <= 0 || limit > validation.StatsLimitMax {
+		limit = validation.StatsLimitDefault
+	}
+
 	query := `
 	SELECT
 		e.contract_id,
@@ -493,7 +572,7 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 	LIMIT $4
 	`
 
-	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, params.Limit)
+	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -529,6 +608,144 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 	}
 
 	return stats, nil
+}
+
+// queryContractStatsFromRollup serves the default "all time" contract stats
+// query from the maintained contract_stats_rollup table (issue #257) instead
+// of aggregating soroban_events live. Invocation metering (issue #266) is
+// still joined live from contract_invocation_metrics — that table is small
+// and indexed by contract_id, so joining it against at most `limit` rollup
+// rows stays cheap.
+//
+// The second return value is false when the rollup has not been populated
+// for this network yet (e.g. before the first periodic refresh completes),
+// signalling the caller to fall back to queryContractStats.
+func queryContractStatsFromRollup(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, bool, error) {
+	query := `
+	SELECT
+		r.contract_id,
+		r.event_count,
+		r.last_seen_ledger,
+		r.last_seen_at,
+		m.invocation_count,
+		m.total_fee_charged,
+		m.avg_fee_charged,
+		m.avg_cpu_instructions,
+		m.avg_read_bytes,
+		m.avg_write_bytes
+	FROM contract_stats_rollup r
+	LEFT JOIN (
+		SELECT
+			contract_id,
+			COUNT(*) AS invocation_count,
+			SUM(fee_charged) AS total_fee_charged,
+			AVG(fee_charged) AS avg_fee_charged,
+			AVG(cpu_instructions) AS avg_cpu_instructions,
+			AVG(read_bytes) AS avg_read_bytes,
+			AVG(write_bytes) AS avg_write_bytes
+		FROM contract_invocation_metrics
+		WHERE network = $1
+		GROUP BY contract_id
+	) m ON m.contract_id = r.contract_id
+	WHERE r.network = $1
+	ORDER BY r.event_count DESC
+	LIMIT $2
+	`
+
+	rows, err := db.Query(ctx, query, params.Network, params.Limit)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	var stats []*ContractStats
+	for rows.Next() {
+		var cs ContractStats
+		var lastSeenAt time.Time
+
+		err := rows.Scan(
+			&cs.ContractID,
+			&cs.EventCount,
+			&cs.LastSeenLedger,
+			&lastSeenAt,
+			&cs.InvocationCount,
+			&cs.TotalFeeCharged,
+			&cs.AvgFeeCharged,
+			&cs.AvgCpuInstructions,
+			&cs.AvgReadBytes,
+			&cs.AvgWriteBytes,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+
+		cs.LastSeenAt = lastSeenAt.UTC().Format(time.RFC3339)
+		stats = append(stats, &cs)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, false, err
+	}
+
+	if len(stats) > 0 {
+		return stats, true, nil
+	}
+
+	// Empty result: indistinguishable between "no activity on this network"
+	// and "the rollup has not been refreshed yet". Check whether the rollup
+	// has ever been populated for this network at all; if not, tell the
+	// caller to fall back to the live aggregate rather than serve a
+	// possibly-wrong empty response.
+	var populated bool
+	if err := db.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM contract_stats_rollup WHERE network = $1)",
+		params.Network,
+	).Scan(&populated); err != nil {
+		return nil, false, err
+	}
+
+	return stats, populated, nil
+}
+
+// contractStatsRollupRefreshSQL recomputes contract_stats_rollup in full from
+// soroban_events (issue #257). Run periodically rather than incrementally on
+// ingest, so the rollup stays independent of the Rust indexer's write path —
+// see the ticker started in main.go and the freshness note in
+// database/migrations/0019_contract_stats_rollup.sql.
+const contractStatsRollupRefreshSQL = `
+	INSERT INTO contract_stats_rollup (
+		contract_id, network, event_count, contract_event_count, system_event_count,
+		diagnostic_event_count, first_seen_ledger, last_seen_ledger, last_seen_at, refreshed_at
+	)
+	SELECT
+		contract_id,
+		network,
+		COUNT(*),
+		COUNT(*) FILTER (WHERE event_type = 'contract'),
+		COUNT(*) FILTER (WHERE event_type = 'system'),
+		COUNT(*) FILTER (WHERE event_type = 'diagnostic'),
+		MIN(ledger_sequence),
+		MAX(ledger_sequence),
+		MAX(ledger_timestamp),
+		NOW()
+	FROM soroban_events
+	GROUP BY contract_id, network
+	ON CONFLICT (contract_id, network) DO UPDATE SET
+		event_count            = EXCLUDED.event_count,
+		contract_event_count   = EXCLUDED.contract_event_count,
+		system_event_count     = EXCLUDED.system_event_count,
+		diagnostic_event_count = EXCLUDED.diagnostic_event_count,
+		first_seen_ledger      = EXCLUDED.first_seen_ledger,
+		last_seen_ledger       = EXCLUDED.last_seen_ledger,
+		last_seen_at           = EXCLUDED.last_seen_at,
+		refreshed_at           = EXCLUDED.refreshed_at
+`
+
+// RefreshContractStatsRollup recomputes contract_stats_rollup from
+// soroban_events (issue #257). Exported so main.go's periodic ticker and
+// tests can both call it.
+func RefreshContractStatsRollup(ctx context.Context, db SchemaRegistryDB) error {
+	_, err := db.Exec(ctx, contractStatsRollupRefreshSQL)
+	return err
 }
 
 // getLatestIndexedLedger queries the database for the highest indexed ledger sequence.

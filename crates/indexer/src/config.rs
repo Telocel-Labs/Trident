@@ -59,6 +59,17 @@ pub struct Config {
     /// idle_in_transaction_session_timeout (ms). Reclaims connections leaked by
     /// open transactions (#249).
     pub idle_in_transaction_timeout_ms: u64,
+    /// How long a cached `token_metadata` row is considered fresh before the
+    /// indexer re-simulates name()/symbol()/decimals() for that contract
+    /// (issue #263). Applies to both positive and negative (non-token)
+    /// results.
+    pub token_metadata_refresh_interval: Duration,
+    /// Network passphrase used to derive Stellar Asset Contract ids (issue
+    /// #262). Defaults from `network` for the two well-known networks.
+    pub network_passphrase: String,
+    /// Operator-configured classic assets to resolve SAC events for (issue
+    /// #262). Each is a `code:issuer` pair, or the literal `native` for XLM.
+    pub tracked_sac_assets: Vec<crate::parser::sac::TrackedAsset>,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -91,6 +102,22 @@ impl Config {
         }
 
         let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into());
+
+        // Network passphrase for SAC contract id derivation (issue #262).
+        // NETWORK_PASSPHRASE always wins when set; otherwise it is inferred
+        // from the well-known "testnet"/"mainnet" friendly names, and any
+        // other `network` value must supply an explicit passphrase.
+        let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {
+            Ok(v) if !v.is_empty() => v,
+            _ => default_network_passphrase(&network)?,
+        };
+
+        // Tracked classic assets whose SAC events should carry asset context
+        // (issue #262), e.g. TRACKED_SAC_ASSETS="USDC:GA5Z...,native".
+        let tracked_sac_assets = match std::env::var("TRACKED_SAC_ASSETS") {
+            Ok(spec) if !spec.trim().is_empty() => parse_tracked_sac_assets(&spec)?,
+            _ => Vec::new(),
+        };
 
         let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000)?;
         let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000)?;
@@ -223,8 +250,65 @@ impl Config {
                 100,
                 3_600_000,
             )?,
+            token_metadata_refresh_interval: Duration::from_secs(parse_bounded_u64(
+                "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
+                86_400,
+                60,
+                2_592_000,
+            )?),
+            network_passphrase,
+            tracked_sac_assets,
         })
     }
+}
+
+/// Well-known Stellar network passphrases (issue #262). Any network name
+/// other than these two must set `NETWORK_PASSPHRASE` explicitly — guessing
+/// would silently derive wrong SAC contract ids.
+fn default_network_passphrase(network: &str) -> Result<String, TridentError> {
+    match network {
+        "testnet" => Ok("Test SDF Network ; September 2015".to_string()),
+        "mainnet" | "pubnet" => Ok("Public Global Stellar Network ; September 2015".to_string()),
+        other => Err(TridentError::config(anyhow::anyhow!(
+            "[indexer] NETWORK={other:?} has no well-known passphrase; set NETWORK_PASSPHRASE explicitly"
+        ))),
+    }
+}
+
+/// Parse `TRACKED_SAC_ASSETS` as a comma-separated list of `CODE:ISSUER`
+/// pairs, or the bare literal `native` for XLM (issue #262).
+fn parse_tracked_sac_assets(
+    spec: &str,
+) -> Result<Vec<crate::parser::sac::TrackedAsset>, TridentError> {
+    let mut assets = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.eq_ignore_ascii_case("native") {
+            assets.push(crate::parser::sac::TrackedAsset {
+                code: "native".to_string(),
+                issuer: String::new(),
+            });
+            continue;
+        }
+        let (code, issuer) = part.split_once(':').ok_or_else(|| {
+            TridentError::config(anyhow::anyhow!(
+                "[indexer] TRACKED_SAC_ASSETS entry {part:?} must be CODE:ISSUER or 'native'"
+            ))
+        })?;
+        if code.is_empty() || issuer.is_empty() {
+            return Err(TridentError::config(anyhow::anyhow!(
+                "[indexer] TRACKED_SAC_ASSETS entry {part:?} must be CODE:ISSUER or 'native'"
+            )));
+        }
+        assets.push(crate::parser::sac::TrackedAsset {
+            code: code.to_string(),
+            issuer: issuer.to_string(),
+        });
+    }
+    Ok(assets)
 }
 
 /// Read a required env var; on absence push its name to `missing` and return None.
@@ -742,6 +826,16 @@ mod tests {
         with_env(&vars, || {
             let err = Config::from_env().unwrap_err();
             assert!(err.to_string().contains("INDEX_TOPIC_FILTERS"));
+        });
+    }
+
+    #[test]
+    fn token_metadata_refresh_interval_defaults_to_24h() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("TOKEN_METADATA_REFRESH_INTERVAL_SECS");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.token_metadata_refresh_interval.as_secs(), 86_400);
         });
     }
 

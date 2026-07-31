@@ -50,6 +50,12 @@ pub struct TokenEvent {
     pub amount: Option<String>,
     /// Ledger at which an `approve` allowance expires.
     pub expiration_ledger: Option<i64>,
+    /// Asset code, populated only when the emitting contract is a recognised
+    /// Stellar Asset Contract (SAC) instance (issue #262).
+    pub asset_code: Option<String>,
+    /// Asset issuer strkey, populated alongside `asset_code`. Absent for the
+    /// native XLM SAC, which has no issuer.
+    pub asset_issuer: Option<String>,
 }
 
 impl TokenEvent {
@@ -62,6 +68,8 @@ impl TokenEvent {
             admin: None,
             amount: None,
             expiration_ledger: None,
+            asset_code: None,
+            asset_issuer: None,
         }
     }
 }

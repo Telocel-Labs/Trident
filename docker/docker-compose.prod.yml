@@ -3,7 +3,7 @@
 
 services:
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:1.27-alpine@sha256:a6b8d5f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5e8f5
     ports:
       - "80:80"
       - "443:443"

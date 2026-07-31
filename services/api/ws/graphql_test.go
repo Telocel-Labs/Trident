@@ -32,6 +32,38 @@ func TestGQLParseSubscribe_Variables(t *testing.T) {
 	}
 }
 
+func TestGQLParseSubscribe_QueryTooLong(t *testing.T) {
+	huge := strings.Repeat("a", gqlMaxQueryLen+1)
+	payload, _ := json.Marshal(map[string]interface{}{
+		"query":     huge,
+		"variables": map[string]string{"contractId": "CTEST"},
+	})
+	_, _, err := gqlParseSubscribe(payload)
+	if err == nil {
+		t.Fatal("expected an error for an oversized query string, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum length") {
+		t.Fatalf("expected a max-length error, got: %v", err)
+	}
+}
+
+func TestGQLParseSubscribe_QueryAtLimit_Allowed(t *testing.T) {
+	// contractId comes from variables, so the query body itself can be
+	// padding right up to (but not over) the limit.
+	padding := strings.Repeat("a", gqlMaxQueryLen)
+	payload, _ := json.Marshal(map[string]interface{}{
+		"query":     padding,
+		"variables": map[string]string{"contractId": "CTEST"},
+	})
+	cid, _, err := gqlParseSubscribe(payload)
+	if err != nil {
+		t.Fatalf("unexpected error at exactly the limit: %v", err)
+	}
+	if cid != "CTEST" {
+		t.Fatalf("contractId: got %q, want CTEST", cid)
+	}
+}
+
 func TestGQLParseSubscribe_InlineQuery(t *testing.T) {
 	payload := json.RawMessage(`{
 		"query": "subscription { contractEvents(contractId: \"CINLINE\", topic0: \"mint\") { id } }"
@@ -337,6 +369,59 @@ func TestGQLHandler_AuthAndDeliver(t *testing.T) {
 	}
 	if outer.Data.ContractEvents.ContractID != "CTEST" {
 		t.Errorf("contractId remap: got %q", outer.Data.ContractEvents.ContractID)
+	}
+}
+
+func TestGQLHandler_SubscriptionCapPerConnection(t *testing.T) {
+	hub := NewHub()
+	validateKey := func(k string) bool { return k == "key" }
+	conn, r := testGQLPipe(t, hub, validateKey)
+
+	if err := writeGQLFrame(conn, gqlMessage{
+		Type:    "connection_init",
+		Payload: json.RawMessage(`{"Authorization":"key"}`),
+	}); err != nil {
+		t.Fatalf("write connection_init: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if ack := readGQLFrame(t, r); ack.Type != "connection_ack" {
+		t.Fatalf("expected connection_ack, got %q", ack.Type)
+	}
+
+	subscribe := func(id, contractID string) gqlMessage {
+		payload, _ := json.Marshal(map[string]interface{}{
+			"variables": map[string]string{"contractId": contractID},
+		})
+		if err := writeGQLFrame(conn, gqlMessage{Type: "subscribe", ID: id, Payload: payload}); err != nil {
+			t.Fatalf("write subscribe %s: %v", id, err)
+		}
+		return readGQLFrame(t, r)
+	}
+
+	// Fill the connection up to the cap — none of these should error.
+	for i := 0; i < gqlMaxSubsPerConn; i++ {
+		// A successful subscribe produces no immediate message (only "next"
+		// on a broadcast), so instead of reading here we just don't expect
+		// an "error" frame — verified by the (cap+1)th subscribe below,
+		// which reads the first frame off the wire and must be that error,
+		// proving nothing earlier queued one up.
+		id := "sub" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		payload, _ := json.Marshal(map[string]interface{}{
+			"variables": map[string]string{"contractId": "C"},
+		})
+		if err := writeGQLFrame(conn, gqlMessage{Type: "subscribe", ID: id, Payload: payload}); err != nil {
+			t.Fatalf("write subscribe %s: %v", id, err)
+		}
+	}
+
+	// One more subscription over the cap must be rejected with an error
+	// frame carrying the original operation id.
+	msg := subscribe("over-cap", "C")
+	if msg.Type != "error" {
+		t.Fatalf("expected error frame once the per-connection subscription cap is exceeded, got %q (payload %s)", msg.Type, msg.Payload)
+	}
+	if msg.ID != "over-cap" {
+		t.Fatalf("expected error id over-cap, got %q", msg.ID)
 	}
 }
 

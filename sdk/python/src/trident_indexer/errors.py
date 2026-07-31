@@ -15,17 +15,22 @@ class TridentApiError(Exception):
         code: str,
         message: str,
         field: Optional[str] = None,
+        attempts: int = 1,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.field = field
+        #: Number of attempts made before this error was raised (>1 if retried).
+        self.attempts = attempts
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"TridentApiError(status={self.status}, code={self.code!r}, message={str(self)!r})"
 
     @classmethod
-    def from_response(cls, status: int, body: str) -> "TridentApiError":
+    def from_response(
+        cls, status: int, body: str, attempts: int = 1
+    ) -> "TridentApiError":
         """Parse a non-2xx response body into a TridentApiError."""
         try:
             parsed = json.loads(body)
@@ -36,7 +41,13 @@ class TridentApiError(Exception):
                     code=err.get("code", "INTERNAL"),
                     message=err.get("message", body or f"HTTP {status}"),
                     field=err.get("field"),
+                    attempts=attempts,
                 )
         except (json.JSONDecodeError, AttributeError):
             pass
-        return cls(status=status, code="INTERNAL", message=body or f"HTTP {status}")
+        return cls(
+            status=status,
+            code="INTERNAL",
+            message=body or f"HTTP {status}",
+            attempts=attempts,
+        )

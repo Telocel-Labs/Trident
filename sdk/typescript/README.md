@@ -95,9 +95,17 @@ Pass a `TridentClientConfig` object to the `TridentClient` constructor.
 
 | Field     | Type                                    | Required | Description                                                                                     |
 |-----------|-----------------------------------------|----------|-------------------------------------------------------------------------------------------------|
-| `apiUrl`  | `string`                                | ✅       | Base URL of the Trident REST API (e.g. `https://api.trident.telocel.io`). No trailing slash.   |
-| `apiKey`  | `string`                                | ✅       | API key sent as the `X-API-Key` header on every request.                                        |
+| `apiUrl`  | `string`                                | See below | Base URL of the Trident REST API (e.g. `https://api.trident.telocel.io`). No trailing slash.   |
+| `apiKey`  | `string`                                | See below | API key sent as the `X-API-Key` header on every request.                                        |
 | `network` | `"mainnet" \| "testnet" \| "futurenet"` | ✅       | Stellar network to query. Included in WebSocket subscription frames for server-side routing.    |
+
+`apiUrl` and `apiKey` may be omitted from the config object; an explicit
+value always takes precedence, but the SDK falls back to the
+`TRIDENT_BASE_URL` / `TRIDENT_API_KEY` environment variables (Node.js only —
+`process.env` is not read in browser bundles). If neither source provides a
+value, the constructor throws a `TridentError` with `code: "CONFIG"`. The
+API key is never logged: `client.toString()` and Node's `util.inspect`
+output redact it (e.g. `***a1b2`).
 
 ---
 
