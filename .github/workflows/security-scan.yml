@@ -75,14 +75,14 @@ jobs:
           output-file: sbom-${{ matrix.name }}.spdx.json
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6a1 # v4.4.0
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
         with:
           name: sbom-${{ matrix.name }}
           path: sbom-${{ matrix.name }}.spdx.json
           retention-days: 90
 
       - name: Scan image for vulnerabilities (trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: ${{ matrix.tag }}
           format: table
