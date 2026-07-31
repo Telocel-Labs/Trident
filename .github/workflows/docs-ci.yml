@@ -42,18 +42,13 @@ jobs:
           npm install --no-save typescript @trident-indexer/sdk@file:../../sdk/typescript
           npx tsc --noEmit
 
-      # --exclude-path node_modules: the globs below would otherwise sweep every
-      # JSON file the install step above unpacks into docs/site/node_modules,
-      # and third-party package metadata is full of dead author URLs and
-      # placeholder links (qualiancy.com, TypeScript's localised
-      # diagnosticMessages files). Those are not this repo's links to fix, and
-      # letting them fail the job means a dependency's stale homepage blocks a
-      # docs change.
+      # Exclusions live in .lycheeignore at the repo root, which lychee picks up
+      # automatically: dependency metadata under node_modules (the *.json glob
+      # reaches all of it once the install step above succeeds), plus product
+      # pages that are not published yet. Each entry there says why and when it
+      # can be removed.
       - name: Check for Broken Links
         uses: lycheeverse/lychee-action@2b973e86fc7b1f6b36a93795fe2c9c6ae1118621 # v1
         with:
-          args: >-
-            --verbose --no-progress
-            --exclude-path docs/site/node_modules
-            'docs/site/**/*.mdx' 'docs/site/**/*.json'
+          args: --verbose --no-progress 'docs/site/**/*.mdx' 'docs/site/**/*.json'
           fail: true
