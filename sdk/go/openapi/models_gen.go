@@ -21,13 +21,70 @@ func (r *OpenAPIModels) Marshal() ([]byte, error) {
 }
 
 type OpenAPIModels struct {
-	ContractStats         *ContractStats         `json:"ContractStats,omitempty"`
-	ContractStatsResponse *ContractStatsResponse `json:"ContractStatsResponse,omitempty"`
-	ErrorResponse         *ErrorResponse         `json:"ErrorResponse,omitempty"`
-	EventListResponse     *EventListResponse     `json:"EventListResponse,omitempty"`
-	HealthResponse        *HealthResponse        `json:"HealthResponse,omitempty"`
-	IndexerStatsResponse  *IndexerStatsResponse  `json:"IndexerStatsResponse,omitempty"`
-	SorobanEvent          *SorobanEvent          `json:"SorobanEvent,omitempty"`
+	ContractEventFieldSchema    *ContractEventFieldSchema    `json:"ContractEventFieldSchema,omitempty"`
+	ContractEventSchema         *ContractEventSchema         `json:"ContractEventSchema,omitempty"`
+	ContractEventSchemaResponse *ContractEventSchemaResponse `json:"ContractEventSchemaResponse,omitempty"`
+	ContractSpecFunction        *ContractSpecFunction        `json:"ContractSpecFunction,omitempty"`
+	ContractSpecResponse        *ContractSpecResponse        `json:"ContractSpecResponse,omitempty"`
+	ContractStats               *ContractStats               `json:"ContractStats,omitempty"`
+	ContractStatsResponse       *ContractStatsResponse       `json:"ContractStatsResponse,omitempty"`
+	ContractStorageResponse     *ContractStorageResponse     `json:"ContractStorageResponse,omitempty"`
+	ContractStorageValue        *ContractStorageValue        `json:"ContractStorageValue,omitempty"`
+	ErrorResponse               *ErrorResponse               `json:"ErrorResponse,omitempty"`
+	EventListResponse           *EventListResponse           `json:"EventListResponse,omitempty"`
+	IndexerStatsResponse        *IndexerStatsResponse        `json:"IndexerStatsResponse,omitempty"`
+	LivenessResponse            *LivenessResponse            `json:"LivenessResponse,omitempty"`
+	ReadyChecks                 *ReadyChecks                 `json:"ReadyChecks,omitempty"`
+	ReadyResponse               *ReadyResponse               `json:"ReadyResponse,omitempty"`
+	SorobanEvent                *SorobanEvent                `json:"SorobanEvent,omitempty"`
+	TokenMetadataResponse       *TokenMetadataResponse       `json:"TokenMetadataResponse,omitempty"`
+}
+
+type ContractEventFieldSchema struct {
+	// Stable field name for this event payload position or property              
+	Name                                                                   string `json:"name"`
+	// Field type inferred from the contract interface or observed payloads       
+	Type                                                                   string `json:"type"`
+}
+
+type ContractEventSchema struct {
+	// Contract event name (topic_0)                                 
+	EventName                             string                     `json:"event_name"`
+	// Named fields for this event payload                           
+	Fields                                []ContractEventFieldSchema `json:"fields"`
+}
+
+type ContractEventSchemaResponse struct {
+	// Contract code hash for this schema version                              
+	CodeHash                                             string                `json:"code_hash"`
+	// Soroban contract address                                                
+	ContractID                                           string                `json:"contract_id"`
+	// Observed event names and their typed field schemas                      
+	Events                                               []ContractEventSchema `json:"events"`
+	// Network queried                                                         
+	Network                                              Network               `json:"network"`
+}
+
+type ContractSpecFunction struct {
+	// Exported function name       
+	Name                     string `json:"name"`
+}
+
+type ContractSpecResponse struct {
+	// Deployed WASM code hash this spec was parsed from                                                       
+	CodeHash                                                                            string                 `json:"code_hash"`
+	// Soroban contract address                                                                                
+	ContractID                                                                          string                 `json:"contract_id"`
+	// Primary classification derived from detected interfaces (e.g. token, nft, custom)                       
+	ContractType                                                                        string                 `json:"contract_type"`
+	// Functions captured from the contract's spec                                                             
+	Functions                                                                           []ContractSpecFunction `json:"functions"`
+	// Whether an embedded contractspecv0 section was found                                                    
+	HasSpec                                                                             bool                   `json:"has_spec"`
+	// Every standard interface detected from the contract's spec functions                                    
+	Interfaces                                                                          []string               `json:"interfaces"`
+	// Network queried                                                                                         
+	Network                                                                             Network                `json:"network"`
 }
 
 type ContractStats struct {
@@ -52,6 +109,28 @@ type ContractStatsResponse struct {
 	Network                                        Network         `json:"network"`
 	// Upper bound of queried ledger range                         
 	ToLedger                                       int64           `json:"to_ledger"`
+}
+
+type ContractStorageResponse struct {
+	// Soroban contract address                                                                                  
+	ContractID                                                                            string                 `json:"contract_id"`
+	// Network queried                                                                                           
+	Network                                                                               Network                `json:"network"`
+	// Storage snapshot values (latest, or full history when queried via /storage/history)                       
+	Values                                                                                []ContractStorageValue `json:"values"`
+}
+
+type ContractStorageValue struct {
+	// Human-readable decoded storage key                                          
+	Key                                                                interface{} `json:"key"`
+	// Ledger sequence at which this value was observed                            
+	LedgerSequence                                                     int64       `json:"ledger_sequence"`
+	// Timestamp this snapshot row was recorded                                    
+	ObservedAt                                                         time.Time   `json:"observed_at"`
+	// Base64-encoded XDR LedgerKey this value was read from                       
+	StorageKey                                                         string      `json:"storage_key"`
+	// Human-readable decoded value (absent when the entry was removed)            
+	Value                                                              interface{} `json:"value"`
 }
 
 type ErrorResponse struct {
@@ -99,38 +178,71 @@ type SorobanEvent struct {
 	TransactionHash                       string    `json:"transaction_hash"`
 }
 
-type HealthResponse struct {
-	Indexer                 Indexer              `json:"indexer"`
-	// Overall system status                     
-	Status                  HealthResponseStatus `json:"status"`
-}
-
-type Indexer struct {
-	// Latest indexed ledger sequence                      
-	LastLedgerIndexed                           int64      `json:"last_ledger_indexed"`
-	// Timestamp of last successful indexer poll           
-	LastPollAt                                  *time.Time `json:"last_poll_at,omitempty"`
-}
-
 type IndexerStatsResponse struct {
-	// Average poll duration in milliseconds                                    
-	AvgPollDurationMS                                *int64                     `json:"avg_poll_duration_ms,omitempty"`
-	// Current chain tip ledger (from RPC)                                      
-	ChainTipLedger                                   *int64                     `json:"chain_tip_ledger,omitempty"`
-	// Cumulative events indexed                                                
-	EventsIndexedTotal                               *int64                     `json:"events_indexed_total,omitempty"`
-	// Events processed in last poll                                            
-	EventsLastPoll                                   *int64                     `json:"events_last_poll,omitempty"`
-	// Number of ledgers behind chain tip                                       
-	LagLedgers                                       *int64                     `json:"lag_ledgers,omitempty"`
-	// Latest indexed ledger sequence                                           
-	LastLedgerIndexed                                *int64                     `json:"last_ledger_indexed,omitempty"`
-	// Timestamp of last successful poll                                        
-	LastPollAt                                       *time.Time                 `json:"last_poll_at,omitempty"`
-	// Network name from NETWORK environment variable                           
-	Network                                          string                     `json:"network"`
-	// Indexer health status                                                    
-	Status                                           IndexerStatsResponseStatus `json:"status"`
+	// Average poll duration in milliseconds                                                                             
+	AvgPollDurationMS                                                                         *int64                     `json:"avg_poll_duration_ms,omitempty"`
+	// Current chain tip ledger (from RPC)                                                                               
+	ChainTipLedger                                                                            *int64                     `json:"chain_tip_ledger,omitempty"`
+	// Cumulative events indexed                                                                                         
+	EventsIndexedTotal                                                                        *int64                     `json:"events_indexed_total,omitempty"`
+	// Events processed in last poll                                                                                     
+	EventsLastPoll                                                                            *int64                     `json:"events_last_poll,omitempty"`
+	// Number of ledgers behind chain tip                                                                                
+	LagLedgers                                                                                *int64                     `json:"lag_ledgers,omitempty"`
+	// Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target                            
+	// ledger close time (~5s). Null whenever lag_ledgers is null. See                                                   
+	// docs/observability/data-freshness.md for the full freshness contract this field is part                           
+	// of.                                                                                                               
+	LagSecondsEstimated                                                                       *float64                   `json:"lag_seconds_estimated,omitempty"`
+	// Latest indexed ledger sequence                                                                                    
+	LastLedgerIndexed                                                                         *int64                     `json:"last_ledger_indexed,omitempty"`
+	// Timestamp of last successful poll                                                                                 
+	LastPollAt                                                                                *time.Time                 `json:"last_poll_at,omitempty"`
+	// Network name from NETWORK environment variable                                                                    
+	Network                                                                                   string                     `json:"network"`
+	// Indexer health status                                                                                             
+	Status                                                                                    IndexerStatsResponseStatus `json:"status"`
+}
+
+type LivenessResponse struct {
+	// Always "ok" while the process is up — no dependency checks.                       
+	Status                                                        LivenessResponseStatus `json:"status"`
+}
+
+type ReadyChecks struct {
+	// "ok" or "error: <message>"       
+	GrpcAPI                      string `json:"grpc_api"`
+	// "ok" or "error: <message>"       
+	Postgres                     string `json:"postgres"`
+	// "ok" or "error: <message>"       
+	Redis                        string `json:"redis"`
+}
+
+type ReadyResponse struct {
+	Checks                                                                                  ReadyChecks         `json:"checks"`
+	// Ledgers behind chain tip, from system_state. Null when Postgres is unreachable or the                    
+	// chain-tip cache hasn't been populated yet.                                                               
+	IndexerLag                                                                              int64               `json:"indexer_lag"`
+	// "degraded" when any dependency check in `checks` failed.                                                 
+	Status                                                                                  ReadyResponseStatus `json:"status"`
+}
+
+type TokenMetadataResponse struct {
+	// Soroban contract address                                                                          
+	ContractID                                                                                string     `json:"contract_id"`
+	// Token decimals, from decimals(). Null unless is_token is true.                                    
+	Decimals                                                                                  *int64     `json:"decimals,omitempty"`
+	// True when the contract was resolved and implements the SEP-41 read interface. False for           
+	// both "not yet resolved" and "resolved, not a token".                                              
+	IsToken                                                                                   bool       `json:"is_token"`
+	// Token name, from name(). Null unless is_token is true.                                            
+	Name                                                                                      *string    `json:"name,omitempty"`
+	// Network queried                                                                                   
+	Network                                                                                   Network    `json:"network"`
+	// When this contract was last resolved. Null if never resolved.                                     
+	ResolvedAt                                                                                *time.Time `json:"resolved_at,omitempty"`
+	// Token symbol, from symbol(). Null unless is_token is true.                                        
+	Symbol                                                                                    *string    `json:"symbol,omitempty"`
 }
 
 // Network queried
@@ -150,14 +262,6 @@ const (
 	System     EventType = "system"
 )
 
-// Overall system status
-type HealthResponseStatus string
-
-const (
-	Degraded HealthResponseStatus = "degraded"
-	Ok       HealthResponseStatus = "ok"
-)
-
 // Indexer health status
 type IndexerStatsResponseStatus string
 
@@ -165,4 +269,19 @@ const (
 	Healthy IndexerStatsResponseStatus = "healthy"
 	Lagging IndexerStatsResponseStatus = "lagging"
 	Stalled IndexerStatsResponseStatus = "stalled"
+)
+
+// Always "ok" while the process is up — no dependency checks.
+type LivenessResponseStatus string
+
+const (
+	PurpleOk LivenessResponseStatus = "ok"
+)
+
+// "degraded" when any dependency check in `checks` failed.
+type ReadyResponseStatus string
+
+const (
+	Degraded ReadyResponseStatus = "degraded"
+	FluffyOk ReadyResponseStatus = "ok"
 )

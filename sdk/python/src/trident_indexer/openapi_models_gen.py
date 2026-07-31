@@ -13,11 +13,6 @@ def from_str(x: Any) -> str:
     return x
 
 
-def from_int(x: Any) -> int:
-    assert isinstance(x, int) and not isinstance(x, bool)
-    return x
-
-
 def from_list(f: Callable[[Any], T], x: Any) -> list[T]:
     assert isinstance(x, list)
     return [f(y) for y in x]
@@ -31,6 +26,16 @@ def to_class(c: Type[T], x: Any) -> dict:
 def to_enum(c: Type[EnumT], x: Any) -> EnumT:
     assert isinstance(x, c)
     return x.value
+
+
+def from_bool(x: Any) -> bool:
+    assert isinstance(x, bool)
+    return x
+
+
+def from_int(x: Any) -> int:
+    assert isinstance(x, int) and not isinstance(x, bool)
+    return x
 
 
 def from_none(x: Any) -> Any:
@@ -47,9 +52,161 @@ def from_union(fs, x):
     assert False
 
 
-def from_bool(x: Any) -> bool:
-    assert isinstance(x, bool)
+def from_float(x: Any) -> float:
+    assert isinstance(x, (float, int)) and not isinstance(x, bool)
+    return float(x)
+
+
+def to_float(x: Any) -> float:
+    assert isinstance(x, (int, float))
     return x
+
+
+@dataclass
+class ContractEventFieldSchema:
+    name: str
+    """Stable field name for this event payload position or property"""
+
+    type: str
+    """Field type inferred from the contract interface or observed payloads"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractEventFieldSchema':
+        assert isinstance(obj, dict)
+        name = from_str(obj.get("name"))
+        type = from_str(obj.get("type"))
+        return ContractEventFieldSchema(name, type)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["name"] = from_str(self.name)
+        result["type"] = from_str(self.type)
+        return result
+
+
+@dataclass
+class ContractEventSchema:
+    event_name: str
+    """Contract event name (topic_0)"""
+
+    fields: list[ContractEventFieldSchema]
+    """Named fields for this event payload"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractEventSchema':
+        assert isinstance(obj, dict)
+        event_name = from_str(obj.get("event_name"))
+        fields = from_list(ContractEventFieldSchema.from_dict, obj.get("fields"))
+        return ContractEventSchema(event_name, fields)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["event_name"] = from_str(self.event_name)
+        result["fields"] = from_list(lambda x: to_class(ContractEventFieldSchema, x), self.fields)
+        return result
+
+
+class Network(Enum):
+    """Network queried"""
+
+    MAINNET = "mainnet"
+    TESTNET = "testnet"
+
+
+@dataclass
+class ContractEventSchemaResponse:
+    code_hash: str
+    """Contract code hash for this schema version"""
+
+    contract_id: str
+    """Soroban contract address"""
+
+    events: list[ContractEventSchema]
+    """Observed event names and their typed field schemas"""
+
+    network: Network
+    """Network queried"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractEventSchemaResponse':
+        assert isinstance(obj, dict)
+        code_hash = from_str(obj.get("code_hash"))
+        contract_id = from_str(obj.get("contract_id"))
+        events = from_list(ContractEventSchema.from_dict, obj.get("events"))
+        network = Network(obj.get("network"))
+        return ContractEventSchemaResponse(code_hash, contract_id, events, network)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["code_hash"] = from_str(self.code_hash)
+        result["contract_id"] = from_str(self.contract_id)
+        result["events"] = from_list(lambda x: to_class(ContractEventSchema, x), self.events)
+        result["network"] = to_enum(Network, self.network)
+        return result
+
+
+@dataclass
+class ContractSpecFunction:
+    name: str
+    """Exported function name"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractSpecFunction':
+        assert isinstance(obj, dict)
+        name = from_str(obj.get("name"))
+        return ContractSpecFunction(name)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["name"] = from_str(self.name)
+        return result
+
+
+@dataclass
+class ContractSpecResponse:
+    code_hash: str
+    """Deployed WASM code hash this spec was parsed from"""
+
+    contract_id: str
+    """Soroban contract address"""
+
+    contract_type: str
+    """Primary classification derived from detected interfaces (e.g. token, nft, custom)"""
+
+    functions: list[ContractSpecFunction]
+    """Functions captured from the contract's spec"""
+
+    has_spec: bool
+    """Whether an embedded contractspecv0 section was found"""
+
+    interfaces: list[str]
+    """Every standard interface detected from the contract's spec functions"""
+
+    network: Network
+    """Network queried"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractSpecResponse':
+        assert isinstance(obj, dict)
+        code_hash = from_str(obj.get("code_hash"))
+        contract_id = from_str(obj.get("contract_id"))
+        contract_type = from_str(obj.get("contract_type"))
+        functions = from_list(ContractSpecFunction.from_dict, obj.get("functions"))
+        has_spec = from_bool(obj.get("has_spec"))
+        interfaces = from_list(from_str, obj.get("interfaces"))
+        network = Network(obj.get("network"))
+        return ContractSpecResponse(code_hash, contract_id, contract_type, functions, has_spec, interfaces, network)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["code_hash"] = from_str(self.code_hash)
+        result["contract_id"] = from_str(self.contract_id)
+        result["contract_type"] = from_str(self.contract_type)
+        result["functions"] = from_list(lambda x: to_class(ContractSpecFunction, x), self.functions)
+        result["has_spec"] = from_bool(self.has_spec)
+        result["interfaces"] = from_list(from_str, self.interfaces)
+        result["network"] = to_enum(Network, self.network)
+        return result
 
 
 @dataclass
@@ -82,13 +239,6 @@ class ContractStats:
         result["last_seen_at"] = from_str(self.last_seen_at)
         result["last_seen_ledger"] = from_int(self.last_seen_ledger)
         return result
-
-
-class Network(Enum):
-    """Network queried"""
-
-    MAINNET = "mainnet"
-    TESTNET = "testnet"
 
 
 @dataclass
@@ -125,6 +275,71 @@ class ContractStatsResponse:
         result["generated_at"] = from_str(self.generated_at)
         result["network"] = to_enum(Network, self.network)
         result["to_ledger"] = from_int(self.to_ledger)
+        return result
+
+
+@dataclass
+class ContractStorageValue:
+    ledger_sequence: int
+    """Ledger sequence at which this value was observed"""
+
+    observed_at: str
+    """Timestamp this snapshot row was recorded"""
+
+    storage_key: str
+    """Base64-encoded XDR LedgerKey this value was read from"""
+
+    key: Any = None
+    """Human-readable decoded storage key"""
+
+    value: Any = None
+    """Human-readable decoded value (absent when the entry was removed)"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractStorageValue':
+        assert isinstance(obj, dict)
+        ledger_sequence = from_int(obj.get("ledger_sequence"))
+        observed_at = from_str(obj.get("observed_at"))
+        storage_key = from_str(obj.get("storage_key"))
+        key = obj.get("key")
+        value = obj.get("value")
+        return ContractStorageValue(ledger_sequence, observed_at, storage_key, key, value)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["ledger_sequence"] = from_int(self.ledger_sequence)
+        result["observed_at"] = from_str(self.observed_at)
+        result["storage_key"] = from_str(self.storage_key)
+        result["key"] = self.key
+        if self.value is not None:
+            result["value"] = self.value
+        return result
+
+
+@dataclass
+class ContractStorageResponse:
+    contract_id: str
+    """Soroban contract address"""
+
+    network: Network
+    """Network queried"""
+
+    values: list[ContractStorageValue]
+    """Storage snapshot values (latest, or full history when queried via /storage/history)"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractStorageResponse':
+        assert isinstance(obj, dict)
+        contract_id = from_str(obj.get("contract_id"))
+        network = Network(obj.get("network"))
+        values = from_list(ContractStorageValue.from_dict, obj.get("values"))
+        return ContractStorageResponse(contract_id, network, values)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["contract_id"] = from_str(self.contract_id)
+        result["network"] = to_enum(Network, self.network)
+        result["values"] = from_list(lambda x: to_class(ContractStorageValue, x), self.values)
         return result
 
 
@@ -270,56 +485,6 @@ class EventListResponse:
         return result
 
 
-@dataclass
-class Indexer:
-    last_ledger_indexed: int
-    """Latest indexed ledger sequence"""
-
-    last_poll_at: str | None = None
-    """Timestamp of last successful indexer poll"""
-
-    @staticmethod
-    def from_dict(obj: Any) -> 'Indexer':
-        assert isinstance(obj, dict)
-        last_ledger_indexed = from_int(obj.get("last_ledger_indexed"))
-        last_poll_at = from_union([from_str, from_none], obj.get("last_poll_at"))
-        return Indexer(last_ledger_indexed, last_poll_at)
-
-    def to_dict(self) -> dict:
-        result: dict = {}
-        result["last_ledger_indexed"] = from_int(self.last_ledger_indexed)
-        if self.last_poll_at is not None:
-            result["last_poll_at"] = from_union([from_str, from_none], self.last_poll_at)
-        return result
-
-
-class HealthResponseStatus(Enum):
-    """Overall system status"""
-
-    DEGRADED = "degraded"
-    OK = "ok"
-
-
-@dataclass
-class HealthResponse:
-    indexer: Indexer
-    status: HealthResponseStatus
-    """Overall system status"""
-
-    @staticmethod
-    def from_dict(obj: Any) -> 'HealthResponse':
-        assert isinstance(obj, dict)
-        indexer = Indexer.from_dict(obj.get("indexer"))
-        status = HealthResponseStatus(obj.get("status"))
-        return HealthResponse(indexer, status)
-
-    def to_dict(self) -> dict:
-        result: dict = {}
-        result["indexer"] = to_class(Indexer, self.indexer)
-        result["status"] = to_enum(HealthResponseStatus, self.status)
-        return result
-
-
 class IndexerStatsResponseStatus(Enum):
     """Indexer health status"""
 
@@ -351,6 +516,12 @@ class IndexerStatsResponse:
     lag_ledgers: int | None = None
     """Number of ledgers behind chain tip"""
 
+    lag_seconds_estimated: float | None = None
+    """Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target
+    ledger close time (~5s). Null whenever lag_ledgers is null. See
+    docs/observability/data-freshness.md for the full freshness contract this field is part
+    of.
+    """
     last_ledger_indexed: int | None = None
     """Latest indexed ledger sequence"""
 
@@ -367,9 +538,10 @@ class IndexerStatsResponse:
         events_indexed_total = from_union([from_int, from_none], obj.get("events_indexed_total"))
         events_last_poll = from_union([from_int, from_none], obj.get("events_last_poll"))
         lag_ledgers = from_union([from_int, from_none], obj.get("lag_ledgers"))
+        lag_seconds_estimated = from_union([from_float, from_none], obj.get("lag_seconds_estimated"))
         last_ledger_indexed = from_union([from_int, from_none], obj.get("last_ledger_indexed"))
         last_poll_at = from_union([from_str, from_none], obj.get("last_poll_at"))
-        return IndexerStatsResponse(network, status, avg_poll_duration_ms, chain_tip_ledger, events_indexed_total, events_last_poll, lag_ledgers, last_ledger_indexed, last_poll_at)
+        return IndexerStatsResponse(network, status, avg_poll_duration_ms, chain_tip_ledger, events_indexed_total, events_last_poll, lag_ledgers, lag_seconds_estimated, last_ledger_indexed, last_poll_at)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -385,6 +557,8 @@ class IndexerStatsResponse:
             result["events_last_poll"] = from_union([from_int, from_none], self.events_last_poll)
         if self.lag_ledgers is not None:
             result["lag_ledgers"] = from_union([from_int, from_none], self.lag_ledgers)
+        if self.lag_seconds_estimated is not None:
+            result["lag_seconds_estimated"] = from_union([to_float, from_none], self.lag_seconds_estimated)
         if self.last_ledger_indexed is not None:
             result["last_ledger_indexed"] = from_union([from_int, from_none], self.last_ledger_indexed)
         if self.last_poll_at is not None:
@@ -392,44 +566,219 @@ class IndexerStatsResponse:
         return result
 
 
+class LivenessResponseStatus(Enum):
+    """Always "ok" while the process is up — no dependency checks."""
+
+    OK = "ok"
+
+
+@dataclass
+class LivenessResponse:
+    status: LivenessResponseStatus
+    """Always "ok" while the process is up — no dependency checks."""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'LivenessResponse':
+        assert isinstance(obj, dict)
+        status = LivenessResponseStatus(obj.get("status"))
+        return LivenessResponse(status)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["status"] = to_enum(LivenessResponseStatus, self.status)
+        return result
+
+
+@dataclass
+class ReadyChecks:
+    grpc_api: str
+    """"ok" or "error: <message>\""""
+
+    postgres: str
+    """"ok" or "error: <message>\""""
+
+    redis: str
+    """"ok" or "error: <message>\""""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ReadyChecks':
+        assert isinstance(obj, dict)
+        grpc_api = from_str(obj.get("grpc_api"))
+        postgres = from_str(obj.get("postgres"))
+        redis = from_str(obj.get("redis"))
+        return ReadyChecks(grpc_api, postgres, redis)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["grpc_api"] = from_str(self.grpc_api)
+        result["postgres"] = from_str(self.postgres)
+        result["redis"] = from_str(self.redis)
+        return result
+
+
+class ReadyResponseStatus(Enum):
+    """"degraded" when any dependency check in `checks` failed."""
+
+    DEGRADED = "degraded"
+    OK = "ok"
+
+
+@dataclass
+class ReadyResponse:
+    checks: ReadyChecks
+    indexer_lag: int
+    """Ledgers behind chain tip, from system_state. Null when Postgres is unreachable or the
+    chain-tip cache hasn't been populated yet.
+    """
+    status: ReadyResponseStatus
+    """"degraded" when any dependency check in `checks` failed."""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ReadyResponse':
+        assert isinstance(obj, dict)
+        checks = ReadyChecks.from_dict(obj.get("checks"))
+        indexer_lag = from_int(obj.get("indexer_lag"))
+        status = ReadyResponseStatus(obj.get("status"))
+        return ReadyResponse(checks, indexer_lag, status)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["checks"] = to_class(ReadyChecks, self.checks)
+        result["indexer_lag"] = from_int(self.indexer_lag)
+        result["status"] = to_enum(ReadyResponseStatus, self.status)
+        return result
+
+
+@dataclass
+class TokenMetadataResponse:
+    contract_id: str
+    """Soroban contract address"""
+
+    is_token: bool
+    """True when the contract was resolved and implements the SEP-41 read interface. False for
+    both "not yet resolved" and "resolved, not a token".
+    """
+    network: Network
+    """Network queried"""
+
+    decimals: int | None = None
+    """Token decimals, from decimals(). Null unless is_token is true."""
+
+    name: str | None = None
+    """Token name, from name(). Null unless is_token is true."""
+
+    resolved_at: str | None = None
+    """When this contract was last resolved. Null if never resolved."""
+
+    symbol: str | None = None
+    """Token symbol, from symbol(). Null unless is_token is true."""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'TokenMetadataResponse':
+        assert isinstance(obj, dict)
+        contract_id = from_str(obj.get("contract_id"))
+        is_token = from_bool(obj.get("is_token"))
+        network = Network(obj.get("network"))
+        decimals = from_union([from_int, from_none], obj.get("decimals"))
+        name = from_union([from_str, from_none], obj.get("name"))
+        resolved_at = from_union([from_str, from_none], obj.get("resolved_at"))
+        symbol = from_union([from_str, from_none], obj.get("symbol"))
+        return TokenMetadataResponse(contract_id, is_token, network, decimals, name, resolved_at, symbol)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["contract_id"] = from_str(self.contract_id)
+        result["is_token"] = from_bool(self.is_token)
+        result["network"] = to_enum(Network, self.network)
+        if self.decimals is not None:
+            result["decimals"] = from_union([from_int, from_none], self.decimals)
+        if self.name is not None:
+            result["name"] = from_union([from_str, from_none], self.name)
+        if self.resolved_at is not None:
+            result["resolved_at"] = from_union([from_str, from_none], self.resolved_at)
+        if self.symbol is not None:
+            result["symbol"] = from_union([from_str, from_none], self.symbol)
+        return result
+
+
 @dataclass
 class OpenAPIModels:
+    contract_event_field_schema: ContractEventFieldSchema | None = None
+    contract_event_schema: ContractEventSchema | None = None
+    contract_event_schema_response: ContractEventSchemaResponse | None = None
+    contract_spec_function: ContractSpecFunction | None = None
+    contract_spec_response: ContractSpecResponse | None = None
     contract_stats: ContractStats | None = None
     contract_stats_response: ContractStatsResponse | None = None
+    contract_storage_response: ContractStorageResponse | None = None
+    contract_storage_value: ContractStorageValue | None = None
     error_response: ErrorResponse | None = None
     event_list_response: EventListResponse | None = None
-    health_response: HealthResponse | None = None
     indexer_stats_response: IndexerStatsResponse | None = None
+    liveness_response: LivenessResponse | None = None
+    ready_checks: ReadyChecks | None = None
+    ready_response: ReadyResponse | None = None
     soroban_event: SorobanEvent | None = None
+    token_metadata_response: TokenMetadataResponse | None = None
 
     @staticmethod
     def from_dict(obj: Any) -> 'OpenAPIModels':
         assert isinstance(obj, dict)
+        contract_event_field_schema = from_union([ContractEventFieldSchema.from_dict, from_none], obj.get("ContractEventFieldSchema"))
+        contract_event_schema = from_union([ContractEventSchema.from_dict, from_none], obj.get("ContractEventSchema"))
+        contract_event_schema_response = from_union([ContractEventSchemaResponse.from_dict, from_none], obj.get("ContractEventSchemaResponse"))
+        contract_spec_function = from_union([ContractSpecFunction.from_dict, from_none], obj.get("ContractSpecFunction"))
+        contract_spec_response = from_union([ContractSpecResponse.from_dict, from_none], obj.get("ContractSpecResponse"))
         contract_stats = from_union([ContractStats.from_dict, from_none], obj.get("ContractStats"))
         contract_stats_response = from_union([ContractStatsResponse.from_dict, from_none], obj.get("ContractStatsResponse"))
+        contract_storage_response = from_union([ContractStorageResponse.from_dict, from_none], obj.get("ContractStorageResponse"))
+        contract_storage_value = from_union([ContractStorageValue.from_dict, from_none], obj.get("ContractStorageValue"))
         error_response = from_union([ErrorResponse.from_dict, from_none], obj.get("ErrorResponse"))
         event_list_response = from_union([EventListResponse.from_dict, from_none], obj.get("EventListResponse"))
-        health_response = from_union([HealthResponse.from_dict, from_none], obj.get("HealthResponse"))
         indexer_stats_response = from_union([IndexerStatsResponse.from_dict, from_none], obj.get("IndexerStatsResponse"))
+        liveness_response = from_union([LivenessResponse.from_dict, from_none], obj.get("LivenessResponse"))
+        ready_checks = from_union([ReadyChecks.from_dict, from_none], obj.get("ReadyChecks"))
+        ready_response = from_union([ReadyResponse.from_dict, from_none], obj.get("ReadyResponse"))
         soroban_event = from_union([SorobanEvent.from_dict, from_none], obj.get("SorobanEvent"))
-        return OpenAPIModels(contract_stats, contract_stats_response, error_response, event_list_response, health_response, indexer_stats_response, soroban_event)
+        token_metadata_response = from_union([TokenMetadataResponse.from_dict, from_none], obj.get("TokenMetadataResponse"))
+        return OpenAPIModels(contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response)
 
     def to_dict(self) -> dict:
         result: dict = {}
+        if self.contract_event_field_schema is not None:
+            result["ContractEventFieldSchema"] = from_union([lambda x: to_class(ContractEventFieldSchema, x), from_none], self.contract_event_field_schema)
+        if self.contract_event_schema is not None:
+            result["ContractEventSchema"] = from_union([lambda x: to_class(ContractEventSchema, x), from_none], self.contract_event_schema)
+        if self.contract_event_schema_response is not None:
+            result["ContractEventSchemaResponse"] = from_union([lambda x: to_class(ContractEventSchemaResponse, x), from_none], self.contract_event_schema_response)
+        if self.contract_spec_function is not None:
+            result["ContractSpecFunction"] = from_union([lambda x: to_class(ContractSpecFunction, x), from_none], self.contract_spec_function)
+        if self.contract_spec_response is not None:
+            result["ContractSpecResponse"] = from_union([lambda x: to_class(ContractSpecResponse, x), from_none], self.contract_spec_response)
         if self.contract_stats is not None:
             result["ContractStats"] = from_union([lambda x: to_class(ContractStats, x), from_none], self.contract_stats)
         if self.contract_stats_response is not None:
             result["ContractStatsResponse"] = from_union([lambda x: to_class(ContractStatsResponse, x), from_none], self.contract_stats_response)
+        if self.contract_storage_response is not None:
+            result["ContractStorageResponse"] = from_union([lambda x: to_class(ContractStorageResponse, x), from_none], self.contract_storage_response)
+        if self.contract_storage_value is not None:
+            result["ContractStorageValue"] = from_union([lambda x: to_class(ContractStorageValue, x), from_none], self.contract_storage_value)
         if self.error_response is not None:
             result["ErrorResponse"] = from_union([lambda x: to_class(ErrorResponse, x), from_none], self.error_response)
         if self.event_list_response is not None:
             result["EventListResponse"] = from_union([lambda x: to_class(EventListResponse, x), from_none], self.event_list_response)
-        if self.health_response is not None:
-            result["HealthResponse"] = from_union([lambda x: to_class(HealthResponse, x), from_none], self.health_response)
         if self.indexer_stats_response is not None:
             result["IndexerStatsResponse"] = from_union([lambda x: to_class(IndexerStatsResponse, x), from_none], self.indexer_stats_response)
+        if self.liveness_response is not None:
+            result["LivenessResponse"] = from_union([lambda x: to_class(LivenessResponse, x), from_none], self.liveness_response)
+        if self.ready_checks is not None:
+            result["ReadyChecks"] = from_union([lambda x: to_class(ReadyChecks, x), from_none], self.ready_checks)
+        if self.ready_response is not None:
+            result["ReadyResponse"] = from_union([lambda x: to_class(ReadyResponse, x), from_none], self.ready_response)
         if self.soroban_event is not None:
             result["SorobanEvent"] = from_union([lambda x: to_class(SorobanEvent, x), from_none], self.soroban_event)
+        if self.token_metadata_response is not None:
+            result["TokenMetadataResponse"] = from_union([lambda x: to_class(TokenMetadataResponse, x), from_none], self.token_metadata_response)
         return result
 
 

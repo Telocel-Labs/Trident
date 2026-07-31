@@ -16,19 +16,112 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct OpenApiModels {
+    pub contract_event_field_schema: Option<ContractEventFieldSchema>,
+
+    pub contract_event_schema: Option<ContractEventSchema>,
+
+    pub contract_event_schema_response: Option<ContractEventSchemaResponse>,
+
+    pub contract_spec_function: Option<ContractSpecFunction>,
+
+    pub contract_spec_response: Option<ContractSpecResponse>,
+
     pub contract_stats: Option<ContractStats>,
 
     pub contract_stats_response: Option<ContractStatsResponse>,
+
+    pub contract_storage_response: Option<ContractStorageResponse>,
+
+    pub contract_storage_value: Option<ContractStorageValue>,
 
     pub error_response: Option<ErrorResponse>,
 
     pub event_list_response: Option<EventListResponse>,
 
-    pub health_response: Option<HealthResponse>,
-
     pub indexer_stats_response: Option<IndexerStatsResponse>,
 
+    pub liveness_response: Option<LivenessResponse>,
+
+    pub ready_checks: Option<ReadyChecks>,
+
+    pub ready_response: Option<ReadyResponse>,
+
     pub soroban_event: Option<SorobanEvent>,
+
+    pub token_metadata_response: Option<TokenMetadataResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractEventFieldSchema {
+    /// Stable field name for this event payload position or property
+    pub name: String,
+
+    /// Field type inferred from the contract interface or observed payloads
+    #[serde(rename = "type")]
+    pub contract_event_field_schema_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractEventSchema {
+    /// Contract event name (topic_0)
+    pub event_name: String,
+
+    /// Named fields for this event payload
+    pub fields: Vec<ContractEventFieldSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractEventSchemaResponse {
+    /// Contract code hash for this schema version
+    pub code_hash: String,
+
+    /// Soroban contract address
+    pub contract_id: String,
+
+    /// Observed event names and their typed field schemas
+    pub events: Vec<ContractEventSchema>,
+
+    /// Network queried
+    pub network: Network,
+}
+
+/// Network queried
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Network {
+    Mainnet,
+
+    Testnet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractSpecFunction {
+    /// Exported function name
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractSpecResponse {
+    /// Deployed WASM code hash this spec was parsed from
+    pub code_hash: String,
+
+    /// Soroban contract address
+    pub contract_id: String,
+
+    /// Primary classification derived from detected interfaces (e.g. token, nft, custom)
+    pub contract_type: String,
+
+    /// Functions captured from the contract's spec
+    pub functions: Vec<ContractSpecFunction>,
+
+    /// Whether an embedded contractspecv0 section was found
+    pub has_spec: bool,
+
+    /// Every standard interface detected from the contract's spec functions
+    pub interfaces: Vec<String>,
+
+    /// Network queried
+    pub network: Network,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,13 +157,34 @@ pub struct ContractStatsResponse {
     pub to_ledger: i64,
 }
 
-/// Network queried
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Network {
-    Mainnet,
+pub struct ContractStorageResponse {
+    /// Soroban contract address
+    pub contract_id: String,
 
-    Testnet,
+    /// Network queried
+    pub network: Network,
+
+    /// Storage snapshot values (latest, or full history when queried via /storage/history)
+    pub values: Vec<ContractStorageValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractStorageValue {
+    /// Human-readable decoded storage key
+    pub key: Option<serde_json::Value>,
+
+    /// Ledger sequence at which this value was observed
+    pub ledger_sequence: i64,
+
+    /// Timestamp this snapshot row was recorded
+    pub observed_at: String,
+
+    /// Base64-encoded XDR LedgerKey this value was read from
+    pub storage_key: String,
+
+    /// Human-readable decoded value (absent when the entry was removed)
+    pub value: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,33 +261,6 @@ pub enum EventType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub indexer: Indexer,
-
-    /// Overall system status
-    pub status: HealthResponseStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Indexer {
-    /// Latest indexed ledger sequence
-    pub last_ledger_indexed: i64,
-
-    /// Timestamp of last successful indexer poll
-    pub last_poll_at: Option<String>,
-}
-
-/// Overall system status
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealthResponseStatus {
-    Degraded,
-
-    #[serde(rename = "ok")]
-    StatusOk,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerStatsResponse {
     /// Average poll duration in milliseconds
     pub avg_poll_duration_ms: Option<i64>,
@@ -189,6 +276,12 @@ pub struct IndexerStatsResponse {
 
     /// Number of ledgers behind chain tip
     pub lag_ledgers: Option<i64>,
+
+    /// Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target
+    /// ledger close time (~5s). Null whenever lag_ledgers is null. See
+    /// docs/observability/data-freshness.md for the full freshness contract this field is part
+    /// of.
+    pub lag_seconds_estimated: Option<f64>,
 
     /// Latest indexed ledger sequence
     pub last_ledger_indexed: Option<i64>,
@@ -212,4 +305,77 @@ pub enum IndexerStatsResponseStatus {
     Lagging,
 
     Stalled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivenessResponse {
+    /// Always "ok" while the process is up — no dependency checks.
+    pub status: LivenessResponseStatus,
+}
+
+/// Always "ok" while the process is up — no dependency checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LivenessResponseStatus {
+    #[serde(rename = "ok")]
+    StatusOk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyChecks {
+    /// "ok" or "error: <message>"
+    pub grpc_api: String,
+
+    /// "ok" or "error: <message>"
+    pub postgres: String,
+
+    /// "ok" or "error: <message>"
+    pub redis: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyResponse {
+    pub checks: ReadyChecks,
+
+    /// Ledgers behind chain tip, from system_state. Null when Postgres is unreachable or the
+    /// chain-tip cache hasn't been populated yet.
+    pub indexer_lag: i64,
+
+    /// "degraded" when any dependency check in `checks` failed.
+    pub status: ReadyResponseStatus,
+}
+
+/// "degraded" when any dependency check in `checks` failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadyResponseStatus {
+    Degraded,
+
+    #[serde(rename = "ok")]
+    StatusOk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenMetadataResponse {
+    /// Soroban contract address
+    pub contract_id: String,
+
+    /// Token decimals, from decimals(). Null unless is_token is true.
+    pub decimals: Option<i64>,
+
+    /// True when the contract was resolved and implements the SEP-41 read interface. False for
+    /// both "not yet resolved" and "resolved, not a token".
+    pub is_token: bool,
+
+    /// Token name, from name(). Null unless is_token is true.
+    pub name: Option<String>,
+
+    /// Network queried
+    pub network: Network,
+
+    /// When this contract was last resolved. Null if never resolved.
+    pub resolved_at: Option<String>,
+
+    /// Token symbol, from symbol(). Null unless is_token is true.
+    pub symbol: Option<String>,
 }

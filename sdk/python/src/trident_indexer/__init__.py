@@ -9,7 +9,7 @@ from .async_client import AsyncTridentClient
 from .errors import TridentApiError
 from .retry import DEFAULT_RETRY_CONFIG, RetryConfig
 from .types import SorobanEvent, PaginatedEvents, Network
-from .openapi_models_gen import OpenAPIModels, SorobanEvent as OpenAPISorobanEvent, EventListResponse, HealthResponse, IndexerStatsResponse, ContractStats, ContractStatsResponse, ErrorResponse
+from .openapi_models_gen import OpenAPIModels, SorobanEvent as OpenAPISorobanEvent, EventListResponse, LivenessResponse, ReadyResponse, ReadyChecks, IndexerStatsResponse, ContractStats, ContractStatsResponse, ErrorResponse
 
 try:
     __version__ = _version("trident-indexer")
@@ -30,7 +30,9 @@ __all__ = [
     "OpenAPIModels",
     "OpenAPISorobanEvent",
     "EventListResponse",
-    "HealthResponse",
+    "LivenessResponse",
+    "ReadyResponse",
+    "ReadyChecks",
     "IndexerStatsResponse",
     "ContractStats",
     "ContractStatsResponse",
