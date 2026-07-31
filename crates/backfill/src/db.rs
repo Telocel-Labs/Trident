@@ -28,7 +28,7 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
             (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
              event_index, event_type, topics, data)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (ledger_sequence, id) DO NOTHING
         "#,
     )
     .bind(id)

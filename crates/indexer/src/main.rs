@@ -1,4 +1,8 @@
+use std::net::SocketAddr;
+
 use opentelemetry_otlp::WithExportConfig;
+use sqlx::postgres::PgPoolOptions;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -7,12 +11,16 @@ use tracing_subscriber::EnvFilter;
 mod alerting;
 mod config;
 mod db;
+mod health;
 mod metrics;
 mod parser;
 mod poll;
 mod redis_stream;
 mod rpc;
+mod spec;
+mod storage;
 mod streamer;
+mod token_metadata;
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
@@ -64,12 +72,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     metrics::install(cfg.metrics_port)?;
 
-    let db_pool = db::connect_pool(&cfg.database_url, cfg.db_pool_size).await?;
-    tracing::info!(pool_size = cfg.db_pool_size, "Database connected via pool");
+    // Set statement_timeout and idle_in_transaction_session_timeout on every
+    // new connection so a pathological query or leaked transaction cannot hold
+    // the pool indefinitely (#249).
+    let stmt_timeout = cfg.statement_timeout_ms;
+    let idle_timeout = cfg.idle_in_transaction_timeout_ms;
+    let db_pool = PgPoolOptions::new()
+        .max_connections(cfg.db_pool_size)
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                sqlx::query(&format!("SET statement_timeout = '{stmt_timeout}ms'"))
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query(&format!(
+                    "SET idle_in_transaction_session_timeout = '{idle_timeout}ms'"
+                ))
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(&cfg.database_url)
+        .await?;
+    tracing::info!(
+        pool_size = cfg.db_pool_size,
+        statement_timeout_ms = stmt_timeout,
+        idle_in_transaction_timeout_ms = idle_timeout,
+        "Database connected with timeout defaults"
+    );
 
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
     let redis_conn = redis_client.get_multiplexed_async_connection().await?;
     tracing::info!("Redis connected");
+
+    // Spawn health and readiness endpoints on HEALTH_PORT (default 8080, separate
+    // from the Prometheus /metrics listener on METRICS_PORT) (#206).
+    let health_addr: SocketAddr = ([0, 0, 0, 0], cfg.health_port).into();
+    let health_db = db_pool.clone();
+    let health_redis_url = cfg.redis_url.clone();
+    tokio::spawn(async move {
+        health::serve(health_addr, health_db, health_redis_url).await;
+    });
 
     let shutdown = CancellationToken::new();
 
@@ -99,8 +142,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_trigger.cancel();
     });
 
-    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn).await?;
-    s.run(shutdown).await?;
+    // Outbox relay (issue #200): the poll loop only commits events; this task
+    // delivers them to Redis. It runs alongside the streamer and stops on the
+    // same shutdown signal.
+    let mut relay = redis_stream::relay::OutboxRelay::new(
+        db_pool.clone(),
+        redis_conn.clone(),
+        redis_stream::relay::RelayConfig {
+            interval: cfg.outbox_poll_interval,
+            batch_size: cfg.outbox_batch_size,
+            backlog_alert_threshold: cfg.outbox_backlog_alert_threshold,
+            stream_maxlen: cfg.redis_stream_maxlen,
+        },
+    );
+    let relay_shutdown = shutdown.clone();
+    let relay_handle = tokio::spawn(async move { relay.run(relay_shutdown).await });
+
+    // Allow the shutdown drain to finish its in-flight work before the process
+    // is killed. Kubernetes/Fly terminationGracePeriodSeconds should be ≥ this
+    // value + a small buffer (recommended: SHUTDOWN_GRACE_SECS + 5).
+    const SHUTDOWN_GRACE_SECS: u64 = 30;
+
+    let mut s = streamer::Streamer::new(cfg, db_pool).await?;
+    let result = s.run(shutdown).await;
+
+    // Let the relay drain its current pass before the process exits, bounded
+    // by the shutdown grace period (issue #205).
+    match tokio::time::timeout(Duration::from_secs(SHUTDOWN_GRACE_SECS), relay_handle).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "Outbox relay task did not shut down cleanly");
+        }
+        Err(_) => {
+            tracing::warn!(
+                grace_seconds = SHUTDOWN_GRACE_SECS,
+                "Graceful shutdown exceeded grace period; forcing exit"
+            );
+        }
+    }
+    result?;
 
     tracing::info!("Trident indexer stopped");
     Ok(())

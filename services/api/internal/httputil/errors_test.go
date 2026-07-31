@@ -107,3 +107,27 @@ func TestGRPCToHTTP_NilError(t *testing.T) {
 		t.Errorf("expected empty code, got %s", code)
 	}
 }
+
+func TestGRPCToHTTP_DeadlineExceeded(t *testing.T) {
+	err := status.Error(codes.DeadlineExceeded, "deadline exceeded")
+	statusCode, code := httputil.GRPCToHTTP(err)
+
+	if statusCode != http.StatusGatewayTimeout {
+		t.Errorf("expected 504, got %d", statusCode)
+	}
+	if code != httputil.UNAVAILABLE {
+		t.Errorf("expected UNAVAILABLE, got %s", code)
+	}
+}
+
+func TestGRPCToHTTP_Unavailable(t *testing.T) {
+	err := status.Error(codes.Unavailable, "connection refused")
+	statusCode, code := httputil.GRPCToHTTP(err)
+
+	if statusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", statusCode)
+	}
+	if code != httputil.UNAVAILABLE {
+		t.Errorf("expected UNAVAILABLE, got %s", code)
+	}
+}

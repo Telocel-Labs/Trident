@@ -8,10 +8,14 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/gen"
+	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 )
+
+// grpcCallTimeout is the per-call deadline applied to all gRPC backend requests.
+const grpcCallTimeout = 10 * time.Second
 
 // ListEventsResponse is the response envelope for GET /v1/events.
 type ListEventsResponse struct {
@@ -49,12 +53,19 @@ func SetEventsClient(client gen.EventsClient) {
 // API key context and enforced server-side — callers cannot override it.
 // Returns 400 on any validation failure.
 func ListEvents(w http.ResponseWriter, r *http.Request) {
-	if eventsClient == nil {
-		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
+	// Input is validated before backend availability: a malformed request is
+	// invalid whether or not the gRPC backend is up, and answering 503 for it
+	// tells the client to retry something that can never succeed (#222).
+	q := r.URL.Query()
+	// An unrecognised parameter is a client bug — a typo'd `limitt` silently
+	// changing the page size hides it — so it is rejected, not ignored (#222).
+	if verr := validation.RejectUnknownParams(
+		q, "limit", "ledgerFrom", "ledgerTo", "contractId", "cursor", "event_type", "topic0", "topic1",
+	); verr != nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 		return
 	}
 
-	q := r.URL.Query()
 	params, verr := validation.ValidateQueryEvents(
 		q.Get("limit"),
 		q.Get("ledgerFrom"),
@@ -68,15 +79,16 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decode opaque cursor → internal paging token (issue #44).
-	var pagingToken string
-	if raw := q.Get("cursor"); raw != "" {
-		decoded, err := cursor.Decode(raw)
-		if err != nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid cursor")
-			return
-		}
-		pagingToken = decoded
+	// Decode opaque cursor → internal paging token (issues #44, #222).
+	pagingToken, verr := validation.ValidateCursor("cursor", q.Get("cursor"))
+	if verr != nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+		return
+	}
+
+	if eventsClient == nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
+		return
 	}
 
 	// Network is enforced server-side from the authenticated API key context.
@@ -99,11 +111,12 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		grpcReq.LedgerTo = uint64(*params.LedgerTo)
 	}
 
-	// Call gRPC backend with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
-	resp, err := eventsClient.ListEvents(ctx, grpcReq)
+	resp, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.ListEventsResponse, error) {
+		return eventsClient.ListEvents(ctx, grpcReq)
+	})
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc ListEvents failed", "err", err)
@@ -136,31 +149,36 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 // derived from the authenticated API key context to prevent cross-network
 // data exposure. Returns 400 when the format is invalid.
 func GetEvent(w http.ResponseWriter, r *http.Request) {
-	if eventsClient == nil {
-		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
-		return
-	}
-
 	id := r.PathValue("id")
 	if verr := validation.ValidateEventID(id); verr != nil {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 		return
 	}
 
+	if eventsClient == nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
+		return
+	}
+
 	// Network enforced from authenticated API key context.
 	network := middleware.NetworkFromContext(r.Context())
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
-	event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{
-		Id:      id,
-		Network: network,
+	event, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.Event, error) {
+		return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 	})
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc GetEvent failed", "err", err)
-		httputil.WriteErrorCtx(r.Context(), w, statusCode, code, "event not found")
+		// "event not found" only fits a 404; a timeout or backend outage
+		// must not masquerade as a missing event (issue #227).
+		msg := "event not found"
+		if statusCode != http.StatusNotFound {
+			msg = "failed to fetch event"
+		}
+		httputil.WriteErrorCtx(r.Context(), w, statusCode, code, msg)
 		return
 	}
 

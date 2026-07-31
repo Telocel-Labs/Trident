@@ -21,8 +21,20 @@
 
 services:
   # ---------------------------------------------------------------------------
-  # Postgres — run init SQL to seed the test API key and apply the schema.
-  # The base compose does not mount initdb scripts; we add one here.
+  # Postgres — apply the real migration chain, then seed the test API key.
+  # The base compose does not mount initdb scripts; we add them here.
+  #
+  # The whole migrations directory is mounted rather than schema.sql plus a
+  # hand-picked subset of migrations. That older arrangement drifted every
+  # time someone added a migration without also updating schema.sql — most
+  # recently leaving out webhook_subscriptions, so initdb aborted with
+  # `relation "webhook_subscriptions" does not exist` and every e2e job died
+  # on a postgres that never finished starting (issue #371).
+  #
+  # postgres' initdb runs *.sql in lexical order, and the migrations are
+  # zero-padded and unique (enforced by scripts/check-migration-versions.sh),
+  # so mounting the directory applies them in the same order as production.
+  # The 99_ prefix keeps the CI seed last.
   # ---------------------------------------------------------------------------
   postgres:
     restart: "no"
@@ -32,11 +44,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - ../database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
-      - ../database/migrations/0002_system_state_health.sql:/docker-entrypoint-initdb.d/02_health.sql:ro
-      - ../database/migrations/0005_api_keys.sql:/docker-entrypoint-initdb.d/03_api_keys.sql:ro
-      - ../database/migrations/0003_alert_webhook.sql:/docker-entrypoint-initdb.d/04_alert_webhook.sql:ro
-      - ../database/migrations/0004_soroban_events_network.sql:/docker-entrypoint-initdb.d/05_events_network.sql:ro
+      - ../database/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./ci-initdb.sh:/docker-entrypoint-initdb.d/01_migrations.sh:ro
       - ./ci-seed.sql:/docker-entrypoint-initdb.d/99_ci_seed.sql:ro
 
   # ---------------------------------------------------------------------------
@@ -70,6 +79,9 @@ services:
       REDIS_URL: ${REDIS_URL}
       RUST_LOG: ${LOG_LEVEL:-info}
       GRPC_API_DB_POOL_SIZE: ${GRPC_API_DB_POOL_SIZE:-5}
+      # In-flight buffer per StreamEvents subscriber. Filling it blocks that
+      # subscriber's Redis consumer rather than queueing without limit.
+      STREAM_CHANNEL_BUFFER: ${STREAM_CHANNEL_BUFFER:-128}
     expose:
       - "50051"
     depends_on:

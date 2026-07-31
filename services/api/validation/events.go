@@ -5,8 +5,6 @@ package validation
 import (
 	"fmt"
 	"regexp"
-	"strconv"
-	"strings"
 )
 
 // Validation limits for GET /v1/events.
@@ -67,77 +65,35 @@ func ValidateQueryEvents(
 	limitStr, ledgerFromStr, ledgerToStr, contractID, cursor, eventTypeStr string,
 ) (*QueryEventsParams, *ValidationError) {
 	p := &QueryEventsParams{
-		Limit:      LimitDefault,
 		ContractID: contractID,
 		Cursor:     cursor,
 	}
 
-	// limit
-	if limitStr != "" {
-		n, err := strconv.Atoi(limitStr)
-		if err != nil || n < LimitMin || n > LimitMax {
-			return nil, &ValidationError{
-				Field:   "limit",
-				Message: fmt.Sprintf("must be an integer between %d and %d", LimitMin, LimitMax),
-			}
-		}
-		p.Limit = n
+	limit, verr := ValidateLimit("limit", limitStr, LimitMin, LimitMax, LimitDefault)
+	if verr != nil {
+		return nil, verr
+	}
+	p.Limit = int(limit)
+
+	from, to, verr := ValidateLedgerRange("ledgerFrom", "ledgerTo", ledgerFromStr, ledgerToStr)
+	if verr != nil {
+		return nil, verr
+	}
+	p.LedgerFrom, p.LedgerTo = from, to
+
+	if verr := ValidateContractID("contractId", contractID); verr != nil {
+		return nil, verr
 	}
 
-	// ledgerFrom
-	if ledgerFromStr != "" {
-		n, err := strconv.ParseInt(ledgerFromStr, 10, 64)
-		if err != nil || n < 0 {
-			return nil, &ValidationError{
-				Field:   "ledgerFrom",
-				Message: "must be a non-negative integer",
-			}
-		}
-		p.LedgerFrom = &n
-	}
+	// The cursor stays opaque here. The handler decodes it via ValidateCursor
+	// because it needs the resulting paging token, and a malformed cursor is
+	// rejected there with the same INVALID_ARGUMENT envelope.
 
-	// ledgerTo
-	if ledgerToStr != "" {
-		n, err := strconv.ParseInt(ledgerToStr, 10, 64)
-		if err != nil || n < 0 {
-			return nil, &ValidationError{
-				Field:   "ledgerTo",
-				Message: "must be a non-negative integer",
-			}
-		}
-		p.LedgerTo = &n
+	eventType, verr := ValidateEventType("event_type", eventTypeStr)
+	if verr != nil {
+		return nil, verr
 	}
-
-	// ledgerFrom <= ledgerTo when both are present
-	if p.LedgerFrom != nil && p.LedgerTo != nil && *p.LedgerTo < *p.LedgerFrom {
-		return nil, &ValidationError{
-			Field:   "ledgerTo",
-			Message: fmt.Sprintf("must be >= ledgerFrom (%d)", *p.LedgerFrom),
-		}
-	}
-
-	// contractId format
-	if contractID != "" && !stellarContractRE.MatchString(contractID) {
-		return nil, &ValidationError{
-			Field:   "contractId",
-			Message: "must be a valid Stellar contract address (C… strkey, 56 characters)",
-		}
-	}
-
-	// cursor non-empty check (presence already checked by caller via non-empty string)
-	// The query string "cursor=" with no value arrives here as "" and is simply ignored.
-
-	// eventType
-	if eventTypeStr != "" {
-		lower := strings.ToLower(eventTypeStr)
-		if !validEventTypes[lower] {
-			return nil, &ValidationError{
-				Field:   "event_type",
-				Message: "must be one of: contract, system, diagnostic",
-			}
-		}
-		p.EventType = lower
-	}
+	p.EventType = eventType
 
 	return p, nil
 }
@@ -145,13 +101,7 @@ func ValidateQueryEvents(
 // ValidateEventID validates the :id path parameter for GET /v1/events/:id.
 // Returns a *ValidationError if the value is not a valid UUID v4.
 func ValidateEventID(id string) *ValidationError {
-	if !uuidV4RE.MatchString(id) {
-		return &ValidationError{
-			Field:   "id",
-			Message: "must be a valid UUID v4 (e.g. 550e8400-e29b-41d4-a716-446655440000)",
-		}
-	}
-	return nil
+	return ValidateUUID("id", id)
 }
 
 // Validation limits for GET /v1/stats/contracts.
@@ -161,10 +111,13 @@ const (
 	StatsLimitDefault = 50
 )
 
+// DefaultNetwork is applied when a request does not specify one.
+const DefaultNetwork = "testnet"
+
 // validNetworks holds the accepted values for the ?network filter.
 var validNetworks = map[string]bool{
-	"testnet":  true,
-	"mainnet":  true,
+	"testnet": true,
+	"mainnet": true,
 }
 
 // QueryStatsParams holds validated parameters for GET /v1/stats/contracts.
@@ -189,68 +142,31 @@ type QueryStatsParams struct {
 func ValidateQueryStats(
 	fromLedgerStr, toLedgerStr, networkStr, limitStr string,
 ) (*QueryStatsParams, *ValidationError) {
-	p := &QueryStatsParams{
-		Network: "testnet",
-		Limit:   int64(StatsLimitDefault),
+	p := &QueryStatsParams{}
+
+	from, to, verr := ValidateLedgerRange("from_ledger", "to_ledger", fromLedgerStr, toLedgerStr)
+	if verr != nil {
+		return nil, verr
+	}
+	p.FromLedgerPtr, p.ToLedgerPtr = from, to
+	if from != nil {
+		p.FromLedger = *from
+	}
+	if to != nil {
+		p.ToLedger = *to
 	}
 
-	// from_ledger
-	if fromLedgerStr != "" {
-		n, err := strconv.ParseInt(fromLedgerStr, 10, 64)
-		if err != nil || n < 0 {
-			return nil, &ValidationError{
-				Field:   "from_ledger",
-				Message: "must be a non-negative integer",
-			}
-		}
-		p.FromLedger = n
-		p.FromLedgerPtr = &n
+	network, verr := ValidateNetwork("network", networkStr, DefaultNetwork)
+	if verr != nil {
+		return nil, verr
 	}
+	p.Network = network
 
-	// to_ledger
-	if toLedgerStr != "" {
-		n, err := strconv.ParseInt(toLedgerStr, 10, 64)
-		if err != nil || n < 0 {
-			return nil, &ValidationError{
-				Field:   "to_ledger",
-				Message: "must be a non-negative integer",
-			}
-		}
-		p.ToLedger = n
-		p.ToLedgerPtr = &n
+	limit, verr := ValidateLimit("limit", limitStr, StatsLimitMin, StatsLimitMax, StatsLimitDefault)
+	if verr != nil {
+		return nil, verr
 	}
-
-	// from_ledger <= to_ledger when both are present
-	if p.FromLedgerPtr != nil && p.ToLedgerPtr != nil && *p.ToLedgerPtr < *p.FromLedgerPtr {
-		return nil, &ValidationError{
-			Field:   "to_ledger",
-			Message: "must be >= from_ledger",
-		}
-	}
-
-	// network
-	if networkStr != "" {
-		lower := strings.ToLower(networkStr)
-		if !validNetworks[lower] {
-			return nil, &ValidationError{
-				Field:   "network",
-				Message: "must be one of: testnet, mainnet",
-			}
-		}
-		p.Network = lower
-	}
-
-	// limit
-	if limitStr != "" {
-		n, err := strconv.ParseInt(limitStr, 10, 64)
-		if err != nil || n < int64(StatsLimitMin) || n > int64(StatsLimitMax) {
-			return nil, &ValidationError{
-				Field:   "limit",
-				Message: fmt.Sprintf("must be an integer between %d and %d", StatsLimitMin, StatsLimitMax),
-			}
-		}
-		p.Limit = n
-	}
+	p.Limit = limit
 
 	return p, nil
 }

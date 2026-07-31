@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 )
 
 const (
@@ -24,6 +27,15 @@ const (
 	// readDeadline is how long the server waits for any data (including pong)
 	// before declaring the connection dead (issue #15 requires ≤ 60 s).
 	readDeadline = 60 * time.Second
+
+	// writeDeadline bounds a single frame write. A stuck TCP socket (full
+	// kernel send buffer because the peer stopped reading) must not block
+	// this connection's goroutine forever (issue #224).
+	writeDeadline = 10 * time.Second
+
+	// closeStatusPolicyViolation is the RFC 6455 close code sent to a slow
+	// consumer disconnected under the fill policy (issue #224).
+	closeStatusPolicyViolation = 1008
 )
 
 // Handler returns an http.HandlerFunc that upgrades incoming HTTP connections
@@ -38,9 +50,17 @@ const (
 // read deadline so dead connections are detected and goroutines do not leak.
 func Handler(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		contractID := r.URL.Query().Get("contractId")
-		if contractID == "" {
-			http.Error(w, "missing contractId query parameter", http.StatusBadRequest)
+		q := r.URL.Query()
+		// Pre-handshake failures use the same INVALID_ARGUMENT envelope as the
+		// REST endpoints rather than a plain-text body (issue #222).
+		if verr := validation.RejectUnknownParams(q, "contractId", "topic0"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		contractID := q.Get("contractId")
+		if verr := validation.ValidateRequiredContractID("contractId", contractID); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -59,6 +79,7 @@ func Handler(hub *Hub) http.HandlerFunc {
 		c := &client{
 			contractID: contractID,
 			send:       make(chan []byte, sendBufSize),
+			closeSlow:  make(chan struct{}),
 		}
 		hub.register(c)
 		defer hub.unregister(c)
@@ -80,6 +101,10 @@ func Handler(hub *Hub) http.HandlerFunc {
 					// Hub closed the channel — client was unregistered.
 					return
 				}
+				if err := conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+					slog.Warn("ws: failed to set write deadline", "err", err)
+					return
+				}
 				if err := writeTextFrame(bufrw, msg); err != nil {
 					slog.Warn("ws: write error, closing connection", "err", err)
 					return
@@ -91,6 +116,10 @@ func Handler(hub *Hub) http.HandlerFunc {
 				}
 
 			case <-ticker.C:
+				if err := conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+					slog.Warn("ws: failed to set write deadline", "err", err)
+					return
+				}
 				if err := writePingFrame(bufrw); err != nil {
 					slog.Warn("ws: ping write error, closing connection", "err", err)
 					return
@@ -101,6 +130,13 @@ func Handler(hub *Hub) http.HandlerFunc {
 					slog.Warn("ws: failed to refresh deadline", "err", err)
 					return
 				}
+
+			case <-c.closeSlow:
+				// Fill-policy disconnect (issue #224): tell the client why
+				// before dropping the connection.
+				_ = conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+				_ = writeCloseFrame(bufrw, closeStatusPolicyViolation, "slow consumer: buffer exceeded")
+				return
 			}
 		}
 	}
@@ -162,6 +198,15 @@ func writeTextFrame(bufrw *bufio.ReadWriter, payload []byte) error {
 // writePingFrame writes an RFC 6455 ping frame (opcode 0x9, FIN set, empty payload).
 func writePingFrame(bufrw *bufio.ReadWriter) error {
 	return writeFrame(bufrw, 0x89, nil)
+}
+
+// writeCloseFrame writes an RFC 6455 close frame (opcode 0x8) carrying a
+// 2-byte status code followed by a UTF-8 reason string (issue #224).
+func writeCloseFrame(bufrw *bufio.ReadWriter, code uint16, reason string) error {
+	payload := make([]byte, 2+len(reason))
+	binary.BigEndian.PutUint16(payload, code)
+	copy(payload[2:], reason)
+	return writeFrame(bufrw, 0x88, payload)
 }
 
 // writeFrame writes a single WebSocket frame with the given first-byte opcode

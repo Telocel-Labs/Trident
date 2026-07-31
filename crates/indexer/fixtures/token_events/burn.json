@@ -1,0 +1,13 @@
+{
+  "name": "burn",
+  "topics": [
+    "AAAADwAAAARidXJu",
+    "AAAAEgAAAAAAAAAAERERERERERERERERERERERERERERERERERERERERERE="
+  ],
+  "data": "AAAACgAAAAAAAAAAAAAAAAAAAPo=",
+  "expected": {
+    "event_type": "burn",
+    "from": "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M",
+    "amount": "250"
+  }
+}

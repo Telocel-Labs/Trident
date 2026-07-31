@@ -62,3 +62,23 @@ try:
 except TridentApiError as e:
     print(e.status, e.code, str(e))  # 404 NOT_FOUND event not found
 ```
+
+## Configuration
+
+`api_url` and `api_key` can be passed explicitly or supplied via environment
+variables. An explicit constructor argument always takes precedence:
+
+| Argument  | Environment variable | 
+|-----------|-----------------------|
+| `api_url` | `TRIDENT_BASE_URL`     |
+| `api_key` | `TRIDENT_API_KEY`      |
+
+```python
+# Reads TRIDENT_API_KEY / TRIDENT_BASE_URL from the environment
+client = TridentClient()
+```
+
+If neither an explicit value nor the environment variable is set,
+construction raises `TridentConfigError` with a clear message. The API key
+is never logged or included in `repr()`/error output — it is always
+redacted (e.g. `***a1b2`).

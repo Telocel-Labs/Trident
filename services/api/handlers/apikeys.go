@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
+	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -59,15 +62,15 @@ type updateKeyRequest struct {
 // error response and returning false when the handler should abort.
 func requireAdmin(cfg APIKeyConfig, w http.ResponseWriter, r *http.Request) bool {
 	if cfg.AdminKey == "" {
-		writeJSON(w, http.StatusForbidden, errorBody("admin API key is not configured"))
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusForbidden, httputil.UNAUTHORIZED, "admin API key is not configured")
 		return false
 	}
 	if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-		writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 		return false
 	}
 	if cfg.DB == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("database unavailable"))
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 		return false
 	}
 	return true
@@ -85,7 +88,11 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		var req createKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid JSON body"))
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}
 		if req.Network == "" {
@@ -97,7 +104,7 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		raw := make([]byte, 32)
 		if _, err := rand.Read(raw); err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to generate key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to generate key")
 			return
 		}
 		plaintext := "trident_" + hex.EncodeToString(raw)
@@ -118,7 +125,7 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			hash, prefix, req.Label, req.Network, req.RateLimitTier, createdBy,
 		).Scan(&id, &createdAt)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to create api key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to create api key")
 			return
 		}
 
@@ -153,7 +160,7 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			 ORDER BY created_at DESC`,
 		)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to list api keys"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to list api keys")
 			return
 		}
 		defer rows.Close()
@@ -166,7 +173,7 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			if err := rows.Scan(&k.ID, &k.KeyPrefix, &k.Label, &k.Network,
 				&k.RateLimitTier, &k.CreatedBy, &lastUsedAt, &k.RequestCount,
 				&revokedAt, &createdAt); err != nil {
-				writeJSON(w, http.StatusInternalServerError, errorBody("scan error"))
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "scan error")
 				return
 			}
 			k.CreatedAt = createdAt.UTC().Format(time.RFC3339)
@@ -181,7 +188,7 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			keys = append(keys, k)
 		}
 		if rows.Err() != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("query error"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "query error")
 			return
 		}
 
@@ -198,19 +205,25 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
+		// Path ids go through the shared UUID validator so a malformed id is a
+		// clear INVALID_ARGUMENT instead of a database-shaped failure (#222).
 		id := r.PathValue("id")
-		if id == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("missing api key id"))
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
 		var req updateKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid JSON body"))
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}
 		if req.Label == nil && req.RateLimitTier == nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("at least one of label or rate_limit_tier is required"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "at least one of label or rate_limit_tier is required")
 			return
 		}
 
@@ -229,11 +242,11 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		).Scan(&k.ID, &k.KeyPrefix, &k.Label, &k.Network, &k.RateLimitTier,
 			&lastUsedAt, &k.RequestCount, &createdAt, &keyHash)
 		if err == pgx.ErrNoRows {
-			writeJSON(w, http.StatusNotFound, errorBody("api key not found"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "api key not found")
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to update api key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to update api key")
 			return
 		}
 
@@ -263,9 +276,11 @@ func DeleteAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
+		// Path ids go through the shared UUID validator so a malformed id is a
+		// clear INVALID_ARGUMENT instead of a database-shaped failure (#222).
 		id := r.PathValue("id")
-		if id == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("missing api key id"))
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -278,11 +293,11 @@ func DeleteAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			id,
 		).Scan(&keyHash)
 		if err == pgx.ErrNoRows {
-			writeJSON(w, http.StatusNotFound, errorBody("api key not found"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "api key not found")
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to revoke api key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to revoke api key")
 			return
 		}
 

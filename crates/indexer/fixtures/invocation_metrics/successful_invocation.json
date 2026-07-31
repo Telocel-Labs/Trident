@@ -1,0 +1,13 @@
+{
+  "name": "successful_invocation",
+  "envelopeXdr": "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAPQkAAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAAAAAAJAAAAAQAAAAAAAAAAAAAAAAB6EgAAABAAAAAEAAAAAAAAAK/IAAAAAA==",
+  "resultXdr": "AAAAAAAXkygAAAAAAAAAAAAAAAA=",
+  "expected": {
+    "fee_charged": 1545000,
+    "resource_fee": 45000,
+    "cpu_instructions": 8000000,
+    "read_bytes": 4096,
+    "write_bytes": 1024,
+    "provenance": "declared_resources"
+  }
+}

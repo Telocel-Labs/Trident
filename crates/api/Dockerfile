@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── builder ──────────────────────────────────────────────────────────────────
-FROM rust:1.88-slim AS builder
+FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
 
 WORKDIR /app
 
@@ -36,13 +36,16 @@ RUN find crates sdk -name '*.rs' -exec touch {} + \
     && cargo build --release -p trident-api
 
 # ── runtime ──────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 1001 --no-create-home trident
 
 COPY --from=builder /app/target/release/trident-api /usr/local/bin/trident-api
+
+USER trident
 
 EXPOSE 50051
 

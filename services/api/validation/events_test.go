@@ -25,7 +25,10 @@ func TestValidateQueryEvents_Defaults(t *testing.T) {
 }
 
 func TestValidateQueryEvents_ValidLimit(t *testing.T) {
-	for _, tc := range []struct{ input string; want int }{
+	for _, tc := range []struct {
+		input string
+		want  int
+	}{
 		{"1", 1},
 		{"50", 50},
 		{"200", 200},
@@ -99,7 +102,7 @@ func TestValidateQueryEvents_InvalidContractID(t *testing.T) {
 	for _, bad := range []string{
 		"not-a-contract",
 		"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", // G... account, not C...
-		"C123",        // too short
+		"C123", // too short
 		"cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // lowercase c
 	} {
 		_, err := validation.ValidateQueryEvents("", "", "", bad, "", "")
@@ -192,7 +195,7 @@ func TestValidateEventID_ValidUUIDv4(t *testing.T) {
 func TestValidateEventID_InvalidFormats(t *testing.T) {
 	for _, bad := range []string{
 		"not-a-uuid",
-		"550e8400e29b41d4a716446655440000", // no hyphens
+		"550e8400e29b41d4a716446655440000",     // no hyphens
 		"550e8400-e29b-31d4-a716-446655440000", // version 3, not 4
 		"550e8400-e29b-41d4-c716-446655440000", // variant bits wrong (c)
 		"",

@@ -1,0 +1,15 @@
+{
+  "name": "sac_transfer_untracked",
+  "topics": [
+    "AAAADwAAAAh0cmFuc2Zlcg==",
+    "AAAAEgAAAAAAAAAAERERERERERERERERERERERERERERERERERERERERERE=",
+    "AAAAEgAAAAAAAAAAIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI="
+  ],
+  "data": "AAAACgAAAAAAAAAAAAAAAEmWAtI=",
+  "expected": {
+    "event_type": "transfer",
+    "from": "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M",
+    "to": "GARCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCFRVX",
+    "amount": "1234567890"
+  }
+}

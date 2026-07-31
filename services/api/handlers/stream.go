@@ -10,12 +10,19 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
 	eventStreamKey = "trident:events"
 	streamReadWait = time.Second
+
+	// sseWriteDeadline bounds a single SSE write. A stalled client (full TCP
+	// send buffer) must not block this connection's goroutine forever
+	// (issue #224); the deadline turns a stuck socket into a write error so
+	// the handler returns and cleans up instead of leaking.
+	sseWriteDeadline = 10 * time.Second
 )
 
 type streamRedisClient interface {
@@ -23,14 +30,34 @@ type streamRedisClient interface {
 	XRevRangeN(ctx context.Context, key, start, stop string, count int64) *redis.XMessageSliceCmd
 }
 
+// eventStreamGapEvent is the documented SSE event sent when a requested
+// Last-Event-ID is older than the stream retention window.
+const eventStreamGapEvent = `event: gap\ndata: {"message":"requested Last-Event-ID is outside the retention window; resuming from oldest available"}\n\n`
+
 // Stream returns an SSE handler that forwards new Redis Stream events for one
 // contract. The handler owns the blocking read loop, so request cancellation
 // stops all streaming work without a detached goroutine.
+//
+// It honours the standard SSE Last-Event-ID header (issue #235):
+// - On first connect: tail the stream from the latest id.
+// - On reconnect with Last-Event-ID: resume from that id + 1.
+// - If the requested id is older than the retention window, emit a `gap` event
+//   and resume from the oldest available id.
+// - Every SSE event includes an `id:` field so the browser automatically sends
+//   Last-Event-ID on reconnect.
 func Stream(rdb streamRedisClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		contractID := r.URL.Query().Get("contractId")
-		if contractID == "" {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contractId is required")
+		q := r.URL.Query()
+		if verr := validation.RejectUnknownParams(q, "contractId", "topic0"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		// The stream filters server-side on this id, so a malformed one would
+		// otherwise silently match nothing for the life of the connection.
+		contractID := q.Get("contractId")
+		if verr := validation.ValidateRequiredContractID("contractId", contractID); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -40,14 +67,47 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 			return
 		}
 
-		lastID, err := latestStreamID(r.Context(), rdb)
-		if err != nil {
-			if r.Context().Err() != nil {
+		// Honour Last-Event-ID for resumption (issue #235).
+		// If the header is present and non-empty, try to resume from that point.
+		lastID := ""
+		if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
+			// Verify the requested id exists in the stream. If not, emit a gap
+			// signal and resume from the oldest available.
+			msgs, lookupErr := rdb.XRevRangeN(r.Context(), eventStreamKey, lastEventID, lastEventID, 1).Result()
+			if lookupErr != nil || len(msgs) == 0 {
+				// Emit a gap event so the client knows data was lost.
+				if _, writeErr := fmt.Fprint(w, eventStreamGapEvent); writeErr != nil {
+					slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
+					return
+				}
+				flusher.Flush()
+
+				oldest, err := earliestStreamID(r.Context(), rdb)
+				if err != nil {
+					if r.Context().Err() != nil {
+						return
+					}
+					slog.Error("sse: failed to read earliest stream id", "err", err)
+					httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
+					return
+				}
+				lastID = oldest
+			} else {
+				lastID = lastEventID
+			}
+		}
+
+		if lastID == "" {
+			var err error
+			lastID, err = latestStreamID(r.Context(), rdb)
+			if err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
+				slog.Error("sse: failed to read Redis Stream tail", "err", err)
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
 				return
 			}
-			slog.Error("sse: failed to read Redis Stream tail", "err", err)
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
-			return
 		}
 
 		h := w.Header()
@@ -55,14 +115,11 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 		h.Set("Cache-Control", "no-cache")
 		h.Set("X-Accel-Buffering", "no")
 		h.Set("Connection", "keep-alive")
-		if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil &&
-			!errors.Is(err, http.ErrNotSupported) {
-			slog.Warn("sse: failed to disable response write deadline", "err", err)
-		}
+		rc := http.NewResponseController(w)
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 
-		topic0 := r.URL.Query().Get("topic0")
+		topic0 := q.Get("topic0")
 
 		for {
 			streams, readErr := rdb.XRead(r.Context(), &redis.XReadArgs{
@@ -105,7 +162,14 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 						continue
 					}
 
-					if _, writeErr := fmt.Fprintf(w, "data: %s\n\n", payload); writeErr != nil {
+					if err := rc.SetWriteDeadline(time.Now().Add(sseWriteDeadline)); err != nil &&
+						!errors.Is(err, http.ErrNotSupported) {
+						slog.Warn("sse: failed to set write deadline", "err", err)
+					}
+					// Emit SSE id: field so browsers auto-send Last-Event-ID on reconnect.
+					if _, writeErr := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", msg.ID, payload); writeErr != nil {
+						metricSSESlowConsumerDisconnects.Add(1)
+						slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
 						return
 					}
 					flusher.Flush()
@@ -117,6 +181,20 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 
 func latestStreamID(ctx context.Context, rdb streamRedisClient) (string, error) {
 	messages, err := rdb.XRevRangeN(ctx, eventStreamKey, "+", "-", 1).Result()
+	if err != nil {
+		return "", err
+	}
+	if len(messages) == 0 {
+		return "0-0", nil
+	}
+	return messages[0].ID, nil
+}
+
+func earliestStreamID(ctx context.Context, rdb streamRedisClient) (string, error) {
+	// XRange with start "-" and stop "+" returns messages in ascending order.
+	// Limit 1 gives us the oldest message in the stream.
+	cmd := rdb.XRevRangeN(ctx, eventStreamKey, "+", "-", 1)
+	messages, err := cmd.Result()
 	if err != nil {
 		return "", err
 	}

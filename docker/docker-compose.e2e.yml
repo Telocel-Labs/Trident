@@ -1,0 +1,27 @@
+# E2E overlay (issue #268) — layered on top of docker-compose.yml +
+# docker-compose.ci.yml. Points the indexer at a local Soroban RPC (started
+# separately as a plain `docker run` of stellar/quickstart, published on the
+# CI runner's port 8000) instead of the public testnet RPC in .env.ci.
+#
+# Usage:
+#   docker compose \
+#     -f docker/docker-compose.yml \
+#     -f docker/docker-compose.ci.yml \
+#     -f docker/docker-compose.e2e.yml \
+#     --env-file .env.ci \
+#     up -d
+#
+# The quickstart container is not part of this Compose project — it is
+# started before `up -d` runs, published on the host at :8000. `host-gateway`
+# is a Docker Engine 20.10+ special value that resolves to the host's gateway
+# IP from inside a container, which is how the indexer (in its own bridge
+# network) reaches the host-published quickstart port on a Linux CI runner.
+services:
+  indexer:
+    environment:
+      STELLAR_RPC_URL: http://host.docker.internal:8000/rpc
+      # Poll aggressively so a just-invoked event is indexed within the E2E
+      # job's bounded wait instead of the production 5s default.
+      POLL_INTERVAL_MS: 500
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

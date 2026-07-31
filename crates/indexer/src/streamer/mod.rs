@@ -11,12 +11,13 @@
 //! - Fault tolerance and retry logic: transient RPC failures are retried with
 //!   exponential backoff; persistent failures are logged without crashing the
 //!   process or losing cursor position so the next poll cycle can recover.
-//! - Handing each raw event to the `Parser` and forwarding normalised
-//!   `SorobanEvent` values to both PostgreSQL (via `db`) and Redis Streams
-//!   (via `redis_stream`).
+//! - Handing each raw event to the `Parser` and committing normalised
+//!   `SorobanEvent` values to PostgreSQL together with an outbox row (issue
+//!   #200). Redis delivery is owned by `redis_stream::relay`, so a crash
+//!   between the commit and the publish cannot drop an event.
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
@@ -30,8 +31,8 @@ use crate::{
     db, metrics,
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
-    redis_stream,
-    rpc::RpcClient,
+    rpc::{filters::build_event_filters, FilterPlan, RpcClient, RpcHttpSettings},
+    token_metadata,
 };
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -40,14 +41,19 @@ const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
 pub struct Streamer {
     config: Config,
     db: PgPool,
-    redis: redis::aio::MultiplexedConnection,
     rpc: RpcClient,
     parser: Parser,
     /// `None`  → index all contracts (empty `indexed_contracts` table).
-    /// `Some`  → allowlist with per-contract `index_from` boundaries;
-    ///           events from unlisted contracts or below their index_from
-    ///           are skipped.
+    /// `Some`  → allowlist with per-contract `index_from` boundaries (issue
+    ///           #202); events from unlisted contracts, or from listed ones
+    ///           below their `index_from`, are skipped.
     contract_filter: Option<HashMap<String, i64>>,
+    /// Server-side `getEvents` filters derived from `contract_filter` (issue
+    /// #203). Rebuilt whenever the allowlist is reloaded. Only the contract
+    /// ids matter to the RPC — the per-contract `index_from` boundaries are
+    /// applied client-side, since `getEvents` has one `startLedger` for the
+    /// whole request.
+    filter_plan: FilterPlan,
     /// Counts poll cycles so we know when to refresh the filter.
     poll_count: u32,
     /// Outbound webhook alerter (issue #75). No-op when URL is not configured.
@@ -56,17 +62,60 @@ pub struct Streamer {
     last_chain_tip: u64,
     /// Adaptive poll-interval controller driven by chain-tip lag (issue #198).
     adaptive_poll: AdaptivePoll,
+    /// Parsed-spec cache keyed by WASM code hash (issue #260).
+    spec_cache: crate::spec::SpecCache,
+    /// Last code hash synced to `contract_specs` per contract, so a redeploy
+    /// (changed hash) is what triggers a refresh, not every poll cycle
+    /// (issue #260).
+    known_code_hashes: std::collections::HashMap<String, String>,
+    /// Tracked contracts most recently classified as SEP-41 tokens (issue
+    /// #269) — what bounds storage-snapshot fetching (issue #270) to
+    /// contracts we actually know how to read a balance from.
+    token_contracts: HashSet<String>,
+}
+
+/// One contract-storage snapshot change observed during a poll cycle,
+/// pending persistence (issue #270). Owns its data so it outlives the
+/// borrows built from `page_events`/`page_tokens` earlier in `poll_once`.
+struct OwnedStorageSnapshot {
+    contract_id: String,
+    storage_key: String,
+    key_json: serde_json::Value,
+    value_json: Option<serde_json::Value>,
+    ledger_sequence: u64,
 }
 
 impl Streamer {
-    pub async fn new(
-        config: Config,
-        db: PgPool,
-        redis: redis::aio::MultiplexedConnection,
-    ) -> Result<Self, TridentError> {
-        let rpc = RpcClient::new(config.stellar_rpc_url.clone());
-        let parser = Parser::new(config.index_diagnostic);
+    /// Build the streamer. It owns no Redis connection: events are committed to
+    /// Postgres with an outbox row and delivered by `redis_stream::relay`
+    /// (issue #200).
+    pub async fn new(config: Config, db: PgPool) -> Result<Self, TridentError> {
+        let rpc = RpcClient::with_endpoints(
+            config.stellar_rpc_urls.clone(),
+            &RpcHttpSettings {
+                connect_timeout: config.rpc_connect_timeout,
+                request_timeout: config.rpc_request_timeout,
+                pool_idle_timeout: config.rpc_pool_idle_timeout,
+                pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
+                tcp_keepalive: config.rpc_tcp_keepalive,
+            },
+        )?;
+        tracing::info!(
+            endpoints = config.stellar_rpc_urls.len(),
+            primary = %config.stellar_rpc_url,
+            "RPC endpoint pool configured with health scoring"
+        );
+        let sac_registry = crate::parser::sac::SacRegistry::build(
+            &config.tracked_sac_assets,
+            &config.network_passphrase,
+        )?;
+        tracing::info!(
+            tracked_assets = config.tracked_sac_assets.len(),
+            "SAC asset registry built"
+        );
+        let parser = Parser::new(config.index_diagnostic).with_sac_registry(sac_registry);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
+        let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
         let alerter = Alerter::from_config(
             config.alert_webhook_url.clone(),
             config.alert_lag_threshold,
@@ -82,14 +131,17 @@ impl Streamer {
         Ok(Self {
             config,
             db,
-            redis,
             rpc,
             parser,
             contract_filter,
+            filter_plan,
             poll_count: 0,
             alerter,
             last_chain_tip: 0,
             adaptive_poll,
+            spec_cache: crate::spec::SpecCache::new(),
+            known_code_hashes: std::collections::HashMap::new(),
+            token_contracts: HashSet::new(),
         })
     }
 
@@ -120,7 +172,8 @@ impl Streamer {
                     if let Some(ref old_map) = self.contract_filter {
                         let cursor = crate::db::get_cursor(&self.db).await.unwrap_or(0);
                         for (id, &index_from) in new_map {
-                            if !old_map.contains_key(id) && index_from > 0
+                            if !old_map.contains_key(id)
+                                && index_from > 0
                                 && (index_from as u64) < cursor
                             {
                                 tracing::warn!(
@@ -136,6 +189,7 @@ impl Streamer {
                         }
                     }
                 }
+                self.filter_plan = plan_filters(filter.as_ref(), &self.config.topic_filters);
                 self.contract_filter = filter;
                 Ok(())
             }
@@ -143,6 +197,58 @@ impl Streamer {
                 // Non-fatal: keep the existing filter, log the error.
                 tracing::warn!(error = %e, "Failed to refresh contract filter; keeping existing");
                 Ok(())
+            }
+        }
+    }
+
+    /// Fetch + persist specs and detected interfaces for every tracked
+    /// contract (issues #260, #269). Best-effort per contract: an RPC or
+    /// parse failure just skips that contract for this cycle. A DB write
+    /// only happens when the observed code hash differs from the last one
+    /// synced, so a contract whose code has not changed costs one cheap
+    /// `getLedgerEntries` call, not a WASM re-fetch.
+    async fn sync_contract_specs(&mut self) {
+        let Some(filter) = self.contract_filter.clone() else {
+            return;
+        };
+
+        // Only the ids matter here — spec sync is per contract and unrelated
+        // to each contract's index_from boundary.
+        for contract_id in filter.into_keys() {
+            match crate::spec::fetch_contract_spec(&self.rpc, &self.spec_cache, &contract_id).await
+            {
+                Ok(Some(contract_spec)) => {
+                    if contract_spec.interfaces.iter().any(|i| i == "sep41_token") {
+                        self.token_contracts.insert(contract_id.clone());
+                    } else {
+                        self.token_contracts.remove(&contract_id);
+                    }
+
+                    let changed =
+                        self.known_code_hashes.get(&contract_id) != Some(&contract_spec.code_hash);
+                    if changed {
+                        match db::upsert_contract_spec(
+                            &self.db,
+                            &contract_id,
+                            &self.config.network,
+                            &contract_spec,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                self.known_code_hashes
+                                    .insert(contract_id.clone(), contract_spec.code_hash.clone());
+                            }
+                            Err(e) => {
+                                tracing::warn!(contract_id = %contract_id, error = %e, "Failed to persist contract spec");
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(contract_id = %contract_id, error = %e, "Failed to fetch contract spec");
+                }
             }
         }
     }
@@ -163,6 +269,12 @@ impl Streamer {
         let mut cursor = db::get_cursor(&self.db).await?;
         tracing::info!(cursor, "Resuming from ledger cursor");
 
+        // Populate contract specs / interface tags once at startup (issues
+        // #260, #269) so storage snapshotting (#270) has token classification
+        // available from the first poll rather than waiting for the first
+        // periodic refresh.
+        self.sync_contract_specs().await;
+
         loop {
             // Check for shutdown before starting a new poll so we never begin
             // a batch we can't finish atomically.
@@ -170,11 +282,18 @@ impl Streamer {
                 break;
             }
 
+            // Dead-man's-switch: ticks once per loop iteration regardless of
+            // poll outcome, so Prometheus can alert on a hung/crashed process
+            // even when lag itself still looks fine.
+            metrics::record_heartbeat();
+            metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
+
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
             if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 self.refresh_contract_filter().await?;
+                self.sync_contract_specs().await;
             }
 
             let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
@@ -212,6 +331,13 @@ impl Streamer {
             let interval = self.adaptive_poll.next_interval(lag);
             metrics::set_effective_poll_interval(interval.as_millis() as u64);
 
+            // Stamp the heartbeat after every cycle — even failed ones — so the
+            // gauge advances as long as the poll loop is alive (#218). A dead-man's
+            // switch alert fires when `time() - gauge > threshold`.
+            if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                metrics::set_heartbeat_timestamp(now.as_secs_f64());
+            }
+
             // Sleep until the next poll interval, waking immediately on shutdown.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -222,8 +348,131 @@ impl Streamer {
             }
         }
 
-        tracing::info!("Streamer stopped cleanly");
+        tracing::info!(cursor, "Streamer stopped cleanly; cursor persisted");
         Ok(())
+    }
+
+    /// Fetch and decode per-invocation fee + declared-resource metering for
+    /// one transaction hash via `getTransaction` (issue #266).
+    ///
+    /// Best-effort: any RPC or decode failure is logged and treated as "no
+    /// metrics for this transaction" rather than failing the poll cycle —
+    /// metering is a value-add on top of event indexing, not a correctness
+    /// requirement for it.
+    async fn fetch_invocation_metrics(
+        &self,
+        tx_hash: &str,
+    ) -> Option<crate::parser::invocation_metrics::InvocationMetrics> {
+        let resp = match self.rpc.get_transaction(tx_hash).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(
+                    tx_hash,
+                    error = %e,
+                    "getTransaction failed; skipping invocation metrics"
+                );
+                return None;
+            }
+        };
+
+        if resp.status == "NOT_FOUND" {
+            tracing::warn!(
+                tx_hash,
+                "getTransaction returned NOT_FOUND for a just-indexed event; skipping invocation metrics"
+            );
+            return None;
+        }
+
+        let (envelope_xdr, result_xdr) = match (resp.envelope_xdr, resp.result_xdr) {
+            (Some(envelope), Some(result)) => (envelope, result),
+            _ => {
+                tracing::warn!(
+                    tx_hash,
+                    status = %resp.status,
+                    "getTransaction response missing envelope/result XDR; skipping invocation metrics"
+                );
+                return None;
+            }
+        };
+
+        match crate::parser::invocation_metrics::decode_invocation_metrics(
+            &envelope_xdr,
+            &result_xdr,
+        ) {
+            Ok(metrics) => Some(metrics),
+            Err(e) => {
+                tracing::warn!(tx_hash, error = %e, "Failed to decode invocation metrics");
+                None
+            }
+        }
+    }
+
+    /// Resolve and cache SEP-41 token metadata for every distinct contract
+    /// among `token_projections` whose `token_metadata` row is missing or
+    /// older than `token_metadata_refresh_interval` (issue #263).
+    ///
+    /// Best-effort: an RPC/simulation failure for one contract is logged and
+    /// skipped, leaving its row (if any) untouched so the next page carrying
+    /// activity for that contract retries it — the poll cycle itself never
+    /// fails because of this.
+    async fn resolve_stale_token_metadata(&self, token_projections: &[db::TokenProjection<'_>]) {
+        if token_projections.is_empty() {
+            return;
+        }
+
+        let mut contract_ids: Vec<String> = token_projections
+            .iter()
+            .map(|p| p.event.contract_id.clone())
+            .collect();
+        contract_ids.sort_unstable();
+        contract_ids.dedup();
+
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(self.config.token_metadata_refresh_interval)
+                .unwrap_or(chrono::Duration::zero());
+        let fresh = match db::fresh_token_metadata_contract_ids(
+            &self.db,
+            &contract_ids,
+            &self.config.network,
+            cutoff,
+        )
+        .await
+        {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load fresh token_metadata contract ids; skipping this cycle's resolution");
+                return;
+            }
+        };
+
+        for contract_id in contract_ids {
+            if fresh.contains(&contract_id) {
+                continue;
+            }
+
+            let resolution = match token_metadata::resolve(&self.rpc, &contract_id).await {
+                Ok(resolution) => resolution,
+                Err(e) => {
+                    tracing::warn!(
+                        contract_id = %contract_id,
+                        error = %e,
+                        "Failed to resolve token metadata; will retry on a future poll"
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) =
+                db::upsert_token_metadata(&self.db, &contract_id, &self.config.network, &resolution)
+                    .await
+            {
+                tracing::warn!(
+                    contract_id = %contract_id,
+                    error = %e,
+                    "Failed to cache token metadata"
+                );
+            }
+        }
     }
 
     /// Execute a single poll cycle. Fetches all available pages from the RPC
@@ -250,10 +499,13 @@ impl Streamer {
         let effective_cursor = if *cursor == 0 {
             match &self.contract_filter {
                 Some(filter) => {
-                    let min_from = filter.values().copied().min().unwrap_or(0);
-                    // If min index_from > 1, set effective_cursor to min_from - 1
-                    // so that page_request_params returns startLedger = min_from.
-                    if min_from > 1 { min_from - 1 } else { 0 }
+                    // index_from is a BIGINT and cursors are u64; clamp at 0 so
+                    // a negative or unset value cannot wrap on conversion.
+                    let min_from = filter.values().copied().min().unwrap_or(0).max(0) as u64;
+                    // Set effective_cursor to min_from - 1 so page_request_params
+                    // returns startLedger = min_from. Saturating so 0 and 1 both
+                    // yield 0 rather than wrapping.
+                    min_from.saturating_sub(1)
                 }
                 None => 0,
             }
@@ -263,16 +515,24 @@ impl Streamer {
         let mut page_cursor: Option<String> = None;
         let mut total = 0;
 
+        // Snapshot the server-side filters for the whole cycle (issue #203) so
+        // the request shape is stable across pages and the borrow does not
+        // conflict with the mutable state updated inside the loop.
+        let filters = self.filter_plan.filters.clone();
+
         loop {
             let (sl, pc) = page_request_params(effective_cursor, page_cursor.as_deref());
             let mut attempt = 0u32;
             let limit = self.config.max_events_per_poll;
+            // Server-side narrowing (issue #203). Empty in index-all mode; the
+            // client-side allowlist check below stays as the safety net.
+            let filters = filters.as_slice();
             let page = Retry::start(retry_strategy.clone(), || {
                 attempt += 1;
                 if attempt > 1 {
                     metrics::record_rpc_retry();
                 }
-                async { self.rpc.get_events(sl, pc.clone(), limit).await }
+                async { self.rpc.get_events(sl, pc.clone(), limit, filters).await }
                     .instrument(tracing::info_span!("rpc_get_events"))
             })
             .await?;
@@ -294,14 +554,25 @@ impl Streamer {
 
             let mut events_in_page: i32 = 0;
             let mut skipped_in_page: u64 = 0;
+            // Accumulate the page and commit it in one transaction (issue #199)
+            // rather than paying a round-trip per row.
+            let mut page_events: Vec<trident_common::SorobanEvent> =
+                Vec::with_capacity(page.events.len());
+            // Token projections keyed by position in `page_events` (issue #211).
+            // Indices, not references, because `page_events` is still growing.
+            let mut page_tokens: Vec<(usize, crate::parser::token_events::TokenEvent)> = Vec::new();
             for raw in &page.events {
+                let decode_start = Instant::now();
                 let parse_result = {
                     let _span = tracing::info_span!("parse_events").entered();
-                    self.parser.parse_event(raw)
+                    self.parser.parse_event_with_projection(raw)
                 };
+                metrics::record_decode_duration(decode_start.elapsed().as_secs_f64());
+
                 match parse_result {
-                    Ok(Some(event)) => {
-                        // Contract allowlist filtering (issue #47, #202).
+                    Ok(Some(parsed)) => {
+                        let event = parsed.event;
+                        // Contract allowlist filtering (issues #47, #202).
                         // None → index all; Some(map) → only listed contracts,
                         // and only at or above their per-contract index_from.
                         if let Some(ref filter) = self.contract_filter {
@@ -311,35 +582,44 @@ impl Streamer {
                                         contract_id = %event.contract_id,
                                         "Skipping event from unlisted contract"
                                     );
+                                    // Unlisted contracts land in the "other" bucket to
+                                    // bound cardinality (issue #212).
+                                    metrics::record_events_by_contract("other", 1);
                                     skipped_in_page += 1;
                                     continue;
                                 }
-                                Some(&index_from) if (event.ledger_sequence as i64) < index_from => {
+                                Some(&index_from)
+                                    if (event.ledger_sequence as i64) < index_from =>
+                                {
                                     tracing::trace!(
                                         contract_id = %event.contract_id,
                                         ledger = event.ledger_sequence,
                                         index_from = index_from,
                                         "Skipping event below contract index_from"
                                     );
+                                    // Listed, but below its start ledger — still a
+                                    // skip, so bucket it the same way.
+                                    metrics::record_events_by_contract("other", 1);
                                     skipped_in_page += 1;
                                     continue;
                                 }
                                 _ => {}
                             }
                         }
-                        db::insert_event(&self.db, &event)
-                            .instrument(tracing::info_span!(
-                                "db_insert_events",
-                                contract_id = %event.contract_id
-                            ))
-                            .await?;
-                        redis_stream::publish_event(
-                            &mut self.redis,
-                            &event,
-                            self.config.redis_stream_maxlen,
-                        )
-                        .instrument(tracing::info_span!("redis_xadd"))
-                        .await?;
+                        // Allowlisted or index-all: record under the real contract_id.
+                        // In index-all mode cardinality is unbounded — operators should
+                        // configure an allowlist if per-contract metrics are needed.
+                        metrics::record_events_by_contract(&event.contract_id, 1);
+                        // Events are accumulated and committed as one page,
+                        // together with their outbox rows; the relay owns the
+                        // Redis publish (issues #199, #200). Publishing inline
+                        // here would reintroduce the lost-event window: a crash
+                        // after the commit but before the XADD dropped the event
+                        // for live subscribers with no replay path.
+                        if let Some(token) = parsed.token {
+                            page_tokens.push((page_events.len(), token));
+                        }
+                        page_events.push(event);
                         total += 1;
                         events_in_page += 1;
                     }
@@ -393,16 +673,23 @@ impl Streamer {
             metrics::record_events_processed(events_in_page as u64);
             metrics::record_events_skipped(skipped_in_page);
 
-            // Advance the persistent cursor and record ledger metadata.
+            // Decide whether this page advances the cursor, and gather the
+            // ledger provenance that must land in the same transaction.
+            let mut next_cursor: Option<u64> = None;
+            let mut ledger_hash = String::new();
+            let mut ledger_timestamp = String::new();
+            let mut ledger_sequence = 0u64;
+
             if let Some(last) = page.events.last() {
                 let seq: u64 = last.ledger.parse().unwrap_or(*cursor);
                 if seq > *cursor {
-                    *cursor = seq;
-                    db::set_cursor(&self.db, *cursor).await?;
+                    next_cursor = Some(seq);
+                    ledger_sequence = seq;
+                    ledger_timestamp = last.ledger_closed_at.clone();
 
                     // Fetch the real ledger hash from getLedgers RPC.
                     // Non-critical: log a warning on failure, store empty string.
-                    let ledger_hash = match self.rpc.get_ledger(seq).await {
+                    ledger_hash = match self.rpc.get_ledger(seq).await {
                         Ok(Some(h)) => h,
                         Ok(None) => {
                             tracing::warn!(seq, "getLedgers returned no ledger for sequence");
@@ -413,17 +700,183 @@ impl Streamer {
                             String::new()
                         }
                     };
-
-                    db::insert_ledger_metadata(
-                        &self.db,
-                        seq,
-                        &ledger_hash,
-                        &last.ledger_closed_at,
-                        events_in_page,
-                    )
-                    .await?;
                 }
             }
+
+            // One transaction for the whole page: events, cursor, and ledger
+            // metadata land together or not at all, so a crash can never leave
+            // the cursor ahead of the events it claims to cover (issue #199).
+            // Resolve the projection indices now that `page_events` is final.
+            let token_projections: Vec<db::TokenProjection<'_>> = page_tokens
+                .iter()
+                .map(|(index, token)| db::TokenProjection {
+                    event: &page_events[*index],
+                    token,
+                })
+                .collect();
+
+            // Per-invocation fee + declared-resource metering for tracked
+            // contracts (issue #266). Every event in `page_events` already
+            // passed the allowlist check above, so this never runs unbounded
+            // index-all fan-out (see docs/contract-invocation-metering.md).
+            //
+            // Two passes over `page_events`: fetching (pass 1) mutates
+            // `tx_metrics`, and building the rows (pass 2) borrows from it —
+            // keeping those separate avoids holding a long-lived immutable
+            // borrow into the map across a later mutable insert.
+            let mut tx_metrics: std::collections::HashMap<
+                &str,
+                Option<crate::parser::invocation_metrics::InvocationMetrics>,
+            > = std::collections::HashMap::new();
+            let mut invocation_metrics: Vec<db::InvocationMetricRow<'_>> = Vec::new();
+            if self.contract_filter.is_some() {
+                for event in &page_events {
+                    if !tx_metrics.contains_key(event.transaction_hash.as_str()) {
+                        let decoded = self.fetch_invocation_metrics(&event.transaction_hash).await;
+                        tx_metrics.insert(event.transaction_hash.as_str(), decoded);
+                    }
+                }
+
+                let mut seen_pairs: std::collections::HashSet<(&str, &str)> =
+                    std::collections::HashSet::new();
+                for event in &page_events {
+                    let pair = (event.contract_id.as_str(), event.transaction_hash.as_str());
+                    if !seen_pairs.insert(pair) {
+                        continue;
+                    }
+                    if let Some(Some(metrics)) = tx_metrics.get(event.transaction_hash.as_str()) {
+                        invocation_metrics.push(db::InvocationMetricRow {
+                            contract_id: &event.contract_id,
+                            transaction_hash: &event.transaction_hash,
+                            ledger_sequence: event.ledger_sequence,
+                            ledger_timestamp: &event.ledger_timestamp,
+                            metrics,
+                        });
+                    }
+                }
+            }
+
+            // Contract storage snapshots (issue #270): bounded to tracked
+            // contracts already classified as SEP-41 tokens (issue #269), and
+            // only for holder addresses that moved funds in this page — never
+            // a scan of arbitrary storage.
+            let mut owned_storage_snapshots: Vec<OwnedStorageSnapshot> = Vec::new();
+            if !self.token_contracts.is_empty() {
+                let mut holders_by_contract: std::collections::HashMap<
+                    &str,
+                    std::collections::HashSet<&str>,
+                > = std::collections::HashMap::new();
+                for (index, token) in &page_tokens {
+                    let contract_id = page_events[*index].contract_id.as_str();
+                    if !self.token_contracts.contains(contract_id) {
+                        continue;
+                    }
+                    let holders = holders_by_contract.entry(contract_id).or_default();
+                    if let Some(from) = &token.from {
+                        holders.insert(from.as_str());
+                    }
+                    if let Some(to) = &token.to {
+                        holders.insert(to.as_str());
+                    }
+                }
+
+                let snapshot_ledger = if ledger_sequence > 0 {
+                    ledger_sequence
+                } else {
+                    *cursor
+                };
+                for (contract_id, holders) in holders_by_contract {
+                    let holder_list: Vec<String> =
+                        holders.into_iter().map(str::to_string).collect();
+                    let observations = match crate::storage::fetch_balance_snapshots(
+                        &self.rpc,
+                        contract_id,
+                        &holder_list,
+                    )
+                    .await
+                    {
+                        Ok(obs) => obs,
+                        Err(e) => {
+                            tracing::warn!(contract_id, error = %e, "Failed to fetch storage snapshot");
+                            continue;
+                        }
+                    };
+
+                    for obs in observations {
+                        let last = db::get_latest_storage_value(
+                            &self.db,
+                            contract_id,
+                            &self.config.network,
+                            &obs.storage_key,
+                        )
+                        .await
+                        .unwrap_or(None);
+
+                        if last != obs.value_json {
+                            owned_storage_snapshots.push(OwnedStorageSnapshot {
+                                contract_id: contract_id.to_string(),
+                                storage_key: obs.storage_key,
+                                key_json: obs.key_json,
+                                value_json: obs.value_json,
+                                ledger_sequence: snapshot_ledger,
+                            });
+                        }
+                    }
+                }
+            }
+            let storage_snapshots: Vec<db::StorageSnapshotRow<'_>> = owned_storage_snapshots
+                .iter()
+                .map(|s| db::StorageSnapshotRow {
+                    contract_id: &s.contract_id,
+                    storage_key: &s.storage_key,
+                    key_json: &s.key_json,
+                    value_json: s.value_json.as_ref(),
+                    ledger_sequence: s.ledger_sequence,
+                })
+                .collect();
+
+            db::commit_page(
+                &self.db,
+                db::PageCommit {
+                    events: &page_events,
+                    token_events: &token_projections,
+                    invocation_metrics: &invocation_metrics,
+                    storage_snapshots: &storage_snapshots,
+                    network: &self.config.network,
+                    cursor: next_cursor,
+                    ledger: next_cursor.map(|_| db::LedgerMeta {
+                        sequence: ledger_sequence,
+                        hash: &ledger_hash,
+                        timestamp: &ledger_timestamp,
+                        event_count: events_in_page,
+                    }),
+                    batch_size: self.config.db_batch_size,
+                },
+            )
+            .instrument(tracing::info_span!(
+                "db_commit_page",
+                events = page_events.len()
+            ))
+            .await?;
+
+            if let Some(seq) = next_cursor {
+                *cursor = seq;
+            }
+
+            // Resolve + cache SEP-41 token metadata for any contract seen in
+            // this page's token events whose cached row is missing or stale
+            // (issue #263). Best-effort, like `fetch_invocation_metrics`
+            // above: a resolution failure is logged and skipped rather than
+            // failing the poll cycle.
+            self.resolve_stale_token_metadata(&token_projections)
+                .instrument(tracing::info_span!("resolve_token_metadata"))
+                .await;
+
+            // Delivery is not done here. The commit above wrote an outbox row
+            // per event, and `redis_stream::relay` publishes them (issue #200).
+            // Publishing inline would still lose events: a crash between the
+            // commit and the XADD leaves the event in Postgres and off the
+            // stream, with nothing to replay it.
 
             // An incomplete page means we have caught up to the chain tip.
             if page.events.len() < self.config.max_events_per_poll as usize {
@@ -456,6 +909,7 @@ impl Streamer {
                         chain_tip_ledger: self.last_chain_tip,
                         lag_threshold: self.config.alert_lag_threshold,
                         network: self.config.network.clone(),
+                        rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
                     };
                     self.alerter.evaluate(&ctx, &mut alert_state).await;
                     if let Err(e) = db::set_alert_state(&self.db, &alert_state).await {
@@ -470,6 +924,45 @@ impl Streamer {
 
         Ok(total)
     }
+}
+
+/// Build the server-side `getEvents` filter plan for the current allowlist and
+/// log how the request will be narrowed (issue #203).
+///
+/// A `degraded` plan means the allowlist is too large to express within the
+/// RPC's filter caps, so we index everything and rely on the client-side
+/// allowlist check in `poll_once` — correct, just less efficient.
+/// Build the server-side filter plan from the allowlist.
+///
+/// Takes the `index_from` map but uses only its keys: `getEvents` carries a
+/// single `startLedger` for the whole request, so per-contract boundaries
+/// cannot be pushed down and are applied client-side in `poll_once`
+/// (issues #202, #203).
+fn plan_filters(
+    allowlist: Option<&HashMap<String, i64>>,
+    topic_filters: &[Vec<String>],
+) -> FilterPlan {
+    let contract_ids: Option<HashSet<String>> = allowlist.map(|map| map.keys().cloned().collect());
+    let plan = build_event_filters(contract_ids.as_ref(), topic_filters);
+
+    if plan.degraded {
+        tracing::warn!(
+            contracts = allowlist.map(|s| s.len()).unwrap_or(0),
+            max = crate::rpc::filters::MAX_FILTERABLE_CONTRACTS,
+            "Allowlist exceeds the RPC filter caps; falling back to index-all with client-side filtering"
+        );
+    } else if plan.filters.is_empty() {
+        tracing::info!("No contract allowlist; requesting all events (index-all mode)");
+    } else {
+        tracing::info!(
+            filters = plan.filters.len(),
+            contracts = allowlist.map(|s| s.len()).unwrap_or(0),
+            topic_patterns = topic_filters.len(),
+            "Server-side getEvents filtering active"
+        );
+    }
+
+    plan
 }
 
 /// Decide the `(startLedger, cursor)` params for a single RPC page request.
@@ -492,6 +985,7 @@ fn page_request_params(cursor: u64, page_cursor: Option<&str>) -> (Option<u64>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redis_stream::relay::{OutboxRelay, RelayConfig};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{Limited, Limits, ScSymbol, ScVal, WriteXdr};
     use wiremock::matchers::{body_partial_json, method, path};
@@ -596,15 +1090,20 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(body)
     }
 
-    async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
-        let db = sqlx::PgPool::connect(db_url).await.unwrap();
-        let redis = redis::Client::open(redis_url)
+    /// Standalone Redis connection for tests that assert on the stream. The
+    /// streamer itself no longer holds one — the relay owns publishing.
+    async fn redis_conn(redis_url: &str) -> redis::aio::MultiplexedConnection {
+        redis::Client::open(redis_url)
             .unwrap()
             .get_multiplexed_async_connection()
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
+        let db = sqlx::PgPool::connect(db_url).await.unwrap();
         let config = Config {
-            stellar_rpc_url: rpc_url,
+            stellar_rpc_url: rpc_url.clone(),
             database_url: db_url.to_string(),
             db_pool_size: 3,
             redis_url: redis_url.to_string(),
@@ -614,16 +1113,35 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
+            stellar_rpc_urls: vec![rpc_url],
+            rpc_failover_threshold: 3,
+            rpc_endpoint_cooldown: Duration::from_secs(30),
+            rpc_connect_timeout: Duration::from_secs(5),
+            rpc_request_timeout: Duration::from_secs(30),
+            rpc_pool_idle_timeout: Duration::from_secs(90),
+            rpc_pool_max_idle_per_host: 8,
+            rpc_tcp_keepalive: Duration::from_secs(60),
             index_diagnostic: false,
+            topic_filters: Vec::new(),
             max_events_per_poll: 200,
+            db_batch_size: 1_000,
             redis_stream_maxlen: 10_000,
+            outbox_poll_interval: Duration::from_millis(10),
+            outbox_batch_size: 500,
+            outbox_backlog_alert_threshold: 10_000,
             metrics_port: 0,
             alert_webhook_url: None,
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
+            health_port: 0,
+            statement_timeout_ms: 30_000,
+            idle_in_transaction_timeout_ms: 60_000,
+            token_metadata_refresh_interval: Duration::from_secs(86_400),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            tracked_sac_assets: Vec::new(),
         };
 
-        Streamer::new(config, db, redis).await.unwrap()
+        Streamer::new(config, db).await.unwrap()
     }
 
     async fn reset_db(pool: &sqlx::PgPool) {
@@ -717,26 +1235,123 @@ mod tests {
             .await;
 
         let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        let mut conn = redis_conn(&redis_url).await;
         reset_db(&s.db).await;
+        sqlx::query("DELETE FROM event_outbox")
+            .execute(&s.db)
+            .await
+            .unwrap();
 
         // Trim the stream so we start fresh.
         let _: () = redis::cmd("XTRIM")
             .arg("trident:events")
             .arg("MAXLEN")
             .arg(0)
-            .query_async(&mut s.redis)
+            .query_async(&mut conn)
             .await
             .unwrap_or(());
 
         let mut cursor = 0u64;
         s.poll_once(&mut cursor).await.unwrap();
 
+        // The poll only commits events plus their outbox rows; the relay is
+        // what puts them on the stream (issue #200).
+        let mut relay = OutboxRelay::new(
+            s.db.clone(),
+            conn.clone(),
+            RelayConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 100,
+                backlog_alert_threshold: 1_000,
+                stream_maxlen: 10_000,
+            },
+        );
+        let published = relay.publish_pending().await.unwrap();
+        assert_eq!(published, 2, "relay should publish both committed events");
+
         let len: i64 = redis::cmd("XLEN")
             .arg("trident:events")
-            .query_async(&mut s.redis)
+            .query_async(&mut conn)
             .await
             .unwrap();
         assert_eq!(len, 2, "expected 2 events in Redis stream");
+    }
+
+    /// A publish that never happens (relay not run) must leave the events
+    /// recoverable: a later relay pass still delivers them, which is the
+    /// crash-after-commit case from issue #200.
+    #[tokio::test]
+    async fn unpublished_events_are_delivered_on_a_later_relay_pass() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(400, 3)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(400, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        let mut conn = redis_conn(&redis_url).await;
+        reset_db(&s.db).await;
+        sqlx::query("DELETE FROM event_outbox")
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("XTRIM")
+            .arg("trident:events")
+            .arg("MAXLEN")
+            .arg(0)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(());
+
+        // Commit the batch, then simulate the process dying before any publish.
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let backlog = crate::db::outbox::backlog(&s.db).await.unwrap();
+        assert_eq!(backlog, 3, "committed events must be queued for delivery");
+
+        let len: i64 = redis::cmd("XLEN")
+            .arg("trident:events")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            len, 0,
+            "nothing should be on the stream before the relay runs"
+        );
+
+        // Restart equivalent: a fresh relay drains the backlog.
+        let mut relay = OutboxRelay::new(
+            s.db.clone(),
+            conn.clone(),
+            RelayConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 100,
+                backlog_alert_threshold: 1_000,
+                stream_maxlen: 10_000,
+            },
+        );
+        assert_eq!(relay.publish_pending().await.unwrap(), 3);
+
+        let len: i64 = redis::cmd("XLEN")
+            .arg("trident:events")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(len, 3, "relay must deliver every committed event");
+        assert_eq!(crate::db::outbox::backlog(&s.db).await.unwrap(), 0);
+
+        // A second pass is a no-op: published rows are not re-delivered.
+        assert_eq!(relay.publish_pending().await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -838,6 +1453,517 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Token projection (issue #211)
+    // -----------------------------------------------------------------------
+
+    /// A page of standard SEP-41 transfer events, wire-encoded the way the RPC
+    /// returns them so the whole decode path runs.
+    fn token_events_page(ledger: u64, count: usize) -> serde_json::Value {
+        use stellar_xdr::curr::{AccountId, Int128Parts, PublicKey, ScAddress, Uint256};
+
+        let addr = |seed: u8| {
+            let val = ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])),
+            )));
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+        let amount = |v: i64| {
+            let val = ScVal::I128(Int128Parts {
+                hi: 0,
+                lo: v as u64,
+            });
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+
+        let events: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": "CTOKEN_PROJECTION",
+                    "id": format!("{:016}-{}", ledger, i),
+                    "pagingToken": format!("{}-{}", ledger, i),
+                    "txHash": format!("tokenhash{}{}", ledger, i),
+                    "topic": [sym_xdr("transfer"), addr(1), addr(2)],
+                    "value": amount(1_000 + i as i64),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "events": events, "latestLedger": ledger }
+        })
+    }
+
+    #[tokio::test]
+    async fn token_events_are_projected_into_the_projection_table() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(token_events_page(700, 3)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page(700, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT event_type, amount, to_address FROM token_events
+             WHERE contract_id = 'CTOKEN_PROJECTION' ORDER BY event_index",
+        )
+        .fetch_all(&s.db)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 3, "every transfer must be projected");
+        assert!(rows.iter().all(|(kind, _, _)| kind == "transfer"));
+        assert_eq!(rows[0].1.as_deref(), Some("1000"));
+        assert!(rows[0].2.is_some(), "transfer must record a destination");
+
+        // Replaying the same page must not duplicate the projection.
+        let mut replay_cursor = 0u64;
+        let _ = s.poll_once(&mut replay_cursor).await;
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM token_events WHERE contract_id = 'CTOKEN_PROJECTION'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 3, "replay must not duplicate projection rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // Invocation metrics (issue #266)
+    // -----------------------------------------------------------------------
+
+    /// Build the `envelopeXdr` + `resultXdr` base64 pair for a successful
+    /// Soroban invocation declaring the given resource budget, exactly as
+    /// `getTransaction` returns them.
+    fn invocation_transaction_xdr(
+        instructions: u32,
+        disk_read_bytes: u32,
+        write_bytes: u32,
+        resource_fee: i64,
+        fee_charged: i64,
+    ) -> (String, String) {
+        use stellar_xdr::curr::{
+            LedgerFootprint, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+            SequenceNumber, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
+            Transaction, TransactionEnvelope, TransactionExt, TransactionResult,
+            TransactionResultExt, TransactionResultResult, TransactionV1Envelope, VecM,
+        };
+
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(stellar_xdr::curr::Uint256([1u8; 32])),
+            fee: 1_000_000,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: VecM::try_from(vec![Operation {
+                source_account: None,
+                body: OperationBody::Inflation,
+            }])
+            .unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: VecM::default(),
+                    },
+                    instructions,
+                    disk_read_bytes,
+                    write_bytes,
+                },
+                resource_fee,
+            }),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+        let result = TransactionResult {
+            fee_charged,
+            result: TransactionResultResult::TxSuccess(VecM::default()),
+            ext: TransactionResultExt::V0,
+        };
+
+        let mut env_buf = vec![];
+        envelope
+            .write_xdr(&mut Limited::new(&mut env_buf, Limits::none()))
+            .unwrap();
+        let mut res_buf = vec![];
+        result
+            .write_xdr(&mut Limited::new(&mut res_buf, Limits::none()))
+            .unwrap();
+
+        (STANDARD.encode(env_buf), STANDARD.encode(res_buf))
+    }
+
+    #[tokio::test]
+    async fn invocation_metrics_persisted_for_tracked_contract() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let event = serde_json::json!({
+            "type": "contract",
+            "ledger": "800",
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "contractId": "CINVOKE_TRACKED",
+            "id": "0000000000800000-0",
+            "pagingToken": "800-0",
+            "txHash": "txinvoke1",
+            "topic": [sym_xdr("swap")],
+            "value": void_xdr(),
+            "inSuccessfulContractCall": true
+        });
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [event], "latestLedger": 800 }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [], "latestLedger": 800 }
+            })))
+            .mount(&server)
+            .await;
+
+        let (envelope_xdr, result_xdr) =
+            invocation_transaction_xdr(5_000_000, 2_048, 512, 12_345, 1_012_345);
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getTransaction", "params": { "hash": "txinvoke1" } }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "status": "SUCCESS",
+                    "envelopeXdr": envelope_xdr,
+                    "resultXdr": result_xdr,
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        sqlx::query(
+            "DELETE FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED'",
+        )
+        .execute(&s.db)
+        .await
+        .unwrap();
+        set_allowlist(&s.db, &["CINVOKE_TRACKED"]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let row: (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>, String) = sqlx::query_as(
+            "SELECT fee_charged, resource_fee, cpu_instructions, read_bytes, write_bytes, provenance
+             FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED' AND transaction_hash = 'txinvoke1'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .expect("invocation metrics row must be persisted");
+
+        assert_eq!(row.0, 1_012_345, "fee_charged");
+        assert_eq!(row.1, Some(12_345), "resource_fee");
+        assert_eq!(row.2, Some(5_000_000), "cpu_instructions");
+        assert_eq!(row.3, Some(2_048), "read_bytes");
+        assert_eq!(row.4, Some(512), "write_bytes");
+        assert_eq!(row.5, "declared_resources", "provenance");
+
+        // Replaying the same page must not duplicate the row.
+        let mut replay_cursor = 0u64;
+        let _ = s.poll_once(&mut replay_cursor).await;
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "replay must not duplicate the metrics row");
+
+        set_allowlist(&s.db, &[]).await;
+        sqlx::query(
+            "DELETE FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED'",
+        )
+        .execute(&s.db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invocation_metrics_are_not_fetched_in_index_all_mode() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let event = serde_json::json!({
+            "type": "contract",
+            "ledger": "810",
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "contractId": "CINVOKE_UNTRACKED",
+            "id": "0000000000810000-0",
+            "pagingToken": "810-0",
+            "txHash": "txinvoke2",
+            "topic": [sym_xdr("swap")],
+            "value": void_xdr(),
+            "inSuccessfulContractCall": true
+        });
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [event], "latestLedger": 810 }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [], "latestLedger": 810 }
+            })))
+            .mount(&server)
+            .await;
+        // Deliberately no getTransaction mock: in index-all mode (no
+        // allowlist) the streamer must never call it. Wiremock returns a 404
+        // for any unmatched request, which would fail the poll if this were
+        // called.
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &[]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_UNTRACKED'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "index-all mode must not fetch invocation metrics"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-side getEvents filtering (issue #203)
+    // -----------------------------------------------------------------------
+
+    /// Register the allowlist rows the streamer reads on refresh, scoped to the
+    /// network the test config uses.
+    async fn set_allowlist(pool: &sqlx::PgPool, contract_ids: &[&str]) {
+        sqlx::query("DELETE FROM indexed_contracts WHERE network = 'testnet' OR network IS NULL")
+            .execute(pool)
+            .await
+            .unwrap();
+        for id in contract_ids {
+            sqlx::query(
+                "INSERT INTO indexed_contracts (contract_id, network) VALUES ($1, 'testnet')
+                 ON CONFLICT (contract_id, network) DO NOTHING",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn get_events_request_carries_allowlist_contract_filter() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // The mock only matches when the outbound body contains the expected
+        // filter block. If the filter were missing, nothing would match and the
+        // poll would fail — this assertion cannot silently pass.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": {
+                    "filters": [{
+                        "type": "contract",
+                        "contractIds": ["CFILTER_A", "CFILTER_B"]
+                    }]
+                }
+            })))
+            .respond_with(rpc_ok(events_page(600, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &["CFILTER_A", "CFILTER_B"]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        set_allowlist(&s.db, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn get_events_request_sends_empty_filters_in_index_all_mode() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": { "filters": [] }
+            })))
+            .respond_with(rpc_ok(events_page(601, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &[]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_allowlist_degrades_to_unfiltered_request() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": { "filters": [] }
+            })))
+            .respond_with(rpc_ok(events_page(602, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let ids: Vec<String> = (0..crate::rpc::filters::MAX_FILTERABLE_CONTRACTS + 1)
+            .map(|i| format!("CBIG_{i:03}"))
+            .collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &id_refs).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        assert!(
+            s.filter_plan.degraded,
+            "an allowlist past the RPC caps must degrade to index-all"
+        );
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        set_allowlist(&s.db, &[]).await;
+    }
+
     #[tokio::test]
     async fn full_page_triggers_followup_poll_partial_page_stops() {
         let (db_url, redis_url) = require_services!();
@@ -904,6 +2030,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn events_page_multi(entries: Vec<(u64, &str, u32)>) -> serde_json::Value {
+        // Computed before the into_iter() below consumes `entries`.
+        let latest = entries.iter().map(|(l, _, _)| *l).max().unwrap_or(0);
         let events: Vec<serde_json::Value> = entries
             .into_iter()
             .map(|(ledger, contract_id, idx)| {
@@ -922,7 +2050,6 @@ mod tests {
             })
             .collect();
 
-        let latest = entries.iter().map(|(l, _, _)| *l).max().unwrap_or(0);
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -962,10 +2089,7 @@ mod tests {
         reset_db(&pool).await;
         seed_contracts(
             &pool,
-            vec![
-                ("CTEST_A", 100, "testnet"),
-                ("CTEST_B", 200, "testnet"),
-            ],
+            vec![("CTEST_A", 100, "testnet"), ("CTEST_B", 200, "testnet")],
         )
         .await;
         // Clean seed from streamer load_filter won't double-count.
@@ -1036,24 +2160,23 @@ mod tests {
         assert_eq!(total, 3, "only in-range events should be indexed");
 
         // Verify stored events in the database.
-        let count_a: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_A'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count_a.0, 2, "CTEST_A should have 2 events (ledgers 150, 250)");
-
-        let count_b: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_B'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count_a: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_A'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
-            count_b.0, 1,
-            "CTEST_B should have 1 event (ledger 250)"
+            count_a.0, 2,
+            "CTEST_A should have 2 events (ledgers 150, 250)"
         );
+
+        let count_b: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_B'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count_b.0, 1, "CTEST_B should have 1 event (ledger 250)");
 
         pool.close().await;
     }
+}

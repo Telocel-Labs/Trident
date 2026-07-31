@@ -99,9 +99,18 @@ Full historical event storage with no enforced retention limit, so a query again
 
 - [x] Architecture defined
 - [x] Full specification written — [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md)
+- [x] Soroban event model documented — [`docs/soroban-event-model.md`](./docs/soroban-event-model.md)
 - [x] Repository scaffolded
 - [x] CI pipeline active
 - [ ] Phase 1 development begins
+
+---
+
+## Reference Contracts
+
+`contracts/` holds a minimal SEP-41 token contract plus build/deploy/invoke
+scripts (local quickstart and testnet) used for local demos and E2E testing.
+See [`contracts/README.md`](./contracts/README.md).
 
 ---
 

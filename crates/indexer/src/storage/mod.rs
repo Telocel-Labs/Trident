@@ -1,0 +1,158 @@
+//! # Storage snapshots (issue #270)
+//!
+//! Indexes contract storage (ledger entry) snapshots for tracked contracts,
+//! bounded to what the allowlist and the current poll page actually touched:
+//! for tracked contracts detected as SEP-41 tokens (issue #269), fetches the
+//! `Balance(Address)` data entry for every address that moved funds in this
+//! page's decoded token events, and records a new row only when the value
+//! changed since the last observed snapshot.
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use stellar_xdr::curr::{
+    AccountId, ContractDataDurability, ContractId, Hash, Int128Parts, LedgerEntryData, LedgerKey,
+    LedgerKeyContractData, Limited, Limits, PublicKey, ReadXdr, ScAddress, ScSymbol, ScVal, ScVec,
+    Uint256, VecM, WriteXdr,
+};
+use trident_common::TridentError;
+
+use crate::rpc::RpcClient;
+use crate::spec::contract_address;
+
+/// One observed contract-storage value, ready to diff against the last
+/// persisted snapshot and insert if it changed.
+#[derive(Debug)]
+pub struct StorageObservation {
+    pub storage_key: String,
+    pub key_json: serde_json::Value,
+    pub value_json: Option<serde_json::Value>,
+}
+
+fn decode_address(strkey: &str) -> Result<ScAddress, TridentError> {
+    match stellar_strkey::Strkey::from_string(strkey) {
+        Ok(stellar_strkey::Strkey::PublicKeyEd25519(pk)) => Ok(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)),
+        ))),
+        Ok(stellar_strkey::Strkey::Contract(c)) => Ok(ScAddress::Contract(ContractId(Hash(c.0)))),
+        _ => Err(TridentError::parse(anyhow::anyhow!(
+            "unsupported address strkey: {strkey}"
+        ))),
+    }
+}
+
+/// Build the `Balance(Address)` ledger key used by the reference SEP-41
+/// token contract (contracts/token, issue #267) and by soroban-examples'
+/// token contract — the de facto standard `DataKey::Balance(Address)`
+/// storage layout.
+fn balance_key(contract_id: &str, holder: &str) -> Result<LedgerKey, TridentError> {
+    let entries: Vec<ScVal> = vec![
+        ScVal::Symbol(ScSymbol::try_from("Balance".to_string()).expect("literal fits ScSymbol")),
+        ScVal::Address(decode_address(holder)?),
+    ];
+    let key = ScVal::Vec(Some(ScVec(
+        VecM::try_from(entries).expect("2 elements fits"),
+    )));
+
+    Ok(LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract_address(contract_id)?,
+        key,
+        durability: ContractDataDurability::Persistent,
+    }))
+}
+
+fn encode_key(key: &LedgerKey) -> Result<String, TridentError> {
+    let mut buf = Vec::new();
+    key.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("encode LedgerKey")))?;
+    Ok(STANDARD.encode(buf))
+}
+
+fn i128_to_json(parts: &Int128Parts) -> serde_json::Value {
+    let value = ((parts.hi as i128) << 64) | (parts.lo as u128 as i128);
+    serde_json::json!(value.to_string())
+}
+
+/// Fetch the current `Balance(Address)` entry for each holder of a tracked
+/// SEP-41 token contract. Holders not present in this batch are silently
+/// skipped (an address with no balance entry has never held the asset).
+pub async fn fetch_balance_snapshots(
+    rpc: &RpcClient,
+    contract_id: &str,
+    holders: &[String],
+) -> Result<Vec<StorageObservation>, TridentError> {
+    if holders.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut keys = Vec::with_capacity(holders.len());
+    let mut key_b64s = Vec::with_capacity(holders.len());
+    for holder in holders {
+        let key = balance_key(contract_id, holder)?;
+        key_b64s.push(encode_key(&key)?);
+        keys.push((holder, key_b64s.last().unwrap().clone()));
+    }
+
+    let entries = rpc.get_ledger_entries(&key_b64s).await?;
+
+    // getLedgerEntries only returns entries that exist, so match results back
+    // to holders by the (base64) key it was requested with.
+    let mut observations = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let Some((holder, _)) = keys.iter().find(|(_, k)| k == &entry.key) else {
+            continue;
+        };
+
+        let bytes = STANDARD.decode(&entry.xdr).map_err(|e| {
+            TridentError::parse(anyhow::Error::new(e).context("base64 decode ledger entry"))
+        })?;
+        let mut cursor = std::io::Cursor::new(bytes);
+        let data = LedgerEntryData::read_xdr(&mut Limited::new(&mut cursor, Limits::none()))
+            .map_err(|e| {
+                TridentError::parse(anyhow::Error::new(e).context("XDR decode LedgerEntryData"))
+            })?;
+
+        let LedgerEntryData::ContractData(contract_data) = data else {
+            continue;
+        };
+
+        let value_json = match &contract_data.val {
+            ScVal::I128(parts) => Some(i128_to_json(parts)),
+            other => Some(serde_json::Value::String(format!("{other:?}"))),
+        };
+
+        observations.push(StorageObservation {
+            storage_key: entry.key.clone(),
+            key_json: serde_json::json!({ "Balance": holder }),
+            value_json,
+        });
+    }
+
+    Ok(observations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const TEST_HOLDER_A: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    const TEST_HOLDER_B: &str = "GDPQS7HP6HHBD6UG2E5GLTIKQZX2PZEA6YWUVKXEYCKSN6QCHKGWCOTM";
+
+    #[test]
+    fn balance_key_is_deterministic_for_the_same_holder() {
+        let a = encode_key(&balance_key(TEST_CONTRACT, TEST_HOLDER_A).unwrap()).unwrap();
+        let b = encode_key(&balance_key(TEST_CONTRACT, TEST_HOLDER_A).unwrap()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn balance_key_differs_per_holder() {
+        let a = encode_key(&balance_key(TEST_CONTRACT, TEST_HOLDER_A).unwrap()).unwrap();
+        let b = encode_key(&balance_key(TEST_CONTRACT, TEST_HOLDER_B).unwrap()).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rejects_an_invalid_holder_strkey() {
+        assert!(balance_key(TEST_CONTRACT, "not-a-strkey").is_err());
+    }
+}

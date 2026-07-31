@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Fails if the indexer, backfill, gRPC API, or Go API read an environment
+# variable that isn't documented in docs/ENVIRONMENT.md (issue #312).
+#
+# This is a grep-based check, not a compiler plugin: it scans for
+# std::env::var("X") / env::var("X") in Rust and os.Getenv("X") in Go, then
+# checks each hit appears (as a whole word, wrapped in backticks) in
+# docs/ENVIRONMENT.md. False positives are possible on ALL_CAPS string
+# literals that aren't actually env var names — those are allow-listed
+# below, not silently skipped.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+DOC="docs/ENVIRONMENT.md"
+
+# Non-env-var ALL_CAPS identifiers that legitimately show up in
+# env::var("...")-shaped test/example strings but are not real env vars, or
+# are test-only fixtures already covered by inline comments rather than a
+# reference table row. Keep this list small and justified.
+ALLOWLIST=(
+  TEST_POOL_UNSET
+  TEST_POOL_VALID
+  TEST_POOL_BAD
+)
+
+is_allowlisted() {
+  local var="$1"
+  for a in "${ALLOWLIST[@]}"; do
+    [[ "$var" == "$a" ]] && return 0
+  done
+  return 1
+}
+
+# Collect candidate env var names: Rust (std::env::var / env::var) and
+# Go (os.Getenv), from application source only (exclude tests, since a test
+# fixture string can look like a var but not be one that a lint doc needs to
+# cover — real vars read by non-test code are always also referenced from a
+# collect_required/envInt/etc call reachable from main, which this still catches).
+mapfile -t rust_vars < <(
+  grep -rhoE '(std::)?env::var\("[A-Z][A-Z0-9_]*"\)' \
+    crates/indexer/src crates/backfill/src crates/api/src crates/common/src 2>/dev/null \
+    | grep -oE '"[A-Z][A-Z0-9_]*"' | tr -d '"' | sort -u
+)
+
+mapfile -t go_vars < <(
+  grep -rhoE 'os\.Getenv\("[A-Z][A-Z0-9_]*"\)' services/api 2>/dev/null \
+    | grep -oE '"[A-Z][A-Z0-9_]*"' | tr -d '"' | sort -u
+)
+
+all_vars=("${rust_vars[@]}" "${go_vars[@]}")
+
+missing=()
+for var in "${all_vars[@]}"; do
+  is_allowlisted "$var" && continue
+  if ! grep -qF "\`$var\`" "$DOC"; then
+    missing+=("$var")
+  fi
+done
+
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "The following env vars are read by the code but missing from $DOC:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  echo "" >&2
+  echo "Add a row for each (service, default, required/optional, description) to $DOC." >&2
+  exit 1
+fi
+
+echo "OK: every env var read by indexer/backfill/grpc-api/go-api is documented in $DOC"
