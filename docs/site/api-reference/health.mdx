@@ -1,0 +1,99 @@
+---
+title: "GET /v1/health"
+description: "Check the health of the Trident API, indexer, database, and Redis connections."
+---
+
+## Endpoint
+
+```
+GET /v1/health
+```
+
+Returns the current health status of the Trident stack. This endpoint does **not** require authentication and is suitable for load balancer health checks and uptime monitors.
+
+---
+
+## Example request
+
+```bash
+curl https://api.trident.telocel.com/v1/health
+```
+
+---
+
+## Response
+
+### 200 OK — healthy or degraded
+
+The endpoint returns `200` for both `"ok"` and `"degraded"` states. Only a completely unavailable service returns `503`.
+
+```json
+{
+  "status": "ok",
+  "indexer": {
+    "status": "healthy",
+    "lastLedger": 12345678,
+    "lagLedgers": 0
+  },
+  "database": "ok",
+  "redis": "ok"
+}
+```
+
+### Response schema
+
+| Field                    | Type     | Description                                                    |
+|--------------------------|----------|----------------------------------------------------------------|
+| `status`                 | `string` | Overall status: `ok`, `degraded`, or `unavailable`.           |
+| `indexer.status`         | `string` | Indexer status: `healthy`, `degraded`, or `stopped`.          |
+| `indexer.lastLedger`     | `number` | Ledger sequence of the last event successfully indexed.        |
+| `indexer.lagLedgers`     | `number` | Number of ledgers the indexer is behind the chain tip.        |
+| `database`               | `string` | Database connectivity: `ok` or `error`.                       |
+| `redis`                  | `string` | Redis connectivity: `ok` or `error`.                          |
+
+### Status values explained
+
+| `status`      | Meaning                                                                             |
+|---------------|-------------------------------------------------------------------------------------|
+| `ok`          | All components are healthy. The indexer is within normal lag tolerance.            |
+| `degraded`    | One or more non-critical components are experiencing issues. Events are still being indexed but with possible delays. |
+| `unavailable` | A critical component (database or indexer) is down. Queries may fail.             |
+
+| `indexer.status` | Meaning                                                                   |
+|------------------|---------------------------------------------------------------------------|
+| `healthy`        | Indexer is running and caught up (or within acceptable lag).             |
+| `degraded`       | Indexer is running but lag is high — it is catching up to the chain tip. |
+| `stopped`        | Indexer process is not running.                                           |
+
+### 503 Service Unavailable
+
+Returned when the API itself cannot reach critical dependencies:
+
+```json
+{
+  "status": "unavailable",
+  "indexer": {
+    "status": "stopped",
+    "lastLedger": 12345600,
+    "lagLedgers": 78
+  },
+  "database": "error",
+  "redis": "ok"
+}
+```
+
+---
+
+## Using for load balancers
+
+Configure your load balancer to poll `GET /v1/health` and expect a `2xx` response. The endpoint responds quickly (no database query) and adds negligible load.
+
+```nginx
+# nginx upstream health check example
+upstream trident_api {
+  server api:3000;
+  check interval=5000 rise=2 fall=3 timeout=1000 type=http;
+  check_http_send "GET /v1/health HTTP/1.0\r\n\r\n";
+  check_http_expect_alive http_2xx;
+}
+```

@@ -1,0 +1,88 @@
+---
+title: "Introduction"
+description: "Trident is the event indexing layer Stellar's developer ecosystem needs — query every Soroban contract event ever emitted, filtered and paginated, without running your own infrastructure."
+---
+
+# What is Trident?
+
+Soroban's RPC node is intentionally thin. It does not retain events beyond a short rolling window, has no historical query capability, and offers minimal filtering. That's a reasonable protocol decision — but it forces every team building on Stellar to solve the same infrastructure problem before they can build their actual product.
+
+Every mature smart contract ecosystem has solved this exactly once:
+
+| Ecosystem  | Solution       |
+|------------|----------------|
+| Ethereum   | The Graph      |
+| Solana     | Helius / Triton|
+| Cosmos     | SubQuery       |
+| **Stellar**| **Trident**    |
+
+Trident is a dedicated indexing layer that streams every Soroban contract event off the network, stores it persistently, and exposes it through a clean API and SDK. A developer using Trident can query every event a contract has ever emitted — filtered by topic, paginated, in real time or historically — without writing a single line of indexing infrastructure.
+
+---
+
+## Architecture
+
+The system is split into two layers with a hard boundary between them.
+
+```
+Stellar RPC
+     │
+     ▼
+┌─────────────────────────────────────────────────┐
+│  Rust Indexer (crates/indexer)                  │
+│  • polls Soroban RPC on a short interval        │
+│  • decodes XDR → normalised SorobanEvent        │
+│  • writes to PostgreSQL (durable storage)       │
+│  • publishes to Redis Streams (real-time fan-out)│
+└────────────────────┬────────────────────────────┘
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+   PostgreSQL               Redis Streams
+  (historical              (real-time
+    queries)               subscriptions)
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  Rust gRPC API (crates/api)                     │
+│  • serves internal gRPC to the Go layer         │
+└────────────────────┬────────────────────────────┘
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  Go REST/WS/GraphQL API (services/api)          │
+│  • REST  → GET /v1/events, /v1/events/:id       │
+│  • WS    → GET /ws  (real-time subscriptions)   │
+│  • GQL   → POST /graphql                        │
+└────────────────────┬────────────────────────────┘
+                     ▼
+          TypeScript SDK (@trident-indexer/sdk)
+```
+
+**Historical queries** read from PostgreSQL. **Real-time delivery** reads from Redis. The two paths never interfere with each other.
+
+The Rust core was chosen because it decodes XDR natively through the same libraries the Stellar protocol uses, has no garbage collector to introduce latency spikes, and gives the predictable performance a 24/7 indexer demands.
+
+---
+
+## Two ways to use Trident
+
+<CardGroup cols={2}>
+  <Card title="Hosted API" icon="cloud" href="/quickstart-sdk">
+    Use the hosted testnet API — no infrastructure to run. Install the SDK,
+    get an API key, and make your first query in under 5 minutes.
+  </Card>
+  <Card title="Self-hosted" icon="server" href="/quickstart-self-hosted">
+    Run the full stack yourself with a single `docker compose up` command.
+    Full control over data retention, network, and scaling.
+  </Card>
+</CardGroup>
+
+---
+
+## Core concepts
+
+- **SorobanEvent** — a single normalised event emitted by a Soroban contract, indexed with a UUID, ledger sequence, transaction hash, topics (XDR-encoded), and data payload.
+- **Cursor-based pagination** — all list endpoints return an opaque `cursor` you pass as `after` to fetch the next page. The cursor is stable: inserting new events does not change the order of existing pages.
+- **WebSocket subscriptions** — connect to `GET /ws` and subscribe to a contract. The server pushes `SorobanEvent` messages as they are indexed.
+- **API key authentication** — every request (except `/v1/health`) requires an `X-API-Key` header. Keys are tied to a rate-limit tier.

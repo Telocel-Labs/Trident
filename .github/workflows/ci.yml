@@ -120,6 +120,26 @@ jobs:
       - name: go test (race)
         run: go test -race ./...
 
+      - name: REST handler coverage
+        run: |
+          go test ./handlers -coverprofile=handlers.out
+          go tool cover -func=handlers.out \
+            | awk '
+              /handlers\/events.go:.*ListEvents/ || /handlers\/events.go:.*GetEvent/ || /handlers\/health.go:.*Health/ {
+                coverage = $NF
+                sub(/%$/, "", coverage)
+                print
+                if ((coverage + 0) < 80) {
+                  failed = 1
+                }
+              }
+              END {
+                if (failed) {
+                  print "REST handler coverage must stay at or above 80% for ListEvents, GetEvent, and Health"
+                  exit 1
+                }
+              }'
+
       # v8 is the first line of the action that supports golangci-lint v2. v4
       # invokes it with `--out-format`, which v2 removed, so the lint aborted
       # with "unknown flag" before checking anything (issue #371).
@@ -309,21 +329,29 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install Spectral and dependencies
-        run: npm install -g @stoplight/spectral-cli openapi-typescript
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Spectral
+        run: npm install -g @stoplight/spectral-cli
+
+      - name: Install codegen dependencies
+        run: pip install PyYAML
 
       - name: Lint OpenAPI specification
         run: spectral lint api/openapi.yaml
 
-      - name: Regenerate types
-        run: openapi-typescript api/openapi.yaml -o sdk/typescript/src/api-types.gen.ts
+      - name: Regenerate SDK models
+        run: python3 scripts/generate_sdk_models.py
 
       - name: Check for uncommitted changes
         run: |
-          if git diff --exit-code sdk/typescript/src/api-types.gen.ts; then
-            echo "✓ Generated types are up-to-date"
+          if git diff --exit-code             sdk/typescript/src/api-types.gen.ts             sdk/go/openapi/models_gen.go             sdk/python/src/trident_indexer/openapi_models_gen.py             sdk/rust/src/openapi_models_gen.rs; then
+            echo "✓ Generated SDK models are up-to-date"
           else
-            echo "✗ Generated types are stale. Run 'npm run generate:types' and commit changes."
+            echo "✗ Generated SDK models are stale. Run 'python3 scripts/generate_sdk_models.py' and commit changes."
             exit 1
           fi
 
@@ -568,6 +596,21 @@ jobs:
             http://localhost:3000/v1/health
           echo ""
           echo "/v1/health returned 200 OK"
+
+      # Without this the job reports only curl's exit code, which says nothing
+      # about which service failed to come up. Runs only on failure.
+      - name: Dump stack state and logs on failure
+        if: failure()
+        run: |
+          cd docker
+          echo "::group::container status"
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci ps -a
+          echo "::endgroup::"
+          for svc in postgres redis grpc-api indexer api; do
+            echo "::group::${svc} logs"
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci logs --tail=120 "${svc}" || true
+            echo "::endgroup::"
+          done
 
       - name: Assert GET /v1/health returns status ok
         run: |
@@ -821,6 +864,21 @@ jobs:
         run: |
           curl --silent --fail --retry 20 --retry-delay 5 --retry-connrefused \
             --max-time 10 http://localhost:3000/v1/health
+
+      # Same rationale as the smoke-test job: curl's exit code alone does not
+      # identify which service failed to start.
+      - name: Dump stack state and logs on failure
+        if: failure()
+        run: |
+          cd docker
+          echo "::group::container status"
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci ps -a
+          echo "::endgroup::"
+          for svc in postgres redis grpc-api indexer api; do
+            echo "::group::${svc} logs"
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci logs --tail=120 "${svc}" || true
+            echo "::endgroup::"
+          done
 
       - name: Poll /v1/events for the decoded mint event
         env:

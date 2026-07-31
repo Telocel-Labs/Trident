@@ -41,12 +41,14 @@
 
 mod client;
 mod errors;
+pub mod openapi_models_gen;
 mod retry;
 mod subscription;
 mod types;
 
 pub use client::TridentClient;
 pub use errors::TridentError;
+pub use openapi_models_gen::OpenApiModels as OpenAPIModels;
 pub use retry::RetryConfig;
 pub use subscription::Subscription;
 pub use types::{

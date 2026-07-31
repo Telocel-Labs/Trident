@@ -1,0 +1,115 @@
+---
+title: "GET /v1/events/:id"
+description: "Retrieve a single Soroban event by its UUID."
+---
+
+## Endpoint
+
+```
+GET /v1/events/:id
+```
+
+Retrieve a specific indexed Soroban event by its UUID.
+
+---
+
+## Authentication
+
+Requires `X-API-Key` header. See [Authentication](/api-reference/authentication).
+
+---
+
+## Path parameters
+
+| Parameter | Type     | Required | Description                        |
+|-----------|----------|----------|------------------------------------|
+| `id`      | `string` | ✅       | UUID v4 of the event to retrieve.  |
+
+The `id` must be a valid UUID v4 (e.g. `550e8400-e29b-41d4-a716-446655440000`). Malformed UUIDs return `400 INVALID_ARGUMENT`.
+
+---
+
+## Example request
+
+```bash
+curl "https://api.trident.telocel.com/v1/events/550e8400-e29b-41d4-a716-446655440000" \
+  -H "X-API-Key: $TRIDENT_API_KEY"
+```
+
+---
+
+## Response
+
+### 200 OK
+
+```json
+{
+  "event": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    "ledgerSequence": 12345678,
+    "ledgerTimestamp": "2025-01-15T10:30:00Z",
+    "transactionHash": "3389e9f0f1a65f19935ef8b398905b88e74e9b0bb72a13dea36dc0cfd4ab2bd1",
+    "eventIndex": 0,
+    "eventType": "contract",
+    "topics": [
+      "AAAADQAAAAh0cmFuc2Zlcg==",
+      "AAAAE..."
+    ],
+    "data": null,
+    "createdAt": "2025-01-15T10:30:01Z"
+  }
+}
+```
+
+---
+
+## Error responses
+
+| Status | Code               | When                                           |
+|--------|--------------------|------------------------------------------------|
+| `400`  | `INVALID_ARGUMENT` | `id` is not a valid UUID v4.                  |
+| `401`  | `UNAUTHORIZED`     | Missing or invalid `X-API-Key`.               |
+| `404`  | `NOT_FOUND`        | No event with this UUID exists in the index.  |
+| `429`  | `RATE_LIMITED`     | Rate limit exceeded.                           |
+| `503`  | `UNAVAILABLE`      | Service temporarily unavailable.              |
+
+### 404 Not Found
+
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "event not found"
+  }
+}
+```
+
+---
+
+## SDK equivalent
+
+```typescript
+import { TridentClient, TridentError } from "@trident-indexer/sdk";
+import type { SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+try {
+  const event: SorobanEvent = await client.getEventById({
+    id: "550e8400-e29b-41d4-a716-446655440000",
+  });
+  console.log("Ledger:", event.ledgerSequence);
+  console.log("Transaction:", event.transactionHash);
+} catch (err) {
+  if (err instanceof TridentError && err.code === "NOT_FOUND") {
+    console.error("Event does not exist in the index");
+  } else {
+    throw err;
+  }
+}
+```

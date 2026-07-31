@@ -1,0 +1,211 @@
+---
+title: "Configuration Reference"
+description: "Every environment variable accepted by the Trident stack, with type, default, required status, and what happens if it is missing."
+---
+
+All configuration is done through environment variables. Copy `.env.example` to `.env` and fill in real values:
+
+```bash
+cp .env.example .env
+```
+
+Variables marked **REQUIRED** must be set before the service starts. Variables marked **OPTIONAL** have defaults and can be omitted. Variables marked **REQUIRED-IF** must be set when a specific feature is enabled.
+
+---
+
+## Shared (all services)
+
+| Variable       | Required | Type     | Default | Services             | Description |
+|----------------|----------|----------|---------|----------------------|-------------|
+| `DATABASE_URL` | REQUIRED | string   | —       | indexer, grpc-api, go-api | PostgreSQL connection string. In production, use the PgBouncer pooler URL, not the direct Postgres port. |
+| `REDIS_URL`    | REQUIRED | string   | —       | indexer, go-api      | Redis connection string. The indexer publishes events here; the Go API consumes them for WebSocket fan-out. |
+
+---
+
+## Database connection pool sizing
+
+| Variable              | Required | Type    | Default | Service    | Description |
+|-----------------------|----------|---------|---------|------------|-------------|
+| `INDEXER_DB_POOL_SIZE`| OPTIONAL | integer | `3`     | indexer    | Pool size for the indexer. Single writer, low concurrency — keep small. |
+| `GRPC_API_DB_POOL_SIZE`| OPTIONAL | integer | `10`   | grpc-api   | Pool size for the Rust gRPC API. Read-heavy, moderate concurrency. |
+| `GO_API_DB_POOL_SIZE` | OPTIONAL | integer | `5`     | go-api     | Per-replica pool. With 3 replicas = 15 total connections against PgBouncer. |
+| `PGBOUNCER_ADMIN_URL` | OPTIONAL | string  | —       | go-api     | PgBouncer admin console connection. Used by `GET /v1/admin/db`. |
+
+---
+
+## Rust Indexer (`crates/indexer`)
+
+### Core
+
+| Variable            | Required | Type    | Default    | Description |
+|---------------------|----------|---------|------------|-------------|
+| `STELLAR_RPC_URL`   | REQUIRED | string  | —          | Soroban RPC endpoint. Testnet: `https://soroban-testnet.stellar.org`. |
+| `NETWORK`           | OPTIONAL | string  | `testnet`  | Network identifier. One of: `mainnet`, `testnet`, `futurenet`. |
+| `RUST_LOG`          | OPTIONAL | string  | `info`     | Log verbosity. One of: `error`, `warn`, `info`, `debug`, `trace`. |
+| `HEALTH_PORT`       | OPTIONAL | integer | `8080`     | Port serving `/healthz` and `/readyz`. |
+| `METRICS_PORT`      | OPTIONAL | integer | `9090`     | Port serving Prometheus `/metrics`. Not authenticated — firewall it. |
+| `INDEX_DIAGNOSTIC`  | OPTIONAL | boolean | `false`    | Store Soroban diagnostic events. Leave `false` in production — they are high-volume. |
+| `NETWORK_PASSPHRASE`| OPTIONAL | string  | —          | Stellar network passphrase. Inferred automatically for standard networks. Required for custom networks. |
+| `TRACKED_SAC_ASSETS`| OPTIONAL | string  | —          | Assets (e.g. `USDC:GA...`) to derive Stellar Asset Contract IDs for and track. |
+
+### Polling and batching
+
+| Variable                   | Required | Type    | Default | Min   | Max    | Description |
+|----------------------------|----------|---------|---------|-------|--------|-------------|
+| `POLL_INTERVAL_MS`         | OPTIONAL | integer | `1000`  | `100` | `60000`| How often (ms) the indexer polls between full pagination runs. |
+| `POLL_INTERVAL_FLOOR_MS`   | OPTIONAL | integer | `250`   | `50`  | `60000`| Shortest poll interval — used when lag ≥ `LAG_HIGH_WATERMARK`. |
+| `POLL_INTERVAL_CEILING_MS` | OPTIONAL | integer | `5000`  | `100` | `600000`| Longest poll interval — used when the indexer is fully caught up. Must be > `POLL_INTERVAL_FLOOR_MS`. |
+| `LAG_HIGH_WATERMARK`       | OPTIONAL | integer | `100`   | `1`   | `100000000`| Chain-tip lag (ledgers) at or above which the floor interval applies. |
+| `POLL_HYSTERESIS_LEDGERS`  | OPTIONAL | integer | `10`    | `0`   | `1000000`| Hysteresis deadband (ledgers) to prevent oscillation around a threshold. |
+| `MAX_EVENTS_PER_POLL`      | OPTIONAL | integer | `200`   | `1`   | `10000`| Max events fetched from the RPC per `getEvents` request. Reduce to lower peak memory; increase to speed up backfill. |
+| `DB_BATCH_SIZE`            | OPTIONAL | integer | `1000`  | `1`   | `10000`| Max rows per batched `INSERT` on page commit. |
+| `INDEX_TOPIC_FILTERS`      | OPTIONAL | string  | —       | —     | —      | Comma-separated topic patterns for server-side RPC filtering (e.g. `transfer/*/*,mint/*/*`). Only applied when the contract allowlist is non-empty. |
+| `REDIS_STREAM_MAXLEN`      | OPTIONAL | integer | `10000` | —     | —      | Max events kept in the Redis stream before trimming. |
+
+### Database timeouts
+
+| Variable                              | Required | Type    | Default | Description |
+|---------------------------------------|----------|---------|---------|-------------|
+| `DB_STATEMENT_TIMEOUT_MS`             | OPTIONAL | integer | `30000` | Postgres per-statement timeout (ms). |
+| `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`   | OPTIONAL | integer | `10000` | Postgres idle-in-transaction timeout (ms). |
+
+### RPC transport and failover
+
+| Variable                    | Required | Type    | Default | Description |
+|-----------------------------|----------|---------|---------|-------------|
+| `STELLAR_RPC_URLS`          | OPTIONAL | string  | —       | Prioritised comma-separated RPC endpoints. Overrides `STELLAR_RPC_URL`. |
+| `RPC_CONNECT_TIMEOUT_MS`    | OPTIONAL | integer | `5000`  | TCP connect timeout for RPC calls. |
+| `RPC_REQUEST_TIMEOUT_MS`    | OPTIONAL | integer | `30000` | Overall RPC request timeout. Must be ≥ `RPC_CONNECT_TIMEOUT_MS`. |
+| `RPC_POOL_IDLE_TIMEOUT_MS`  | OPTIONAL | integer | `90000` | How long an idle pooled connection is kept. |
+| `RPC_POOL_MAX_IDLE_PER_HOST`| OPTIONAL | integer | `8`     | Idle keep-alive connections retained per RPC host. |
+| `RPC_TCP_KEEPALIVE_MS`      | OPTIONAL | integer | `60000` | TCP keep-alive probe interval. |
+| `RPC_FAILOVER_THRESHOLD`    | OPTIONAL | integer | `3`     | Consecutive failures before an endpoint is parked. |
+| `RPC_ENDPOINT_COOLDOWN_MS`  | OPTIONAL | integer | `30000` | How long a parked endpoint waits before retrying. |
+
+### Outbox relay
+
+| Variable                       | Required | Type    | Default | Description |
+|--------------------------------|----------|---------|---------|-------------|
+| `OUTBOX_POLL_INTERVAL_MS`      | OPTIONAL | integer | `100`   | How often the outbox relay polls for new events. |
+| `OUTBOX_BATCH_SIZE`            | OPTIONAL | integer | `500`   | Max events relayed per batch. |
+| `OUTBOX_BACKLOG_ALERT_THRESHOLD`| OPTIONAL | integer | `10000`| Outbox depth that triggers an alert. |
+
+### Alerting
+
+| Variable               | Required | Type    | Default | Description |
+|------------------------|----------|---------|---------|-------------|
+| `ALERT_WEBHOOK_URL`    | OPTIONAL | string  | —       | Outbound webhook URL for lag/recovery alerts. Leave empty to disable. |
+| `ALERT_LAG_THRESHOLD`  | OPTIONAL | integer | `200`   | Lag (ledgers) above which an alert fires. |
+| `ALERT_COOLDOWN_MINUTES`| OPTIONAL | integer | `30`   | Minimum minutes between repeated lag alerts. |
+
+### Token metadata and diagnostics
+
+| Variable                              | Required | Type    | Default | Description |
+|---------------------------------------|----------|---------|---------|-------------|
+| `TOKEN_METADATA_REFRESH_INTERVAL_SECS`| OPTIONAL | integer | `86400`| How often (seconds) cached token metadata is refreshed. |
+| `TOKIO_CONSOLE_ENABLED`               | OPTIONAL | boolean | `false`| Enables tokio-console diagnostics. Only works when built with the `tokio-console` Cargo feature. |
+
+---
+
+## Rust gRPC API (`crates/api`)
+
+| Variable              | Required | Type    | Default    | Description |
+|-----------------------|----------|---------|------------|-------------|
+| `GRPC_ADDR`           | REQUIRED | string  | `0.0.0.0:50051` | Address the gRPC server binds to. |
+| `STREAM_CHANNEL_BUFFER`| OPTIONAL | integer | `128`     | In-flight event buffer per `StreamEvents` subscriber. Raise for bursty clients; lower to cap per-subscriber memory. |
+
+---
+
+## Go REST API (`services/api`)
+
+### Core
+
+| Variable               | Required      | Type    | Default      | Description |
+|------------------------|---------------|---------|--------------|-------------|
+| `API_GRPC_ADDR`        | REQUIRED      | string  | —            | Address of the upstream Rust gRPC API. |
+| `PORT`                 | OPTIONAL      | integer | `3000`       | Port the Go HTTP server listens on. |
+| `API_KEY_SALT`         | OPTIONAL      | string  | —            | HMAC-SHA256 salt for hashing API keys. **Change before production.** Generate: `openssl rand -hex 32`. |
+| `API_KEY_HASHES`       | OPTIONAL      | string  | —            | Comma-separated HMAC-SHA256 hashes of accepted API keys. |
+| `ADMIN_API_KEY`        | OPTIONAL      | string  | —            | Shared secret for `X-Admin-Key` header on `/v1/admin/*`. Leave empty to disable admin endpoints. |
+| `ALLOWED_ORIGINS`      | REQUIRED (prod)| string | —           | Comma-separated CORS allow-list. Dev allows any origin when unset — never leave unset in production. |
+| `REQUEST_TIMEOUT_MS`   | OPTIONAL      | integer | `30000`      | Per-request timeout (ms). Does not apply to `/ws` or `/v1/events/stream`. |
+| `MAX_WS_CONNECTIONS`   | OPTIONAL      | integer | `1000`       | Max concurrent WebSocket connections before new ones are rejected. |
+| `REDIS_STREAM_KEY`     | OPTIONAL      | string  | `trident:events` | Redis stream key for event pub/sub. Must match between indexer and Go API. |
+
+### Rate limiting
+
+| Variable                  | Required | Type    | Default | Description |
+|---------------------------|----------|---------|---------|-------------|
+| `RATE_LIMIT_FREE_RPS`     | OPTIONAL | integer | `10`    | Requests/sec limit for Free tier API keys. |
+| `RATE_LIMIT_PRO_RPS`      | OPTIONAL | integer | `100`   | Requests/sec limit for Pro tier API keys. |
+| `RATE_LIMIT_INTERNAL_RPS` | OPTIONAL | integer | `1000`  | Requests/sec limit for Internal tier keys. |
+
+### Retention (data pruning)
+
+| Variable                       | Required | Type    | Default | Description |
+|--------------------------------|----------|---------|---------|-------------|
+| `RETENTION_AUDIT_LOG_DAYS`     | OPTIONAL | integer | `90`    | Days to retain audit log rows. |
+| `RETENTION_PARSE_ERRORS_DAYS`  | OPTIONAL | integer | `30`    | Days to retain parse error rows. |
+| `RETENTION_WEBHOOK_DELIVERIES_DAYS`| OPTIONAL | integer | `30` | Days to retain webhook delivery rows. |
+| `RETENTION_SOROBAN_EVENTS_DAYS`| OPTIONAL | integer | `0`     | Days to retain Soroban event rows. `0` = no pruning (unlimited retention). |
+
+### Webhook delivery
+
+| Variable                 | Required | Type    | Default              | Description |
+|--------------------------|----------|---------|----------------------|-------------|
+| `WEBHOOK_CONSUMER_GROUP` | OPTIONAL | string  | `trident-webhooks`   | Redis Stream consumer group for the webhook delivery worker. |
+| `WEBHOOK_CONSUMER_NAME`  | OPTIONAL | string  | `webhook-worker`     | Redis Stream consumer name. |
+
+### Request body limits and abuse protection
+
+| Variable                  | Required | Type    | Default     | Description |
+|---------------------------|----------|---------|-------------|-------------|
+| `MAX_IN_FLIGHT_REQUESTS`  | OPTIONAL | integer | `500`       | Global concurrency cap. Requests beyond this many in-flight get `503`. |
+| `PER_IP_RATE_LIMIT_RPS`   | OPTIONAL | integer | `20`        | Per-IP sliding-window request limit, applied before auth. |
+| `PER_IP_RATE_LIMIT_WINDOW_MS`| OPTIONAL | integer | `1000`   | Window (ms) for the per-IP rate limit. |
+| `TRUSTED_PROXY_ENABLED`   | OPTIONAL | boolean | `false`     | Set `true` only when behind the nginx reverse proxy. Resolves client IP from `X-Forwarded-For`. Do NOT enable if untrusted clients can reach the API directly. |
+
+### Profiling
+
+| Variable      | Required | Type    | Default         | Description |
+|---------------|----------|---------|-----------------|-------------|
+| `PPROF_ENABLED`| OPTIONAL | boolean | `false`        | Enable internal pprof profiling server. Never expose publicly. |
+| `PPROF_ADDR`  | OPTIONAL | string  | `127.0.0.1:6060`| Bind address for pprof. Loopback only. |
+
+### Internal status auth
+
+| Variable           | Required         | Type   | Default | Description |
+|--------------------|------------------|--------|---------|-------------|
+| `INTERNAL_API_KEY` | REQUIRED-IF using `/internal/status` | string | — | Shared secret for `X-Internal-Key` header. Compared with constant-time comparison. Leaving unset causes every request to be rejected (fails closed). Generate: `openssl rand -hex 32`. |
+
+---
+
+## mTLS (internal gRPC hop)
+
+| Variable                | Required | Type    | Default | Description |
+|-------------------------|----------|---------|---------|-------------|
+| `GRPC_MTLS_ENABLED`     | OPTIONAL | boolean | `false` | Enables mutual TLS on the Go API ↔ Rust gRPC API hop. When false, that hop is plaintext within the cluster network. |
+| `GRPC_MTLS_CA_CERT`     | REQUIRED-IF `GRPC_MTLS_ENABLED=true` | string | — | Path to CA bundle for verifying the peer certificate. |
+| `GRPC_MTLS_SERVER_CERT` | REQUIRED-IF `GRPC_MTLS_ENABLED=true` | string | — | Path to gRPC server TLS certificate. |
+| `GRPC_MTLS_SERVER_KEY`  | REQUIRED-IF `GRPC_MTLS_ENABLED=true` | string | — | Path to gRPC server TLS private key. |
+| `GRPC_MTLS_CLIENT_CERT` | REQUIRED-IF `GRPC_MTLS_ENABLED=true` | string | — | Path to Go API client TLS certificate. |
+| `GRPC_MTLS_CLIENT_KEY`  | REQUIRED-IF `GRPC_MTLS_ENABLED=true` | string | — | Path to Go API client TLS private key. |
+
+---
+
+## Docker Compose
+
+| Variable           | Required | Type   | Default    | Description |
+|--------------------|----------|--------|------------|-------------|
+| `POSTGRES_USER`    | OPTIONAL | string | `trident`  | PostgreSQL superuser username (used on first container create). |
+| `POSTGRES_PASSWORD`| OPTIONAL | string | `password` | PostgreSQL superuser password. **Change in production.** |
+| `POSTGRES_DB`      | OPTIONAL | string | `trident`  | PostgreSQL database name. |
+
+---
+
+## OpenTelemetry distributed tracing
+
+| Variable                    | Required | Type   | Default | Description |
+|-----------------------------|----------|--------|---------|-------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`| OPTIONAL | string | —      | OTLP gRPC endpoint for the trace collector (Jaeger, Grafana Tempo, etc.). Leave empty to disable tracing with zero overhead. Local dev: `http://localhost:4317`. |
+| `OTEL_SAMPLING_RATIO`       | OPTIONAL | float  | `0.1`   | Fraction of traces to sample. `1.0` = 100% (useful in development). Reduce in production if trace volume is too high. |

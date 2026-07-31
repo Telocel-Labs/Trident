@@ -74,6 +74,20 @@ show_error_codes = true
 module = ["websocket.*"]
 ignore_missing_imports = true
 
+# openapi_models_gen is generated from api/openapi.yaml by
+# scripts/generate_sdk_models.py and is overwritten on every regeneration, so
+# it cannot carry hand-written annotations. The generator emits untyped
+# `from_*` coercion helpers and bare `dict` returns, which trip
+# no-untyped-call / type-arg under --strict. Relaxing those four checks for
+# this module only keeps --strict enforced everywhere a human writes code;
+# the models it exports are still fully typed at their public boundary.
+[[tool.mypy.overrides]]
+module = ["trident_indexer.openapi_models_gen"]
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+disallow_any_generics = false
+warn_return_any = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

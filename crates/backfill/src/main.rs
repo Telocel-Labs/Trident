@@ -98,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let duplicates_skipped = duplicates_skipped.clone();
         let pb = pb.clone();
         let rpc_delay = args.rpc_delay_ms;
+        let network = args.network.clone();
 
         let handle = tokio::spawn(async move {
             while let Some((s, e)) = rx.lock().await.recv().await {
@@ -125,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 println!("DRY: event {:?}", ev);
                                             }
                                         } else {
-                                            match db::insert_event(&db, &ev).await {
+                                            match db::insert_event(&db, &ev, &network).await {
                                                 Ok(_) => {
                                                     events_indexed.fetch_add(1, Ordering::Relaxed);
                                                 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -710,24 +710,31 @@ pub async fn update_health_stats(
     Ok(())
 }
 
-/// Load all contract IDs from `indexed_contracts` for the given network (or
-/// network-agnostic rows where `network IS NULL`).
+/// Load all contract IDs and their `index_from` values from
+/// `indexed_contracts` for the given network (or network-agnostic rows where
+/// `network IS NULL`).
 ///
-/// Returns an empty set if the table has no rows — the caller treats an empty
-/// set as "index all contracts" (issue #47).
+/// Returns an empty map if the table has no rows — the caller treats an empty
+/// map as "index all contracts" (issue #47).
+///
+/// `index_from` (BIGINT, default 0, added in 0001_init.sql) is the first
+/// ledger from which events for that contract should be indexed. Events below
+/// it are skipped client-side, because `getEvents` carries a single
+/// `startLedger` for the whole request and so cannot express a per-contract
+/// boundary (issue #202).
 pub async fn load_indexed_contracts(
     pool: &PgPool,
     network: &str,
-) -> Result<HashSet<String>, TridentError> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT contract_id FROM indexed_contracts WHERE network = $1 OR network IS NULL",
+) -> Result<HashMap<String, i64>, TridentError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT contract_id, index_from FROM indexed_contracts WHERE network = $1 OR network IS NULL",
     )
     .bind(network)
     .fetch_all(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("load_indexed_contracts")))?;
 
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    Ok(rows.into_iter().collect())
 }
 
 /// Read alert state (last_alert_at, alert_fired) from system_state (issue #75).

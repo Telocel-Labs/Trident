@@ -1,0 +1,152 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "Trident",
+  "logo": {
+    "dark": "/logo/trident-dark.svg",
+    "light": "/logo/trident-light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#6366f1",
+    "light": "#818cf8",
+    "dark": "#4f46e5",
+    "background": {
+      "dark": "#0f0f1a"
+    },
+    "anchors": {
+      "from": "#6366f1",
+      "to": "#818cf8"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "GitHub",
+      "url": "https://github.com/Telocel-Labs/Trident"
+    }
+  ],
+  "topbarCtaButton": {
+    "name": "Get API Key",
+    "url": "https://trident.telocel.com/signup"
+  },
+  "tabs": [
+    {
+      "name": "API Reference",
+      "url": "api-reference"
+    },
+    {
+      "name": "SDK Reference",
+      "url": "sdk"
+    },
+    {
+      "name": "WebSocket",
+      "url": "websocket"
+    },
+    {
+      "name": "GraphQL",
+      "url": "graphql"
+    }
+  ],
+  "anchors": [
+    {
+      "name": "Changelog",
+      "icon": "list",
+      "url": "changelog"
+    },
+    {
+      "name": "GitHub",
+      "icon": "github",
+      "url": "https://github.com/Telocel-Labs/Trident"
+    },
+    {
+      "name": "Discussions",
+      "icon": "comments",
+      "url": "https://github.com/Telocel-Labs/Trident/discussions"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Get Started",
+      "pages": [
+        "introduction",
+        "quickstart-sdk",
+        "quickstart-self-hosted"
+      ]
+    },
+    {
+      "group": "API Reference",
+      "pages": [
+        "api-reference/authentication",
+        "api-reference/pagination",
+        "api-reference/rate-limiting",
+        "api-reference/events-list",
+        "api-reference/events-get",
+        "api-reference/health"
+      ]
+    },
+    {
+      "group": "WebSocket",
+      "pages": [
+        "websocket/connecting",
+        "websocket/subscription-format",
+        "websocket/event-format",
+        "websocket/reconnection",
+        "websocket/example-sdk",
+        "websocket/example-raw"
+      ]
+    },
+    {
+      "group": "GraphQL",
+      "pages": [
+        "graphql/schema",
+        "graphql/queries",
+        "graphql/subscriptions",
+        "graphql/playground"
+      ]
+    },
+    {
+      "group": "SDK Reference",
+      "pages": [
+        "sdk/client",
+        "sdk/query-events",
+        "sdk/get-event-by-id",
+        "sdk/subscribe",
+        "sdk/errors",
+        "sdk/transport"
+      ]
+    },
+    {
+      "group": "Self-Hosting",
+      "pages": [
+        "self-hosting/prerequisites",
+        "self-hosting/configuration",
+        "self-hosting/fly-io",
+        "self-hosting/upgrading",
+        "self-hosting/monitoring"
+      ]
+    },
+    {
+      "group": "More",
+      "pages": [
+        "changelog"
+      ]
+    }
+  ],
+  "footerSocials": {
+    "github": "https://github.com/Telocel-Labs/Trident"
+  },
+  "openapi": "/api-reference/openapi.yaml",
+  "api": {
+    "baseUrl": "https://api.trident.telocel.com",
+    "auth": {
+      "method": "key",
+      "name": "X-API-Key"
+    }
+  },
+  "feedback": {
+    "thumbsRating": true,
+    "suggestEdit": true
+  },
+  "search": {
+    "prompt": "Search Trident docs…"
+  }
+}

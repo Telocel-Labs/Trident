@@ -1,0 +1,99 @@
+---
+title: "GraphQL Schema"
+description: "Full GraphQL schema for the Trident API — auto-generated from the SDL."
+---
+
+<Warning>
+**Pending #66.** The GraphQL API is being developed in [issue #66](https://github.com/Telocel-Labs/Trident/issues/66). This page will be updated with the full schema listing once the SDL is merged. Subscribe to that issue for updates.
+</Warning>
+
+## Overview
+
+The Trident GraphQL API is served at:
+
+```
+POST https://api.trident.telocel.com/graphql
+```
+
+It supports the same event query and subscription capabilities as the REST API, with the added flexibility of composable queries and field-level selection.
+
+---
+
+## Authentication
+
+Pass your API key in the `X-API-Key` header (same as the REST API):
+
+```bash
+curl -X POST https://api.trident.telocel.com/graphql \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $TRIDENT_API_KEY" \
+  -d '{ "query": "{ __typename }" }'
+```
+
+---
+
+## Schema (coming in #66)
+
+The full SDL will be listed here once the GraphQL API ships. Core types expected:
+
+```graphql
+# Coming in #66
+
+type SorobanEvent {
+  id: ID!
+  contractId: String!
+  ledgerSequence: Int!
+  ledgerTimestamp: String!
+  transactionHash: String!
+  eventIndex: Int!
+  eventType: EventType!
+  topics: [String!]!
+  data: JSON
+  createdAt: String!
+}
+
+enum EventType {
+  CONTRACT
+  SYSTEM
+  DIAGNOSTIC
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+type EventConnection {
+  edges: [EventEdge!]!
+  pageInfo: PageInfo!
+}
+
+type EventEdge {
+  node: SorobanEvent!
+  cursor: String!
+}
+
+type Query {
+  events(
+    contractId: String
+    topic0: String
+    topic1: String
+    fromLedger: Int
+    toLedger: Int
+    first: Int
+    after: String
+  ): EventConnection!
+
+  event(id: ID!): SorobanEvent
+}
+
+type Subscription {
+  eventAdded(contractId: String!, topic0: String): SorobanEvent!
+}
+```
+
+---
+
+## Interactive Playground
+
+Once the GraphQL API ships, explore it interactively at [/playground](/graphql/playground).

@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0013) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0025) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -165,7 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_parse_errors_occurred_at ON parse_errors (occurre
 -- ---------------------------------------------------------------------------
 -- event_outbox
 -- Transactional outbox guaranteeing every committed event reaches the Redis
--- stream at least once (migration 0010).
+-- stream at least once (migration 0011).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS event_outbox (
     seq          BIGSERIAL   PRIMARY KEY,
@@ -241,7 +241,7 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_id ON webhook_del
 
 -- ---------------------------------------------------------------------------
 -- usage_rollup
--- Per-API-key daily usage rollup, aggregated from audit_log (migration 0010).
+-- Per-API-key daily usage rollup, aggregated from audit_log (migration 0024).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS usage_rollup (
     api_key_id      UUID             NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,

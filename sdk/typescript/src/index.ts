@@ -18,6 +18,7 @@ export type { TridentErrorCode } from "./errors.js";
 export { ENV_API_KEY, ENV_BASE_URL, redactKey } from "./config.js";
 export { iterEvents, DEFAULT_MAX_PAGES } from "./iterator.js";
 export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
+export type { components, operations, paths } from "./api-types.gen.js";
 export { DEFAULT_RETRY_CONFIG } from "./retry.js";
 export type { RetryConfig } from "./retry.js";
 

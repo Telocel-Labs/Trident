@@ -1,0 +1,146 @@
+---
+title: "Deploying on Fly.io"
+description: "Step-by-step walkthrough for deploying the Trident stack to Fly.io using TOML configuration files."
+---
+
+## Overview
+
+Trident provides pre-configured Fly.io deployment configurations in the `fly/` directory:
+
+- `fly/indexer.toml` — Rust indexer service
+- `fly/grpc-api.toml` — Rust gRPC API service
+- `fly/api.toml` — Go REST / WebSocket API front office
+
+This guide walks through deploying all three components along with managed Postgres and Redis instances on Fly.io.
+
+---
+
+## Prerequisites
+
+1. Install the Fly CLI (`flyctl`):
+   ```bash
+   curl -L https://fly.io/install.sh | sh
+   ```
+2. Log in to Fly.io:
+   ```bash
+   fly auth login
+   ```
+
+---
+
+## Step 1: Provision Postgres & Redis
+
+### Fly Postgres
+
+Create a Fly Postgres cluster (or PgBouncer pooler):
+
+```bash
+fly postgres create --name trident-db --region iad --initial-cluster-size 2 --vm-size shared-cpu-2x --volume-size 50
+```
+
+Attach Postgres to obtain the connection string:
+```bash
+fly postgres attach trident-db --app trident-api
+```
+
+### Fly Redis / Upstash
+
+Create an Upstash Redis instance on Fly:
+
+```bash
+fly redis create --name trident-redis --region iad
+```
+
+Note down the `REDIS_URL` connection string provided upon creation.
+
+---
+
+## Step 2: Deploy Rust Indexer
+
+The indexer reads blocks from Soroban RPC and writes to Postgres & Redis.
+
+1. Navigate to the indexer configuration context or specify config location:
+   ```bash
+   fly secrets set \
+     DATABASE_URL="postgres://trident:password@trident-db.internal:5432/trident" \
+     REDIS_URL="redis://default:password@trident-redis.upstash.io:6379" \
+     STELLAR_RPC_URL="https://soroban-testnet.stellar.org" \
+     NETWORK="testnet" \
+     --config fly/indexer.toml
+   ```
+
+2. Deploy the indexer:
+   ```bash
+   fly deploy --config fly/indexer.toml
+   ```
+
+---
+
+## Step 3: Deploy Rust gRPC API
+
+The internal gRPC API bridges Postgres storage to the Go front office.
+
+1. Set required secrets:
+   ```bash
+   fly secrets set \
+     DATABASE_URL="postgres://trident:password@trident-db.internal:5432/trident" \
+     --config fly/grpc-api.toml
+   ```
+
+2. Deploy gRPC API:
+   ```bash
+   fly deploy --config fly/grpc-api.toml
+   ```
+
+---
+
+## Step 4: Deploy Go REST/WS API
+
+The Go API exposes the public HTTP and WebSocket endpoints to client SDKs.
+
+1. Set secrets and environment configurations:
+   ```bash
+   fly secrets set \
+     DATABASE_URL="postgres://trident:password@trident-db.internal:5432/trident" \
+     REDIS_URL="redis://default:password@trident-redis.upstash.io:6379" \
+     API_GRPC_ADDR="trident-grpc-api.internal:50051" \
+     API_KEY_SALT="$(openssl rand -hex 32)" \
+     ALLOWED_ORIGINS="https://yourdomain.com" \
+     --config fly/api.toml
+   ```
+
+2. Deploy Go API:
+   ```bash
+   fly deploy --config fly/api.toml
+   ```
+
+---
+
+## Step 5: Verify Deployment
+
+Check status and logs across apps:
+
+```bash
+fly status --config fly/api.toml
+fly logs --config fly/api.toml
+```
+
+Test health check endpoint:
+
+```bash
+curl https://trident-api.fly.dev/v1/health
+```
+
+Expected output:
+```json
+{
+  "status": "ok",
+  "indexer": {
+    "status": "healthy",
+    "lastLedger": 12345678,
+    "lagLedgers": 0
+  },
+  "database": "ok",
+  "redis": "ok"
+}
+```

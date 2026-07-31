@@ -1,0 +1,124 @@
+---
+title: "Rate Limiting"
+description: "Rate limits per API key tier, the 429 response, the Retry-After header, and backoff strategies."
+---
+
+Trident enforces per-key rate limits to ensure fair access and system stability. Limits are applied as a sliding-window requests-per-second (RPS) budget.
+
+---
+
+## Limits by tier
+
+| Tier         | Requests / second | Notes                                      |
+|--------------|-------------------|--------------------------------------------|
+| **Free**     | 10 RPS            | Default for all new accounts               |
+| **Pro**      | 100 RPS           | [Contact us](https://trident.telocel.com/pricing) to upgrade |
+| **Internal** | 1 000 RPS         | Reserved for Trident infrastructure        |
+
+These defaults apply to the hosted API. In a self-hosted deployment, configure them via:
+
+```bash
+RATE_LIMIT_FREE_RPS=10
+RATE_LIMIT_PRO_RPS=100
+RATE_LIMIT_INTERNAL_RPS=1000
+```
+
+---
+
+## 429 Too Many Requests
+
+When you exceed your tier's limit, the API returns `429` with a `Retry-After` header:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "RATE_LIMITED",
+    "message": "rate limit exceeded — retry after 1 second"
+  }
+}
+```
+
+`Retry-After` is the number of **seconds** to wait before retrying. Always respect this header — retrying immediately will continue to return `429` and consume your budget.
+
+---
+
+## Handling 429 in your code
+
+### With the SDK
+
+The SDK does **not** automatically retry on `429`. Handle it by catching `TridentError`:
+
+```typescript
+import { TridentClient, TridentError } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+async function queryWithBackoff(retries = 3): Promise<void> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const result = await client.queryEvents({ limit: 50 });
+      console.log(`Got ${result.events.length} events`);
+      return;
+    } catch (err) {
+      if (err instanceof TridentError && err.code === "RATE_LIMITED") {
+        const waitMs = (err.retryAfterSeconds ?? 1) * 1000;
+        console.warn(`Rate limited — waiting ${waitMs}ms`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("Max retries exceeded");
+}
+```
+
+### With curl (exponential backoff)
+
+```bash
+#!/usr/bin/env bash
+attempt=0
+max_attempts=5
+delay=1
+
+while [ $attempt -lt $max_attempts ]; do
+  response=$(curl -s -w "\n%{http_code}" \
+    -H "X-API-Key: $TRIDENT_API_KEY" \
+    "https://api.trident.telocel.com/v1/events?limit=10")
+
+  http_code=$(echo "$response" | tail -1)
+
+  if [ "$http_code" = "200" ]; then
+    echo "$response" | head -n -1
+    exit 0
+  elif [ "$http_code" = "429" ]; then
+    echo "Rate limited — waiting ${delay}s"
+    sleep $delay
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  else
+    echo "Error: $http_code"
+    exit 1
+  fi
+done
+
+echo "Max retries exceeded"
+exit 1
+```
+
+---
+
+## Tips for staying within limits
+
+- Use cursor-based `iterEvents` with a delay between pages rather than firing requests in tight loops.
+- Cache results client-side when the same query is repeated frequently.
+- Use WebSocket subscriptions for real-time use cases — a single persistent connection does not consume REST quota.
+- If you need higher limits, [upgrade to Pro](https://trident.telocel.com/pricing).
