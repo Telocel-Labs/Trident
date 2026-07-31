@@ -1,24 +1,23 @@
-# Links the docs link checker must not fail on.
-# One regex per line; lychee reads this file automatically from the repo root.
+# URLs the docs link checker must not fail on.
+# One regex per line, matched against the URL. lychee reads this file
+# automatically from the repo root.
+#
+# Note these are URL patterns, not paths — a bare directory name here matches
+# nothing. Files are excluded by narrowing the globs in
+# .github/workflows/docs-ci.yml instead.
 
-# Dependency metadata. The `docs/site/**/*.json` glob reaches every package.json
-# and locale file npm unpacks under node_modules, and third-party author URLs
-# rot constantly (qualiancy.com is gone, ariporad.com 403s, TypeScript's
-# localised diagnosticMessages files carry {1} placeholder URLs). None of these
-# are this repo's links, and none are fixable here.
-node_modules
-
-# Product pages that are not published yet. The marketing site resolves but
+# Product pages that are not published yet. The marketing site resolves, but
 # these paths do not exist, so the checker fails on links the docs are correct
 # to contain — they are where a reader should go once the pages ship. Remove
 # each line as the corresponding page goes live.
 https://trident\.telocel\.com/signup
 https://trident\.telocel\.com/pricing
 
-# The API root returns no HTML document; only the versioned endpoints beneath
-# it do, and those are exercised by the contract tests, not by a link check.
+# The API root serves no HTML document; only the versioned endpoints beneath it
+# do, and those are covered by the contract tests rather than a link check.
 https://api\.trident\.telocel\.com/?$
 
 # GitHub Discussions is not enabled for this repository (has_discussions is
-# false), so this URL 404s. Delete this line if Discussions is turned on.
+# false), so this 404s. Delete this line if Discussions is turned on, or drop
+# the link from the docs.
 https://github\.com/Telocel-Labs/Trident/discussions

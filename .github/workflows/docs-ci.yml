@@ -42,13 +42,17 @@ jobs:
           npm install --no-save typescript @trident-indexer/sdk@file:../../sdk/typescript
           npx tsc --noEmit
 
-      # Exclusions live in .lycheeignore at the repo root, which lychee picks up
-      # automatically: dependency metadata under node_modules (the *.json glob
-      # reaches all of it once the install step above succeeds), plus product
-      # pages that are not published yet. Each entry there says why and when it
-      # can be removed.
+      # Only the .mdx files are checked. The previous 'docs/site/**/*.json' glob
+      # matched no tracked file in this repo — `git ls-files 'docs/site/**/*.json'`
+      # returns nothing — so in practice it only ever reached the dependency
+      # metadata npm unpacks into docs/site/node_modules during the step above,
+      # and failed the job on other people's rotted author URLs and on
+      # placeholder links inside TypeScript's localised diagnostic files.
+      #
+      # Remaining exclusions (unpublished product pages) live in .lycheeignore
+      # at the repo root, which lychee reads automatically.
       - name: Check for Broken Links
         uses: lycheeverse/lychee-action@2b973e86fc7b1f6b36a93795fe2c9c6ae1118621 # v1
         with:
-          args: --verbose --no-progress 'docs/site/**/*.mdx' 'docs/site/**/*.json'
+          args: --verbose --no-progress 'docs/site/**/*.mdx'
           fail: true
