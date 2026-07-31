@@ -32,6 +32,7 @@ use crate::{
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
     rpc::{filters::build_event_filters, FilterPlan, RpcClient, RpcHttpSettings},
+    token_metadata,
 };
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -56,6 +57,27 @@ pub struct Streamer {
     last_chain_tip: u64,
     /// Adaptive poll-interval controller driven by chain-tip lag (issue #198).
     adaptive_poll: AdaptivePoll,
+    /// Parsed-spec cache keyed by WASM code hash (issue #260).
+    spec_cache: crate::spec::SpecCache,
+    /// Last code hash synced to `contract_specs` per contract, so a redeploy
+    /// (changed hash) is what triggers a refresh, not every poll cycle
+    /// (issue #260).
+    known_code_hashes: std::collections::HashMap<String, String>,
+    /// Tracked contracts most recently classified as SEP-41 tokens (issue
+    /// #269) — what bounds storage-snapshot fetching (issue #270) to
+    /// contracts we actually know how to read a balance from.
+    token_contracts: HashSet<String>,
+}
+
+/// One contract-storage snapshot change observed during a poll cycle,
+/// pending persistence (issue #270). Owns its data so it outlives the
+/// borrows built from `page_events`/`page_tokens` earlier in `poll_once`.
+struct OwnedStorageSnapshot {
+    contract_id: String,
+    storage_key: String,
+    key_json: serde_json::Value,
+    value_json: Option<serde_json::Value>,
+    ledger_sequence: u64,
 }
 
 impl Streamer {
@@ -72,15 +94,21 @@ impl Streamer {
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
             },
-            config.rpc_failover_threshold,
-            config.rpc_endpoint_cooldown,
         )?;
         tracing::info!(
             endpoints = config.stellar_rpc_urls.len(),
             primary = %config.stellar_rpc_url,
-            "RPC endpoint pool configured"
+            "RPC endpoint pool configured with health scoring"
         );
-        let parser = Parser::new(config.index_diagnostic);
+        let sac_registry = crate::parser::sac::SacRegistry::build(
+            &config.tracked_sac_assets,
+            &config.network_passphrase,
+        )?;
+        tracing::info!(
+            tracked_assets = config.tracked_sac_assets.len(),
+            "SAC asset registry built"
+        );
+        let parser = Parser::new(config.index_diagnostic).with_sac_registry(sac_registry);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
         let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
         let alerter = Alerter::from_config(
@@ -106,6 +134,9 @@ impl Streamer {
             alerter,
             last_chain_tip: 0,
             adaptive_poll,
+            spec_cache: crate::spec::SpecCache::new(),
+            known_code_hashes: std::collections::HashMap::new(),
+            token_contracts: HashSet::new(),
         })
     }
 
@@ -140,6 +171,56 @@ impl Streamer {
         }
     }
 
+    /// Fetch + persist specs and detected interfaces for every tracked
+    /// contract (issues #260, #269). Best-effort per contract: an RPC or
+    /// parse failure just skips that contract for this cycle. A DB write
+    /// only happens when the observed code hash differs from the last one
+    /// synced, so a contract whose code has not changed costs one cheap
+    /// `getLedgerEntries` call, not a WASM re-fetch.
+    async fn sync_contract_specs(&mut self) {
+        let Some(filter) = self.contract_filter.clone() else {
+            return;
+        };
+
+        for contract_id in filter {
+            match crate::spec::fetch_contract_spec(&self.rpc, &self.spec_cache, &contract_id).await
+            {
+                Ok(Some(contract_spec)) => {
+                    if contract_spec.interfaces.iter().any(|i| i == "sep41_token") {
+                        self.token_contracts.insert(contract_id.clone());
+                    } else {
+                        self.token_contracts.remove(&contract_id);
+                    }
+
+                    let changed =
+                        self.known_code_hashes.get(&contract_id) != Some(&contract_spec.code_hash);
+                    if changed {
+                        match db::upsert_contract_spec(
+                            &self.db,
+                            &contract_id,
+                            &self.config.network,
+                            &contract_spec,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                self.known_code_hashes
+                                    .insert(contract_id.clone(), contract_spec.code_hash.clone());
+                            }
+                            Err(e) => {
+                                tracing::warn!(contract_id = %contract_id, error = %e, "Failed to persist contract spec");
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(contract_id = %contract_id, error = %e, "Failed to fetch contract spec");
+                }
+            }
+        }
+    }
+
     /// Start the polling loop. Runs until `shutdown` is cancelled, always
     /// finishing the current `poll_once` before stopping (never mid-batch).
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
@@ -156,6 +237,12 @@ impl Streamer {
         let mut cursor = db::get_cursor(&self.db).await?;
         tracing::info!(cursor, "Resuming from ledger cursor");
 
+        // Populate contract specs / interface tags once at startup (issues
+        // #260, #269) so storage snapshotting (#270) has token classification
+        // available from the first poll rather than waiting for the first
+        // periodic refresh.
+        self.sync_contract_specs().await;
+
         loop {
             // Check for shutdown before starting a new poll so we never begin
             // a batch we can't finish atomically.
@@ -163,11 +250,18 @@ impl Streamer {
                 break;
             }
 
+            // Dead-man's-switch: ticks once per loop iteration regardless of
+            // poll outcome, so Prometheus can alert on a hung/crashed process
+            // even when lag itself still looks fine.
+            metrics::record_heartbeat();
+            metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
+
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
             if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 self.refresh_contract_filter().await?;
+                self.sync_contract_specs().await;
             }
 
             let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
@@ -222,7 +316,7 @@ impl Streamer {
             }
         }
 
-        tracing::info!("Streamer stopped cleanly");
+        tracing::info!(cursor, "Streamer stopped cleanly; cursor persisted");
         Ok(())
     }
 
@@ -277,6 +371,74 @@ impl Streamer {
             Err(e) => {
                 tracing::warn!(tx_hash, error = %e, "Failed to decode invocation metrics");
                 None
+            }
+        }
+    }
+
+    /// Resolve and cache SEP-41 token metadata for every distinct contract
+    /// among `token_projections` whose `token_metadata` row is missing or
+    /// older than `token_metadata_refresh_interval` (issue #263).
+    ///
+    /// Best-effort: an RPC/simulation failure for one contract is logged and
+    /// skipped, leaving its row (if any) untouched so the next page carrying
+    /// activity for that contract retries it — the poll cycle itself never
+    /// fails because of this.
+    async fn resolve_stale_token_metadata(&self, token_projections: &[db::TokenProjection<'_>]) {
+        if token_projections.is_empty() {
+            return;
+        }
+
+        let mut contract_ids: Vec<String> = token_projections
+            .iter()
+            .map(|p| p.event.contract_id.clone())
+            .collect();
+        contract_ids.sort_unstable();
+        contract_ids.dedup();
+
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(self.config.token_metadata_refresh_interval)
+                .unwrap_or(chrono::Duration::zero());
+        let fresh = match db::fresh_token_metadata_contract_ids(
+            &self.db,
+            &contract_ids,
+            &self.config.network,
+            cutoff,
+        )
+        .await
+        {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load fresh token_metadata contract ids; skipping this cycle's resolution");
+                return;
+            }
+        };
+
+        for contract_id in contract_ids {
+            if fresh.contains(&contract_id) {
+                continue;
+            }
+
+            let resolution = match token_metadata::resolve(&self.rpc, &contract_id).await {
+                Ok(resolution) => resolution,
+                Err(e) => {
+                    tracing::warn!(
+                        contract_id = %contract_id,
+                        error = %e,
+                        "Failed to resolve token metadata; will retry on a future poll"
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) =
+                db::upsert_token_metadata(&self.db, &contract_id, &self.config.network, &resolution)
+                    .await
+            {
+                tracing::warn!(
+                    contract_id = %contract_id,
+                    error = %e,
+                    "Failed to cache token metadata"
+                );
             }
         }
     }
@@ -345,10 +507,13 @@ impl Streamer {
             // Indices, not references, because `page_events` is still growing.
             let mut page_tokens: Vec<(usize, crate::parser::token_events::TokenEvent)> = Vec::new();
             for raw in &page.events {
+                let decode_start = Instant::now();
                 let parse_result = {
                     let _span = tracing::info_span!("parse_events").entered();
                     self.parser.parse_event_with_projection(raw)
                 };
+                metrics::record_decode_duration(decode_start.elapsed().as_secs_f64());
+
                 match parse_result {
                     Ok(Some(parsed)) => {
                         let event = parsed.event;
@@ -360,10 +525,17 @@ impl Streamer {
                                     contract_id = %event.contract_id,
                                     "Skipping event from unlisted contract"
                                 );
+                                // Unlisted contracts land in the "other" bucket to
+                                // bound cardinality (issue #212).
+                                metrics::record_events_by_contract("other", 1);
                                 skipped_in_page += 1;
                                 continue;
                             }
                         }
+                        // Allowlisted or index-all: record under the real contract_id.
+                        // In index-all mode cardinality is unbounded — operators should
+                        // configure an allowlist if per-contract metrics are needed.
+                        metrics::record_events_by_contract(&event.contract_id, 1);
                         // Events are accumulated and committed as one page,
                         // together with their outbox rows; the relay owns the
                         // Redis publish (issues #199, #200). Publishing inline
@@ -510,12 +682,93 @@ impl Streamer {
                 }
             }
 
+            // Contract storage snapshots (issue #270): bounded to tracked
+            // contracts already classified as SEP-41 tokens (issue #269), and
+            // only for holder addresses that moved funds in this page — never
+            // a scan of arbitrary storage.
+            let mut owned_storage_snapshots: Vec<OwnedStorageSnapshot> = Vec::new();
+            if !self.token_contracts.is_empty() {
+                let mut holders_by_contract: std::collections::HashMap<
+                    &str,
+                    std::collections::HashSet<&str>,
+                > = std::collections::HashMap::new();
+                for (index, token) in &page_tokens {
+                    let contract_id = page_events[*index].contract_id.as_str();
+                    if !self.token_contracts.contains(contract_id) {
+                        continue;
+                    }
+                    let holders = holders_by_contract.entry(contract_id).or_default();
+                    if let Some(from) = &token.from {
+                        holders.insert(from.as_str());
+                    }
+                    if let Some(to) = &token.to {
+                        holders.insert(to.as_str());
+                    }
+                }
+
+                let snapshot_ledger = if ledger_sequence > 0 {
+                    ledger_sequence
+                } else {
+                    *cursor
+                };
+                for (contract_id, holders) in holders_by_contract {
+                    let holder_list: Vec<String> =
+                        holders.into_iter().map(str::to_string).collect();
+                    let observations = match crate::storage::fetch_balance_snapshots(
+                        &self.rpc,
+                        contract_id,
+                        &holder_list,
+                    )
+                    .await
+                    {
+                        Ok(obs) => obs,
+                        Err(e) => {
+                            tracing::warn!(contract_id, error = %e, "Failed to fetch storage snapshot");
+                            continue;
+                        }
+                    };
+
+                    for obs in observations {
+                        let last = db::get_latest_storage_value(
+                            &self.db,
+                            contract_id,
+                            &self.config.network,
+                            &obs.storage_key,
+                        )
+                        .await
+                        .unwrap_or(None);
+
+                        if last != obs.value_json {
+                            owned_storage_snapshots.push(OwnedStorageSnapshot {
+                                contract_id: contract_id.to_string(),
+                                storage_key: obs.storage_key,
+                                key_json: obs.key_json,
+                                value_json: obs.value_json,
+                                ledger_sequence: snapshot_ledger,
+                            });
+                        }
+                    }
+                }
+            }
+            let storage_snapshots: Vec<db::StorageSnapshotRow<'_>> = owned_storage_snapshots
+                .iter()
+                .map(|s| db::StorageSnapshotRow {
+                    contract_id: &s.contract_id,
+                    storage_key: &s.storage_key,
+                    key_json: &s.key_json,
+                    value_json: s.value_json.as_ref(),
+                    ledger_sequence: s.ledger_sequence,
+                })
+                .collect();
+
             db::commit_page(
                 &self.db,
                 db::PageCommit {
                     events: &page_events,
                     token_events: &token_projections,
                     invocation_metrics: &invocation_metrics,
+                    storage_snapshots: &storage_snapshots,
+                    network: &self.config.network,
                     cursor: next_cursor,
                     ledger: next_cursor.map(|_| db::LedgerMeta {
                         sequence: ledger_sequence,
@@ -535,6 +788,15 @@ impl Streamer {
             if let Some(seq) = next_cursor {
                 *cursor = seq;
             }
+
+            // Resolve + cache SEP-41 token metadata for any contract seen in
+            // this page's token events whose cached row is missing or stale
+            // (issue #263). Best-effort, like `fetch_invocation_metrics`
+            // above: a resolution failure is logged and skipped rather than
+            // failing the poll cycle.
+            self.resolve_stale_token_metadata(&token_projections)
+                .instrument(tracing::info_span!("resolve_token_metadata"))
+                .await;
 
             // Delivery is not done here. The commit above wrote an outbox row
             // per event, and `redis_stream::relay` publishes them (issue #200).
@@ -573,6 +835,7 @@ impl Streamer {
                         chain_tip_ledger: self.last_chain_tip,
                         lag_threshold: self.config.alert_lag_threshold,
                         network: self.config.network.clone(),
+                        rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
                     };
                     self.alerter.evaluate(&ctx, &mut alert_state).await;
                     if let Err(e) = db::set_alert_state(&self.db, &alert_state).await {
@@ -789,6 +1052,9 @@ mod tests {
             health_port: 0,
             statement_timeout_ms: 30_000,
             idle_in_transaction_timeout_ms: 60_000,
+            token_metadata_refresh_interval: Duration::from_secs(86_400),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            tracked_sac_assets: Vec::new(),
         };
 
         Streamer::new(config, db).await.unwrap()

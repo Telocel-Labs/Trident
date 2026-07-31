@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::PgPoolOptions;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -16,7 +17,10 @@ mod parser;
 mod poll;
 mod redis_stream;
 mod rpc;
+mod spec;
+mod storage;
 mod streamer;
+mod token_metadata;
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
@@ -154,12 +158,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay_shutdown = shutdown.clone();
     let relay_handle = tokio::spawn(async move { relay.run(relay_shutdown).await });
 
+    // Allow the shutdown drain to finish its in-flight work before the process
+    // is killed. Kubernetes/Fly terminationGracePeriodSeconds should be ≥ this
+    // value + a small buffer (recommended: SHUTDOWN_GRACE_SECS + 5).
+    const SHUTDOWN_GRACE_SECS: u64 = 30;
+
     let mut s = streamer::Streamer::new(cfg, db_pool).await?;
     let result = s.run(shutdown).await;
 
-    // Let the relay drain its current pass before the process exits.
-    if let Err(e) = relay_handle.await {
-        tracing::warn!(error = %e, "Outbox relay task did not shut down cleanly");
+    // Let the relay drain its current pass before the process exits, bounded
+    // by the shutdown grace period (issue #205).
+    match tokio::time::timeout(
+        Duration::from_secs(SHUTDOWN_GRACE_SECS),
+        relay_handle,
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "Outbox relay task did not shut down cleanly");
+        }
+        Err(_) => {
+            tracing::warn!(
+                grace_seconds = SHUTDOWN_GRACE_SECS,
+                "Graceful shutdown exceeded grace period; forcing exit"
+            );
+        }
     }
     result?;
 

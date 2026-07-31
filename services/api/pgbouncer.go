@@ -8,6 +8,36 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// PgBouncer compatibility notes (#256)
+//
+// Supported pooling mode: transaction pooling (pool_mode = transaction).
+//
+// The application pool (newDBPool in main.go) is configured with
+// QueryExecModeSimpleProtocol, which disables server-side prepared statements.
+// This is required for PgBouncer transaction pooling because:
+//
+//   - Extended query protocol prepared statements are session-scoped; in
+//     transaction mode the backend connection changes between transactions and
+//     a previously prepared statement is no longer available.
+//   - Simple protocol sends each query as a one-shot Parse+Execute in the
+//     same message, which is safe across connection hand-offs.
+//
+// Session-level state avoided:
+//   - No SET LOCAL / SET SESSION variables outside of transactions.
+//   - No advisory locks (pg_advisory_lock / pg_try_advisory_lock).
+//   - No LISTEN / NOTIFY (WebSocket fan-out uses Redis Streams instead).
+//   - No temp tables that persist beyond a single transaction.
+//
+// To enable PgBouncer, set the PGBOUNCER_ADMIN_URL environment variable to
+// the admin console URL (e.g. postgresql://pgbouncer-admin@host:6432/pgbouncer).
+// The app then exposes live SHOW POOLS / SHOW STATS data at GET /v1/db/stats.
+//
+// Validation: run load-tests/pgbouncer-validation.js against the stack while
+// PgBouncer fronts the database to confirm no connection-exhaustion errors and
+// p99 < 500 ms:
+//
+//   BASE_URL=http://localhost:3000 k6 run load-tests/pgbouncer-validation.js
+
 // newPgbouncerStats returns a stats function that connects to the PgBouncer
 // admin console at adminURL (the virtual "pgbouncer" database) and reads
 // SHOW POOLS / SHOW STATS on demand.

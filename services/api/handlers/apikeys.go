@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -87,6 +88,10 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		var req createKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}
@@ -210,6 +215,10 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		var req updateKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}

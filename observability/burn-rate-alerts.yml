@@ -1,0 +1,122 @@
+# Multi-window, multi-burn-rate alerts for the SLOs defined in docs/slo.md
+# (issue #296). Follows the Google SRE workbook pattern: a short window
+# confirms the burn is happening *now*, a long window confirms it's
+# sustained (not a blip) — both must breach before paging.
+#
+# Validate with: promtool check rules observability/burn-rate-alerts.yml
+# (not run as part of this change — promtool wasn't available in the
+# environment this was authored in).
+#
+# Only SLO 1 (ingest freshness) has live metrics today. SLO 2/3 (API
+# latency/availability) are stubbed below and gated on issue #295 shipping
+# the underlying RED metrics — do not enable them until those metrics
+# actually exist, or every rule evaluation will just return no data.
+
+groups:
+  - name: trident-slo-ingest-freshness
+    rules:
+      # Error ratio: fraction of time ledger lag exceeded the 30s target,
+      # over the two windows the multi-burn-rate check below compares.
+      - record: trident:ingest_freshness_error_ratio5m
+        expr: 1 - avg_over_time((trident_indexer_ledger_lag <= bool 30)[5m:1m])
+      - record: trident:ingest_freshness_error_ratio1h
+        expr: 1 - avg_over_time((trident_indexer_ledger_lag <= bool 30)[1h:1m])
+      - record: trident:ingest_freshness_error_ratio30m
+        expr: 1 - avg_over_time((trident_indexer_ledger_lag <= bool 30)[30m:1m])
+      - record: trident:ingest_freshness_error_ratio6h
+        expr: 1 - avg_over_time((trident_indexer_ledger_lag <= bool 30)[6h:1m])
+
+      # Fast burn: consuming the 28-day, 5%-error-budget SLO (target 95%,
+      # docs/slo.md SLO 1) at 14.4x — exhausts the whole monthly budget in
+      # ~2 days if sustained. 5m confirms it's happening now, 1h confirms
+      # it isn't a single blip.
+      - alert: IngestFreshnessFastBurn
+        expr: |
+          trident:ingest_freshness_error_ratio5m > (14.4 * 0.05)
+          and
+          trident:ingest_freshness_error_ratio1h > (14.4 * 0.05)
+        for: 2m
+        labels:
+          severity: page
+          slo: ingest-freshness
+        annotations:
+          summary: "Ledger lag SLO fast-burn — indexer is falling behind quickly"
+          description: >-
+            trident_indexer_ledger_lag has exceeded 30s for a large share of
+            both the last 5m and the last 1h. At this burn rate the 28-day
+            error budget is exhausted in under 2 days. Check
+            trident_indexer_rpc_retries_total / trident_indexer_rpc_failovers_total
+            and trident_indexer_last_poll_timestamp_seconds for a stalled or
+            struggling poll loop.
+
+      # Slow burn: 6x burn rate — exhausts the budget in ~5 days if
+      # sustained. Longer windows (30m/6h) so this doesn't fire on
+      # transient blips the fast-burn rule would already catch anyway.
+      - alert: IngestFreshnessSlowBurn
+        expr: |
+          trident:ingest_freshness_error_ratio30m > (6 * 0.05)
+          and
+          trident:ingest_freshness_error_ratio6h > (6 * 0.05)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: ingest-freshness
+        annotations:
+          summary: "Ledger lag SLO slow-burn — sustained elevated lag"
+          description: >-
+            trident_indexer_ledger_lag has exceeded 30s for a sustained
+            share of both the last 30m and the last 6h. Not urgent enough to
+            page, but investigate before it becomes a fast burn.
+
+      # Dead-man's-switch: catches a fully stalled indexer that a lag-ratio
+      # rule alone can miss if the gauge itself stops updating.
+      - alert: IndexerHeartbeatStalled
+        expr: time() - trident_indexer_last_poll_timestamp_seconds > 120
+        for: 1m
+        labels:
+          severity: page
+          slo: ingest-freshness
+        annotations:
+          summary: "Indexer poll loop has not completed a cycle in over 2 minutes"
+          description: >-
+            trident_indexer_last_poll_timestamp_seconds has not advanced —
+            the indexer process may be hung, crashed, or stuck retrying RPC.
+
+      # Direct threshold alert on sustained high lag (issue #293), independent
+      # of the error-budget/burn-rate math above: a straightforward "lag has
+      # been high for a while" signal for anyone not fluent in the SLO
+      # calculation, mirroring the fields exposed by GET /v1/stats/indexer
+      # (see docs/observability/data-freshness.md).
+      - alert: TridentIngestLagSustainedHigh
+        expr: trident_indexer_ledger_lag_seconds_estimated > 500
+        for: 10m
+        labels:
+          severity: page
+          slo: ingest-freshness
+        annotations:
+          summary: "Indexer ledger lag above 100 ledgers (~500s estimated) for 10m+"
+          description: >-
+            trident_indexer_ledger_lag_seconds_estimated (lag_ledgers * ~5s/
+            ledger, see docs/observability/data-freshness.md) has been above
+            {{ $value | humanizeDuration }} for 10 minutes straight — over
+            100 ledgers behind. Check
+            trident_indexer_rpc_errors_total / trident_indexer_rpc_active_endpoint
+            (observability/rpc-alerts.yml) for whether the RPC provider is
+            the cause.
+
+  # ---------------------------------------------------------------------------
+  # Stubbed — do not enable until issue #295 (RED metrics for services/api)
+  # ships http_requests_total / http_request_duration_seconds with route and
+  # status_code labels. See docs/slo.md SLO 2 / SLO 3 for the target query
+  # shapes these rules should eventually mirror.
+  # ---------------------------------------------------------------------------
+  # - name: trident-slo-api-latency-availability
+  #   rules:
+  #     - record: trident:api_availability_error_ratio5m
+  #       expr: |
+  #         1 - (
+  #           sum(rate(http_requests_total{status_code!~"5.."}[5m]))
+  #           /
+  #           sum(rate(http_requests_total[5m]))
+  #         )
+  #     # ... mirror the fast/slow burn pattern above once the metric exists.

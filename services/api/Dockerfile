@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── builder ──────────────────────────────────────────────────────────────────
-FROM golang:1.25-alpine AS builder
+FROM golang:1.25-alpine@sha256:a7f2fc9834049c1f5df787690026a53738e55fc097cd8a4a93faa3e06c67ee32 AS builder
 
 WORKDIR /build
 
@@ -14,7 +14,7 @@ COPY services/api/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /api .
 
 # ── runtime ──────────────────────────────────────────────────────────────────
-FROM alpine:3.19 AS runtime
+FROM alpine:3.19@sha256:c5b1261d6d3e43071626931fc004f70149baeba2c8ec672bd4f27761f8e1ad6b AS runtime
 
 RUN adduser -S -u 1001 trident
 

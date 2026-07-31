@@ -1,0 +1,31 @@
+# Gitleaks configuration for Trident
+# https://github.com/gitleaks/gitleaks#configuration
+#
+# The values below are intentionally committed CI test credentials documented
+# in .env.ci. They have no value outside an ephemeral CI runner and are
+# explicitly NOT production secrets — see the header comment in .env.ci.
+
+title = "Trident gitleaks config"
+
+[allowlist]
+description = "Known CI test credentials committed intentionally in .env.ci"
+
+# Match by the literal secret value so gitleaks skips findings whose
+# secret field exactly equals one of these strings.
+regexes = [
+  # Postgres CI password
+  "ci-password",
+  # Go API salt (used to hash the CI test key)
+  "ci-test-salt",
+  # HMAC-SHA256(ci-test-api-key-do-not-use-in-production, ci-test-salt)
+  "02f464c47994f7237aa6a9fc7c1dfa0b4b6d7b2f407fd3bd08e131670cac43cf",
+  # Raw CI test API key (documented: do not use outside CI)
+  "ci-test-api-key-do-not-use-in-production",
+  # CI admin key (documented: do not use outside CI)
+  "ci-admin-key-do-not-use-in-production",
+]
+
+# Scope the allowlist to the files that intentionally carry these values.
+paths = [
+  ".env.ci",
+]

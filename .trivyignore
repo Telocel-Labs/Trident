@@ -1,0 +1,10 @@
+# Trivy vulnerability allowlist for the security-scan workflow (issue #311).
+#
+# Every entry here MUST have a comment above it recording: the CVE, why it's
+# allowlisted (no fix available / not reachable / false positive), and the
+# date it was added — see docs/security-triage.md for the full process.
+#
+# Example:
+# # CVE-2024-XXXXX — no upstream fix yet for alpine:3.19's libcrypto3;
+# # tracked upstream at <link>. Added 2026-01-15, re-review by 2026-04-15.
+# CVE-2024-XXXXX

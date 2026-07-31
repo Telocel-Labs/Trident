@@ -113,6 +113,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/contracts/{id}/events/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get per-contract event schemas
+         * @description Returns the observed event names and typed field schemas for one contract version.
+         */
+        get: operations["getContractEventSchemas"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/contracts/{id}/metadata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get token metadata for a contract
+         * @description Returns cached name/symbol/decimals for a SEP-41 token contract, resolved via a read-only simulateTransaction call. `is_token` is false, with the other fields null, both when the contract has not been resolved yet and when it was resolved and found not to implement the token interface.
+         */
+        get: operations["getContractTokenMetadata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/stats/indexer": {
         parameters: {
             query?: never;
@@ -352,6 +392,56 @@ export interface components {
              */
             last_poll_at?: string | null;
         };
+        TokenMetadataResponse: {
+            /** @description Soroban contract address */
+            contract_id: string;
+            /**
+             * @description Network queried
+             * @enum {string}
+             */
+            network: "testnet" | "mainnet";
+            /** @description True when the contract was resolved and implements the SEP-41 read interface. False for both "not yet resolved" and "resolved, not a token". */
+            is_token: boolean;
+            /** @description Token name, from name(). Null unless is_token is true. */
+            name?: string | null;
+            /** @description Token symbol, from symbol(). Null unless is_token is true. */
+            symbol?: string | null;
+            /**
+             * Format: int32
+             * @description Token decimals, from decimals(). Null unless is_token is true.
+             */
+            decimals?: number | null;
+            /**
+             * Format: date-time
+             * @description When this contract was last resolved. Null if never resolved.
+             */
+            resolved_at?: string | null;
+        };
+        ContractEventSchemaResponse: {
+            /** @description Soroban contract address */
+            contract_id: string;
+            /**
+             * @description Network queried
+             * @enum {string}
+             */
+            network: "testnet" | "mainnet";
+            /** @description Contract code hash for this schema version */
+            code_hash: string;
+            /** @description Observed event names and their typed field schemas */
+            events: components["schemas"]["ContractEventSchema"][];
+        };
+        ContractEventSchema: {
+            /** @description Contract event name (topic_0) */
+            event_name: string;
+            /** @description Named fields for this event payload */
+            fields: components["schemas"]["ContractEventFieldSchema"][];
+        };
+        ContractEventFieldSchema: {
+            /** @description Stable field name for this event payload position or property */
+            name: string;
+            /** @description Field type inferred from the contract interface or observed payloads */
+            type: string;
+        };
         ContractStatsResponse: {
             /** @description Contracts sorted by event count (descending) */
             contracts: components["schemas"]["ContractStats"][];
@@ -590,7 +680,10 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Multiple event details */
+            /**
+             * @description Batch result. Always returns 200 even when some IDs are not found;
+             *     check `missing` for unresolved IDs.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -602,6 +695,58 @@ export interface operations {
                         /** @description Ids that are valid UUIDs but not indexed, in request order. Empty array when every id was found. */
                         missing: string[];
                     };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getContractEventSchemas: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Contract event schema registry entry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractEventSchemaResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getContractTokenMetadata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cached token metadata (or a not-a-token / not-yet-resolved result) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenMetadataResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];

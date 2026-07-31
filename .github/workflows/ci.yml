@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [dev, main]
 
+# Cancel superseded runs on the same branch/PR so we don't burn CI minutes
+# (and queue time for everyone else) compiling a commit nobody cares about
+# anymore once a newer push has landed.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # Rust — format, lint, test, and SQLx prepare
@@ -13,6 +20,9 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     services:
       postgres:
         image: postgres:15-alpine
@@ -29,18 +39,34 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
         with:
           components: rustfmt, clippy
 
+      # Check formatting first: it needs neither the Postgres service nor a
+      # compiled dependency graph, so a formatting mistake (the most common
+      # CI failure) is reported in seconds instead of after the DB migration
+      # and sqlx-prepare steps below have already run.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # sccache caches compiled objects in the GitHub Actions cache, keyed by
+      # crate/flags/rustc version, and is shared with the rust-integration
+      # job below (same workspace, same Cargo.lock) via the same GHA cache
+      # scope. Cuts recompilation between the two jobs to near-zero on a hit.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          shared-key: rust-workspace
 
       - name: Install sqlx-cli
-        uses: baptiste0928/cargo-install@v3
+        uses: baptiste0928/cargo-install@904927dbe77864e0f2281519fe9d5bd097a220b3 # v3.0.1
         with:
           crate: sqlx-cli
           version: latest
@@ -57,9 +83,6 @@ jobs:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
         run: cargo sqlx prepare --workspace
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -67,6 +90,10 @@ jobs:
         env:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
         run: cargo test --all -- --test-threads=1
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # ---------------------------------------------------------------------------
   # Go — vet and lint
@@ -79,10 +106,10 @@ jobs:
         working-directory: services/api
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
         with:
           go-version: "1.25"
           cache-dependency-path: services/api/go.sum
@@ -94,7 +121,7 @@ jobs:
         run: go test -race ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@3cfe3a4abbb849e10058ce4af15d205b6da42804 # v4.0.0
         with:
           version: v2.12.2
           working-directory: services/api
@@ -110,10 +137,10 @@ jobs:
         working-directory: sdk/typescript
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
           node-version: "20"
           cache: npm
@@ -139,9 +166,9 @@ jobs:
       run:
         working-directory: sdk/go
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
         with:
           go-version: "1.25"
           cache-dependency-path: sdk/go/go.sum
@@ -155,13 +182,15 @@ jobs:
       run:
         working-directory: sdk/python
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
         with:
           python-version: "3.12"
       - name: Install package with test deps
         run: pip install -e ".[dev]"
+      - name: Type check (mypy --strict)
+        run: mypy
       - name: Test
         run: pytest -q
 
@@ -169,9 +198,9 @@ jobs:
     name: SDK (React)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
           node-version: "20"
       # react depends on the TypeScript SDK via `file:../typescript`, which
@@ -187,6 +216,82 @@ jobs:
         working-directory: sdk/react
         run: npm test
 
+  sdk-rust:
+    name: SDK (Rust)
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    defaults:
+      run:
+        working-directory: sdk/rust
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          workspaces: sdk/rust
+      - name: Test
+        run: cargo test --examples
+      - name: Test library and docs
+        run: cargo test
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # ---------------------------------------------------------------------------
+  # Contracts — reference Soroban contracts (issue #258).
+  #
+  # A separate Cargo workspace (contracts/), not a member of the root one:
+  # contract builds target wasm32v1-none with panic=abort, which is a
+  # different profile shape than the native services. Build-only here (no
+  # deploy) so the contracts can't silently rot; the e2e-contract-events job
+  # below is what actually deploys the token contract.
+  # ---------------------------------------------------------------------------
+  contracts:
+    name: Contracts
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        with:
+          targets: wasm32v1-none
+
+      # Shared with e2e-contract-events below via the same sccache GHA cache
+      # scope, so that job's rebuild of the token contract to wasm32v1-none
+      # (needed there to get a fresh Soroban deployment) reuses these
+      # compiled objects instead of building the same crate twice per CI run.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          workspaces: contracts
+          shared-key: contracts-wasm
+
+      - name: Run contract unit tests
+        run: cargo test --workspace
+
+      - name: Build contracts to WASM
+        run: cargo build --release --target wasm32v1-none --workspace
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   # ---------------------------------------------------------------------------
   # OpenAPI specification — Spectral linting
   # ---------------------------------------------------------------------------
@@ -194,10 +299,10 @@ jobs:
     name: OpenAPI Spec
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
           node-version: "20"
 
@@ -230,6 +335,9 @@ jobs:
     if: >
       github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') ||
       github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'dev')
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     services:
       postgres:
         image: postgres:16
@@ -253,13 +361,27 @@ jobs:
         ports:
           - 6379:6379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+
+      # Shares the sccache object cache with the rust job (same workspace,
+      # same Cargo.lock) so this job's build reuses objects already compiled
+      # there instead of recompiling the whole workspace from scratch.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          shared-key: rust-workspace
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: services/api/go.sum
 
       # Apply the real migration chain (0001..latest) — the same artifact CI's
       # `rust` job and production apply. This validates the migrations as an
@@ -287,6 +409,10 @@ jobs:
           CI: "true"
         run: cargo test --all -- --include-ignored --test-threads=1
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   # ---------------------------------------------------------------------------
   # Docker — build images (no push)
   # Both application images are built here so the layer cache is warm when
@@ -297,38 +423,53 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
 
+      # Each image gets its own cache scope. Without an explicit `scope`, the
+      # gha cache backend defaults every build in the workflow to the same
+      # "buildkit" scope, so these three builds were overwriting each other's
+      # cache blobs on every run instead of accumulating a per-image cache —
+      # the main source of poor Docker cache hit-rate here.
       - name: Build Go API image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
           context: .
           file: services/api/Dockerfile
           push: false
           tags: trident-go-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=go-api
+          cache-to: type=gha,mode=max,scope=go-api
 
       - name: Build Rust gRPC API image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
           context: .
           file: crates/api/Dockerfile
           push: false
           tags: trident-grpc-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=grpc-api
+          cache-to: type=gha,mode=max,scope=grpc-api
 
       - name: Build Rust indexer image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
           context: .
           file: crates/indexer/Dockerfile
           push: false
           tags: trident-indexer:ci
+          cache-from: type=gha,scope=indexer
+          cache-to: type=gha,mode=max,scope=indexer
+
+      - name: Build database migration image
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: database/Dockerfile
+          push: false
+          tags: trident-migrate:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -355,42 +496,42 @@ jobs:
     needs: [rust, go, typescript, docker]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
 
       # Restore the layer cache written by the docker job above so that
       # `docker compose build` below is a no-op cache hit.
       - name: Restore Go API image cache
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
           context: .
           file: services/api/Dockerfile
           push: false
           tags: trident-go-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=go-api
+          cache-to: type=gha,mode=max,scope=go-api
 
       - name: Restore Rust gRPC API image cache
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
           context: .
           file: crates/api/Dockerfile
           push: false
           tags: trident-grpc-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=grpc-api
+          cache-to: type=gha,mode=max,scope=grpc-api
 
       - name: Restore Rust indexer image cache
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
           context: .
           file: crates/indexer/Dockerfile
           push: false
           tags: trident-indexer:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=indexer
+          cache-to: type=gha,mode=max,scope=indexer
 
       - name: Build full stack images
         run: |
@@ -484,16 +625,276 @@ jobs:
             down -v --remove-orphans
 
   # ---------------------------------------------------------------------------
+  # E2E contract events — deploy a real contract, emit an event, assert it is
+  # indexed (issue #268).
+  #
+  # Unlike the `e2e` smoke test above (which only checks response shape), this
+  # job proves the actual pipeline: on-chain event -> indexer -> DB -> API.
+  #
+  #   1. Start a local Soroban network (stellar/quickstart, standalone mode).
+  #   2. Deploy the reference token contract (issue #258), initialize it, and
+  #      mint to a second account — mint publishes a decodable SEP-41 event.
+  #   3. Start the full stack pointed at the local network instead of testnet.
+  #   4. Poll GET /v1/events until the mint event appears, and assert its
+  #      decoded topics/data match what was invoked.
+  #
+  # Runs as its own job (not part of `e2e`) so a slow local-network boot
+  # doesn't hold up the fast checks; `needs: [contracts, docker]` because it
+  # depends on both the contract WASM and the application images.
+  # ---------------------------------------------------------------------------
+  e2e-contract-events:
+    name: E2E contract events
+    runs-on: ubuntu-latest
+    needs: [contracts, docker]
+    env:
+      STELLAR_CLI_VERSION: "25.2.0"
+      LOCAL_RPC_URL: http://localhost:8000/rpc
+      LOCAL_NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        with:
+          targets: wasm32v1-none
+
+      # needs: [contracts, ...] above guarantees the contracts job (and its
+      # sccache writes) has already completed, so this reuses its compiled
+      # objects for the same token crate/target instead of rebuilding them.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          workspaces: contracts
+          shared-key: contracts-wasm
+
+      - name: Build the reference token contract
+        working-directory: contracts
+        run: cargo build --release --target wasm32v1-none -p token
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Install the stellar CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin stellar
+          stellar --version
+
+      - name: Start local Soroban network
+        run: |
+          docker run -d --name stellar-quickstart -p 8000:8000 \
+            stellar/quickstart:testing --local --enable rpc,horizon
+
+      - name: Wait for the local network to become healthy
+        run: |
+          echo "Waiting for $LOCAL_RPC_URL to report healthy..."
+          for i in $(seq 1 60); do
+            if curl -sSf -X POST "$LOCAL_RPC_URL" \
+                -H 'Content-Type: application/json' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+                | grep -q '"status":"healthy"'; then
+              echo "Local network is healthy."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Local network did not become healthy in time." >&2
+          docker logs stellar-quickstart || true
+          exit 1
+
+      - name: Wait for friendbot to become available
+        run: |
+          echo "Waiting for friendbot to start funding accounts..."
+          for i in $(seq 1 60); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:8000/friendbot?addr=GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+            if [ "$status" = "200" ] || [ "$status" = "400" ]; then
+              echo "Friendbot is ready (status $status)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Friendbot did not become ready in time." >&2
+          docker logs stellar-quickstart || true
+          exit 1
+
+      - name: Deploy and invoke the reference token contract
+        id: deploy
+        run: |
+          set -euo pipefail
+          stellar network add local \
+            --rpc-url "$LOCAL_RPC_URL" \
+            --network-passphrase "$LOCAL_NETWORK_PASSPHRASE" \
+            || true
+
+          fund_with_retry() {
+            local key_name="$1"
+            stellar keys generate "$key_name" --network local
+            for i in $(seq 1 30); do
+              if stellar keys fund "$key_name" --network local; then
+                return 0
+              fi
+              echo "Funding $key_name failed (attempt $i/30), retrying..." >&2
+              sleep 2
+            done
+            echo "Failed to fund $key_name after retries." >&2
+            return 1
+          }
+
+          fund_with_retry admin
+          fund_with_retry recipient
+          ADMIN_ADDR=$(stellar keys address admin)
+          RECIPIENT_ADDR=$(stellar keys address recipient)
+
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm contracts/target/wasm32v1-none/release/token.wasm \
+            --source admin \
+            --network local)
+          echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+
+          stellar contract invoke \
+            --id "$CONTRACT_ID" --source admin --network local \
+            -- initialize --admin "$ADMIN_ADDR" --decimals 7 \
+                --name "E2E Token" --symbol E2E
+
+          # The mint call is what the E2E assertion below waits for: it
+          # publishes a `mint` event with topics (admin, recipient) and an
+          # i128 amount body, decoded by
+          # crates/indexer/src/parser/token_events.rs.
+          stellar contract invoke \
+            --id "$CONTRACT_ID" --source admin --network local \
+            -- mint --to "$RECIPIENT_ADDR" --amount 4200000
+
+          echo "recipient_addr=$RECIPIENT_ADDR" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+      - name: Restore Go API image cache
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: services/api/Dockerfile
+          push: false
+          tags: trident-go-api:ci
+          cache-from: type=gha,scope=go-api
+
+      - name: Restore Rust gRPC API image cache
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: crates/api/Dockerfile
+          push: false
+          tags: trident-grpc-api:ci
+          cache-from: type=gha,scope=grpc-api
+
+      - name: Restore Rust indexer image cache
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: crates/indexer/Dockerfile
+          push: false
+          tags: trident-indexer:ci
+          cache-from: type=gha,scope=indexer
+
+      - name: Start the full stack against the local network
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            up -d --build
+
+      - name: Wait for Go API to become healthy
+        run: |
+          curl --silent --fail --retry 20 --retry-delay 5 --retry-connrefused \
+            --max-time 10 http://localhost:3000/v1/health
+
+      - name: Poll /v1/events for the decoded mint event
+        env:
+          CI_API_KEY: ci-test-api-key-do-not-use-in-production
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          RECIPIENT_ADDR: ${{ steps.deploy.outputs.recipient_addr }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for the mint event to be indexed (contract $CONTRACT_ID)..."
+          for i in $(seq 1 30); do
+            RESPONSE=$(curl -sS --fail \
+              -H "X-API-Key: ${CI_API_KEY}" \
+              "http://localhost:3000/v1/events?contractId=${CONTRACT_ID}&limit=10") || RESPONSE=""
+
+            if echo "$RESPONSE" | python3 .github/scripts/assert_mint_event.py "$RECIPIENT_ADDR"; then
+              echo "✓ mint event indexed and decoded correctly"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Mint event was not indexed within the bounded wait." >&2
+          exit 1
+
+      - name: Dump service logs
+        if: always()
+        run: |
+          echo "=== quickstart logs ==="
+          docker logs stellar-quickstart || true
+          echo "=== docker compose ps ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            ps
+          echo "=== Service logs ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            logs --no-color --timestamps
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            down -v --remove-orphans
+          docker rm -f stellar-quickstart || true
+
+  # ---------------------------------------------------------------------------
+  # Environment reference — fails if code reads an env var undocumented in
+  # docs/ENVIRONMENT.md (issue #312).
+  # ---------------------------------------------------------------------------
+  env-reference:
+    name: Env reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Check every env var the code reads is documented
+        run: bash scripts/check-env-reference.sh
+
+  # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
   helm:
     name: Helm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
         with:
           version: "3.14.0"
 
@@ -504,7 +905,7 @@ jobs:
         run: helm template trident helm/trident
 
       - name: Create kind cluster
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@v1.10.0
         with:
           cluster_name: trident-ci
 

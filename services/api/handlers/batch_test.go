@@ -161,6 +161,23 @@ func TestBatchGetEvents_EmptyMissingIsArray(t *testing.T) {
 	}
 }
 
+func TestBatchGetEvents_EmptyIDs(t *testing.T) {
+	handlers.SetEventsClient(&MockEventsClient{})
+
+	w := httptest.NewRecorder()
+	handlers.BatchGetEvents(w, batchPost(map[string]any{"ids": []string{}}))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&body)
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["code"] != "INVALID_ARGUMENT" {
+		t.Errorf("expected INVALID_ARGUMENT, got: %v", body)
+	}
+}
+
 func TestBatchGetEvents_PreservesRequestOrder(t *testing.T) {
 	handlers.SetEventsClient(&MockEventsClient{
 		GetEventFunc: func(_ context.Context, req *gen.GetEventRequest) (*gen.Event, error) {

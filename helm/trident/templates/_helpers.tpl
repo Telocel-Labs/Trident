@@ -56,3 +56,30 @@ imagePullSecrets:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- end }}
+
+{{/*
+Pod-level securityContext (issue #304): runs as the given non-root UID with
+a restricted seccomp profile. Usage:
+  {{ include "trident.podSecurityContext" (dict "uid" 1001) }}
+*/}}
+{{- define "trident.podSecurityContext" -}}
+runAsNonRoot: true
+runAsUser: {{ .uid }}
+runAsGroup: {{ .uid }}
+fsGroup: {{ .uid }}
+seccompProfile:
+  type: RuntimeDefault
+{{- end }}
+
+{{/*
+Container-level securityContext (issue #304): read-only rootfs, no privilege
+escalation, every Linux capability dropped. Same for every component — none
+of them need any capability or a writable root filesystem (writable scratch
+space, where needed, is mounted as an emptyDir at the call site).
+*/}}
+{{- define "trident.containerSecurityContext" -}}
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+capabilities:
+  drop: ["ALL"]
+{{- end }}

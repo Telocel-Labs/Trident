@@ -1,0 +1,156 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeSlider is a deterministic in-memory stand-in for the Redis sliding
+// window, keyed exactly like redisSlider, so tests don't need a live Redis.
+func fakeSlider(t *testing.T) func(ctx context.Context, key string, limit, windowMs int64) (bool, int64, error) {
+	t.Helper()
+	var mu sync.Mutex
+	counts := map[string]int64{}
+	return func(_ context.Context, key string, limit, _ int64) (bool, int64, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		counts[key]++
+		if counts[key] > limit {
+			return false, counts[key], nil
+		}
+		return true, counts[key], nil
+	}
+}
+
+func TestPerIPRateLimit_ExceedingIPBlocked_OtherIPUnaffected(t *testing.T) {
+	handler := PerIPRateLimit(PerIPRateLimitConfig{
+		RPS:      2,
+		Window:   time.Second,
+		SliderFn: fakeSlider(t),
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	do := func(ip string) int {
+		req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+		req.RemoteAddr = ip + ":12345"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// IP A: first two requests allowed, third rejected.
+	if code := do("1.2.3.4"); code != http.StatusOK {
+		t.Fatalf("request 1 for IP A: expected 200, got %d", code)
+	}
+	if code := do("1.2.3.4"); code != http.StatusOK {
+		t.Fatalf("request 2 for IP A: expected 200, got %d", code)
+	}
+	if code := do("1.2.3.4"); code != http.StatusTooManyRequests {
+		t.Fatalf("request 3 for IP A: expected 429, got %d", code)
+	}
+
+	// IP B is a distinct bucket and is unaffected by IP A's limit.
+	if code := do("5.6.7.8"); code != http.StatusOK {
+		t.Fatalf("request 1 for IP B: expected 200, got %d", code)
+	}
+}
+
+func TestPerIPRateLimit_NonPublicPath_Skipped(t *testing.T) {
+	handler := PerIPRateLimit(PerIPRateLimitConfig{
+		RPS:      0, // would reject request 1 if applied
+		Window:   time.Second,
+		SliderFn: fakeSlider(t),
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "1.2.3.4:1"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected /metrics to bypass the per-IP limiter, got %d", rec.Code)
+	}
+}
+
+func TestTrustedClientIP_UntrustedByDefault(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.RemoteAddr = "9.9.9.9:5555"
+	req.Header.Set("X-Forwarded-For", "1.1.1.1, 2.2.2.2")
+
+	if ip := trustedClientIP(req, false); ip != "9.9.9.9" {
+		t.Fatalf("expected RemoteAddr host 9.9.9.9 when proxy headers are untrusted, got %q", ip)
+	}
+}
+
+func TestTrustedClientIP_TrustsLastHopOnly(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.RemoteAddr = "9.9.9.9:5555"
+	req.Header.Set("X-Forwarded-For", "1.1.1.1, 2.2.2.2")
+
+	// Only the last entry (the one the trusted proxy itself appended) is used.
+	if ip := trustedClientIP(req, true); ip != "2.2.2.2" {
+		t.Fatalf("expected last XFF hop 2.2.2.2, got %q", ip)
+	}
+}
+
+func TestGlobalConcurrencyLimit_ShedsLoadUnderConcurrency(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 10)
+
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := GlobalConcurrencyLimit(2)(slow)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+
+	// Wait for at most 2 to actually start executing (the ones that got past
+	// the cap), then release them.
+	for i := 0; i < 2; i++ {
+		<-started
+	}
+	// Give the other two goroutines a moment to hit the cap and be rejected
+	// before we release the in-flight ones.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	var okCount, shedCount int
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			okCount++
+		case http.StatusServiceUnavailable:
+			shedCount++
+		default:
+			t.Fatalf("unexpected status code %d", c)
+		}
+	}
+	if okCount != 2 {
+		t.Fatalf("expected exactly 2 requests to pass through the cap of 2, got %d", okCount)
+	}
+	if shedCount != 2 {
+		t.Fatalf("expected exactly 2 requests to be shed, got %d", shedCount)
+	}
+}

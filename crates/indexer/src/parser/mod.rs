@@ -23,9 +23,11 @@ use crate::rpc::RawEvent;
 
 pub mod invocation_metrics;
 pub mod nft_events;
+pub mod sac;
 pub mod token_events;
 
 use nft_events::NftEvent;
+use sac::SacRegistry;
 use token_events::TokenEvent;
 
 /// A normalised event together with its optional typed projections.
@@ -41,11 +43,25 @@ pub struct ParsedEvent {
 
 pub struct Parser {
     pub index_diagnostic: bool,
+    /// Tracked SAC contract id -> asset context lookup (issue #262). Empty
+    /// when no assets are configured; every contract then decodes with no
+    /// asset context, same as before this feature existed.
+    sac_registry: SacRegistry,
 }
 
 impl Parser {
     pub fn new(index_diagnostic: bool) -> Self {
-        Self { index_diagnostic }
+        Self {
+            index_diagnostic,
+            sac_registry: SacRegistry::default(),
+        }
+    }
+
+    /// Attach a pre-built SAC registry (issue #262). Kept separate from `new`
+    /// so callers that don't track any assets pay no extra setup cost.
+    pub fn with_sac_registry(mut self, sac_registry: SacRegistry) -> Self {
+        self.sac_registry = sac_registry;
+        self
     }
 
     /// Decode a raw RPC event into a normalised `SorobanEvent` plus, when the
@@ -85,7 +101,16 @@ impl Parser {
             (scval_to_json(&val), val)
         };
 
-        let token = token_events::decode_token_event(&topic_vals, &data_val);
+        // Attach asset context when the emitting contract is a recognised SAC
+        // instance (issue #262). Any token-interface contract is eligible for
+        // typed projection; only known SACs also carry asset_code/issuer.
+        let token = token_events::decode_token_event(&topic_vals, &data_val).map(|mut event| {
+            if let Some((code, issuer)) = self.sac_registry.lookup(&contract_id) {
+                event.asset_code = Some(code.to_string());
+                event.asset_issuer = Some(issuer.to_string());
+            }
+            event
+        });
         let nft = nft_events::decode_nft_event(&topic_vals, &data_val);
 
         let ledger_sequence: u64 = raw
@@ -161,14 +186,20 @@ pub fn scval_to_string(val: &ScVal) -> String {
             let val = ((parts.hi as i128) << 64) | (parts.lo as i128);
             val.to_string()
         }
-        ScVal::U256(parts) => format!(
-            "u256({:x}{:x}{:x}{:x})",
-            parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo
-        ),
-        ScVal::I256(parts) => format!(
-            "i256({:x}{:x}{:x}{:x})",
-            parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo
-        ),
+        ScVal::U256(parts) => {
+            let val = ((parts.hi_hi as u128) << 96)
+                | ((parts.hi_lo as u128) << 64)
+                | ((parts.lo_hi as u128) << 32)
+                | (parts.lo_lo as u128);
+            val.to_string()
+        }
+        ScVal::I256(parts) => {
+            let val = ((parts.hi_hi as i128) << 96)
+                | ((parts.hi_lo as i128) << 64)
+                | ((parts.lo_hi as i128) << 32)
+                | (parts.lo_lo as i128);
+            val.to_string()
+        }
         ScVal::Bytes(b) => hex::encode(b.as_slice()),
         ScVal::Address(addr) => scaddress_to_string(addr),
         // For complex types in topic position, fall back to debug representation
@@ -204,6 +235,20 @@ pub fn scval_to_json(val: &ScVal) -> Json {
                 Json::String(v.to_string())
             }
         }
+        ScVal::U256(parts) => {
+            let val = ((parts.hi_hi as u128) << 96)
+                | ((parts.hi_lo as u128) << 64)
+                | ((parts.lo_hi as u128) << 32)
+                | (parts.lo_lo as u128);
+            Json::String(val.to_string())
+        }
+        ScVal::I256(parts) => {
+            let val = ((parts.hi_hi as i128) << 96)
+                | ((parts.hi_lo as i128) << 64)
+                | ((parts.lo_hi as i128) << 32)
+                | (parts.lo_lo as i128);
+            Json::String(val.to_string())
+        }
         ScVal::Bytes(b) => Json::String(hex::encode(b.as_slice())),
         ScVal::Address(addr) => Json::String(scaddress_to_string(addr)),
         ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
@@ -238,10 +283,10 @@ pub(crate) fn scaddress_to_string(addr: &ScAddress) -> String {
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use stellar_xdr::curr::{
-        AccountId, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress, ScMap,
-        ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
-    };
+        use stellar_xdr::curr::{
+            AccountId, ContractId, Hash, Int128Parts, Int256Parts, Limited, Limits, PublicKey,
+            ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+        };
 
     use crate::rpc::RawEvent;
 
@@ -447,6 +492,70 @@ mod tests {
     }
 
     #[test]
+    fn large_i128_decoded_as_json_string() {
+        let v = ScVal::I128(Int128Parts {
+            hi: (170141183460469763414537442822368085504i128 >> 64) as i64,
+            lo: 1,
+        });
+
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert!(
+            event.data.is_string(),
+            "large i128 must be a JSON string, got: {event}"
+        );
+        assert_eq!(
+            event.data.as_str().unwrap(),
+            "170141183460469763414537442822368085505",
+            "exact decimal string must survive round-trip XDR -> JSON"
+        );
+    }
+
+    #[test]
+    fn u256_decoded_as_decimal_string() {
+        let v = ScVal::U256(stellar_xdr::curr::UInt256Parts {
+            hi_hi: 0,
+            hi_lo: 0,
+            lo_hi: 0,
+            lo_lo: 1,
+        });
+
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert_eq!(event.data, serde_json::json!("1"), "u256(1) must encode as \"1\"");
+    }
+
+    #[test]
+    fn i256_decoded_as_decimal_string() {
+        let v = ScVal::I256(stellar_xdr::curr::Int256Parts {
+            hi_hi: 0,
+            hi_lo: 0,
+            lo_hi: 0,
+            lo_lo: -1i32,
+        });
+
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert_eq!(event.data, serde_json::json!("-1"), "i256(-1) must encode as \"-1\"");
+    }
+
+    #[test]
+    fn small_i128_remains_json_number() {
+        let v = ScVal::I128(Int128Parts { hi: 0, lo: 123 });
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert!(
+            event.data.is_number(),
+            "small i128 that fits in i64 should remain a JSON number: {event}",
+        );
+        assert_eq!(event.data, serde_json::json!(123));
+    }
+
+    #[test]
     fn contract_address_topic_decoded_to_strkey() {
         let contract_hash = [0xABu8; 32];
         let addr = ScVal::Address(ScAddress::Contract(ContractId(Hash(contract_hash))));
@@ -475,5 +584,131 @@ mod tests {
             56,
             "contract strkey must be 56 chars"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SAC asset context (issue #262)
+    //
+    // The fixture JSON carries topics/data/expected exactly like the plain
+    // token_events fixtures; the tracked asset's SAC contract id is derived at
+    // test time (rather than hardcoded) and used as the fixture event's
+    // contract_id, so the test stays correct regardless of the exact strkey
+    // the derivation produces.
+    // -----------------------------------------------------------------------
+
+    const TEST_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+    #[test]
+    fn sac_transfer_fixture_gets_asset_context_attached() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/token_events/sac_transfer.json"
+        ))
+        .expect("fixture JSON");
+
+        let asset_code = fixture["asset_code"].as_str().unwrap();
+        let asset_issuer = fixture["asset_issuer"].as_str().unwrap();
+        let contract_id =
+            sac::derive_sac_contract_id(asset_code, asset_issuer, TEST_PASSPHRASE).unwrap();
+
+        let registry = SacRegistry::build(
+            &[sac::TrackedAsset {
+                code: asset_code.to_string(),
+                issuer: asset_issuer.to_string(),
+            }],
+            TEST_PASSPHRASE,
+        )
+        .unwrap();
+
+        let topics: Vec<ScVal> = fixture["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| decode_scval(t.as_str().unwrap()).unwrap())
+            .collect();
+        let value = decode_scval(fixture["data"].as_str().unwrap()).unwrap();
+
+        let raw = make_event("contract", Some(&contract_id), topics, value, true);
+
+        let parser = Parser::new(false).with_sac_registry(registry);
+        let parsed = parser.parse_event_with_projection(&raw).unwrap().unwrap();
+        let token = parsed.token.expect("transfer must produce a projection");
+
+        let expected = &fixture["expected"];
+        assert_eq!(token.amount.as_deref(), expected["amount"].as_str());
+        assert_eq!(token.asset_code.as_deref(), Some(asset_code));
+        assert_eq!(token.asset_issuer.as_deref(), Some(asset_issuer));
+    }
+
+    #[test]
+    fn sac_transfer_from_an_untracked_contract_gets_no_asset_context() {
+        // Same event shape as sac_transfer.json, but the contract_id is an
+        // arbitrary contract not present in the SAC registry — this must not
+        // be misattributed to any tracked asset.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/token_events/sac_transfer_untracked.json"
+        ))
+        .expect("fixture JSON");
+
+        let registry = SacRegistry::build(
+            &[sac::TrackedAsset {
+                code: "USDC".to_string(),
+                issuer: "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M".to_string(),
+            }],
+            TEST_PASSPHRASE,
+        )
+        .unwrap();
+
+        let topics: Vec<ScVal> = fixture["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| decode_scval(t.as_str().unwrap()).unwrap())
+            .collect();
+        let value = decode_scval(fixture["data"].as_str().unwrap()).unwrap();
+
+        let raw = make_event(
+            "contract",
+            Some("CARBITRARYUNRELATEDCONTRACTNOTINREGISTRY"),
+            topics,
+            value,
+            true,
+        );
+
+        let parser = Parser::new(false).with_sac_registry(registry);
+        let parsed = parser.parse_event_with_projection(&raw).unwrap().unwrap();
+        let token = parsed
+            .token
+            .expect("transfer must still produce a projection");
+
+        assert!(token.asset_code.is_none());
+        assert!(token.asset_issuer.is_none());
+    }
+
+    #[test]
+    fn parser_with_no_sac_registry_attaches_no_asset_context() {
+        // Default Parser::new (no with_sac_registry call) must behave exactly
+        // as before this feature existed.
+        let from = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])),
+        )));
+        let to = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])),
+        )));
+        let amount = ScVal::I128(Int128Parts { hi: 0, lo: 42 });
+        let raw = make_event(
+            "contract",
+            Some("CANYCONTRACT"),
+            vec![sym("transfer"), from, to],
+            amount,
+            true,
+        );
+
+        let parsed = Parser::new(false)
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap();
+        let token = parsed.token.expect("transfer must produce a projection");
+        assert!(token.asset_code.is_none());
+        assert!(token.asset_issuer.is_none());
     }
 }

@@ -1,0 +1,157 @@
+name: Security Scan
+
+# SBOM generation + container/dependency vulnerability scanning (issue #311).
+# Complements pinning (#303) and secrets scanning (secrets-scan.yml). Gated
+# on a severity threshold — see docs/security-triage.md for the allowlist
+# and triage process for findings.
+#
+# Third-party actions below are pinned to a release tag rather than a
+# commit SHA (unlike the rest of this repo's workflows) — verifying and
+# recording the correct SHA for each requires an authenticated network
+# lookup this change was authored without; pin these to SHA as a follow-up
+# rather than risk recording an incorrect/unverified commit.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  schedule:
+    # Catch newly-disclosed CVEs in already-merged code, not just at PR time.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: security-scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # SBOM + image scan — one job per image so a failure in one doesn't hide
+  # the others' results, matching the `docker` job's per-image build split
+  # in ci.yml.
+  # ---------------------------------------------------------------------------
+  image-scan:
+    name: SBOM + scan (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: go-api
+            dockerfile: services/api/Dockerfile
+            tag: trident-go-api:scan
+          - name: grpc-api
+            dockerfile: crates/api/Dockerfile
+            tag: trident-grpc-api:scan
+          - name: indexer
+            dockerfile: crates/indexer/Dockerfile
+            tag: trident-indexer:scan
+          - name: migrate
+            dockerfile: database/Dockerfile
+            tag: trident-migrate:scan
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+      - name: Build image (loaded locally for scanning, not pushed)
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ matrix.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ matrix.tag }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.name }}.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6a1 # v4.4.0
+        with:
+          name: sbom-${{ matrix.name }}
+          path: sbom-${{ matrix.name }}.spdx.json
+          retention-days: 90
+
+      - name: Scan image for vulnerabilities (trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.tag }}
+          format: table
+          # Only fixable HIGH/CRITICAL findings fail the build — an
+          # unfixable base-image CVE with no available patch would
+          # otherwise permanently block CI (documented in the triage doc).
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true
+          exit-code: "1"
+          trivyignores: .trivyignore
+
+  # ---------------------------------------------------------------------------
+  # Dependency vulnerability audits — one step per ecosystem actually
+  # present in this repo (Rust workspace, the two standalone Go modules,
+  # the three npm packages, the Python SDK).
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+
+      - name: cargo audit (Rust workspace)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.25"
+
+      - name: govulncheck (services/api)
+        uses: golang/govulncheck-action@v1
+        with:
+          work-dir: services/api
+
+      - name: govulncheck (sdk/go)
+        uses: golang/govulncheck-action@v1
+        with:
+          work-dir: sdk/go
+
+      - name: Set up Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+
+      - name: npm audit (explorer)
+        working-directory: explorer
+        run: npm audit --audit-level=high
+        continue-on-error: false
+
+      - name: npm audit (sdk/typescript)
+        working-directory: sdk/typescript
+        run: npm audit --audit-level=high
+
+      - name: npm audit (sdk/react)
+        working-directory: sdk/react
+        run: npm audit --audit-level=high
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: "3.12"
+
+      - name: pip-audit (sdk/python)
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: sdk/python/pyproject.toml

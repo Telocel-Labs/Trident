@@ -8,6 +8,11 @@ pub enum TridentError {
     #[error("Unauthorized: invalid or missing API key")]
     Unauthorized,
 
+    #[error(
+        "API key is required; set TridentConfig.api_key or the TRIDENT_API_KEY environment variable"
+    )]
+    MissingApiKey,
+
     #[error("Not found")]
     NotFound,
 
@@ -22,4 +27,11 @@ pub enum TridentError {
 
     #[error("Deserialization error: {0}")]
     Deserialize(#[from] serde_json::Error),
+
+    #[error("request failed after {attempts} attempts: {last_error}")]
+    RetryExhausted {
+        attempts: u32,
+        #[source]
+        last_error: Box<TridentError>,
+    },
 }

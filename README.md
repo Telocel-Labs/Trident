@@ -106,6 +106,14 @@ Full historical event storage with no enforced retention limit, so a query again
 
 ---
 
+## Reference Contracts
+
+`contracts/` holds a minimal SEP-41 token contract plus build/deploy/invoke
+scripts (local quickstart and testnet) used for local demos and E2E testing.
+See [`contracts/README.md`](./contracts/README.md).
+
+---
+
 ## Production Deployment
 
 Trident ships a docker-compose overlay for production that terminates TLS at nginx and hides the API port from the host.

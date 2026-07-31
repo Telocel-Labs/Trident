@@ -96,7 +96,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let events_service = services::events::EventsServiceImpl::new(db_pool, redis_manager);
 
-    tonic::transport::Server::builder()
+    let mut server_builder = tonic::transport::Server::builder();
+
+    if let Some(mtls) = &cfg.mtls {
+        // mTLS behind a flag (issue #320): require and verify a client
+        // certificate signed by GRPC_MTLS_CA_CERT before accepting any RPC.
+        // Cert/key files are mounted from a Kubernetes Secret, never baked
+        // into the image — see docs/kubernetes.md#internal-mtls.
+        let cert = std::fs::read(&mtls.server_cert_path)?;
+        let key = std::fs::read(&mtls.server_key_path)?;
+        let ca = std::fs::read(&mtls.ca_cert_path)?;
+
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+        let client_ca = tonic::transport::Certificate::from_pem(ca);
+        let tls_config = tonic::transport::ServerTlsConfig::new()
+            .identity(identity)
+            .client_ca_root(client_ca);
+
+        server_builder = server_builder.tls_config(tls_config)?;
+        tracing::info!("internal gRPC mTLS enabled (GRPC_MTLS_ENABLED=true)");
+    } else {
+        tracing::info!("internal gRPC mTLS disabled — plaintext within the cluster network");
+    }
+
+    server_builder
         .add_service(trident::events_server::EventsServer::new(events_service))
         .serve(addr)
         .await?;
