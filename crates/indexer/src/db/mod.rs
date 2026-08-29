@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -37,8 +37,8 @@ const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
 
 /// Derive a deterministic UUID for an event from its natural key.
 /// Using the same inputs will always produce the same UUID, so duplicate
-/// events produce the same (ledger_sequence, id) pair and `ON CONFLICT
-/// (ledger_sequence, id) DO NOTHING` fires.
+/// events produce the same (ledger_sequence, id) pair and the insert's
+/// `ON CONFLICT DO NOTHING` absorbs the replay.
 fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid {
     let key = format!("{contract_id}:{ledger_sequence}:{event_index}");
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
@@ -165,16 +165,36 @@ impl EventColumns {
 
 /// Insert a batch of events in a single statement (issue #199).
 ///
-/// One round-trip per batch instead of one per row. Duplicate handling is
-/// unchanged in spirit: the deterministic UUIDv5 id plus `ON CONFLICT
-/// (ledger_sequence, id) DO NOTHING` means a replayed page inserts nothing
-/// new. The target is the full (ledger_sequence, id) pair, not just id, since
-/// migration 0017 made soroban_events RANGE-partitioned by ledger_sequence —
-/// PostgreSQL requires every unique constraint on a partitioned table to
-/// include the partition key, so a single-column PK on id alone no longer
-/// exists to match against. ledger_sequence is itself part of the input
-/// event_uuid() derives id from, so a replayed page always reproduces the
-/// same (ledger_sequence, id) pair — the idempotency guarantee is unchanged.
+/// One round-trip per batch instead of one per row. A replayed page inserts
+/// nothing new: the deterministic UUIDv5 id reproduces the same
+/// (ledger_sequence, id) pair, and `ON CONFLICT DO NOTHING` absorbs it.
+///
+/// The conflict clause is deliberately **untargeted** (issue #418).
+/// `soroban_events` carries two unique constraints:
+///
+///   1. `PRIMARY KEY (ledger_sequence, id)` — from migration 0017, which made
+///      the table RANGE-partitioned by ledger_sequence. PostgreSQL requires
+///      every unique constraint on a partitioned table to include the
+///      partition key, so a single-column PK on id alone no longer exists.
+///   2. `uq_soroban_events_tx_index_network
+///      (ledger_sequence, transaction_hash, event_index, network)` — from
+///      migration 0025, mirroring the protocol guarantee that a
+///      (transaction_hash, event_index) pair identifies exactly one event.
+///
+/// A targeted `ON CONFLICT (ledger_sequence, id)` only guards the first. That
+/// is enough for a single writer replaying its own page, but not for two
+/// indexer replicas committing the same page concurrently: the second writer's
+/// rows collide on the natural key, which the targeted clause does not absorb,
+/// and the whole batch fails with a unique-violation error rather than being
+/// silently ignored. In production that aborts a poll cycle during any rollout
+/// overlap or double deploy. Caught by
+/// `concurrent_indexers_persist_each_event_exactly_once`.
+///
+/// Untargeted `DO NOTHING` covers both constraints. It does not weaken the
+/// safety net migration 0025 describes: a genuine id-derivation bug still
+/// cannot write a duplicate row, it is simply dropped rather than raised. The
+/// natural-key constraint remains as the enforcement point, and 0025's
+/// pre-flight duplicate check still runs against existing data.
 pub async fn insert_events_batch<'e, E>(
     executor: E,
     events: &[SorobanEvent],
@@ -197,7 +217,7 @@ where
             $1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[], $5::text[],
             $6::int[], $7::text[], $8::jsonb[], $9::jsonb[]
         )
-        ON CONFLICT (ledger_sequence, id) DO NOTHING
+        ON CONFLICT DO NOTHING
         "#,
     )
     .bind(&cols.ids)
@@ -622,13 +642,38 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     }
 
     if let Some(cursor) = commit.cursor {
+        // Monotonic cursor advance (issue #418). Two indexer replicas — by
+        // deliberate scale-out or an accidental double deploy mid-rollout —
+        // can commit overlapping pages concurrently. An unconditional
+        // `SET value = $1` lets the slower writer's older cursor land last and
+        // rewind the cursor behind data that is already committed, so the
+        // replicas re-poll a range they have both already indexed.
+        //
+        // The `WHERE ... < $1` guard makes the advance a no-op when the stored
+        // cursor is already at or ahead of this page: the row is only written
+        // when it genuinely moves forward. The comparison is numeric, not the
+        // lexicographic ordering the TEXT column would otherwise give ("9" >
+        // "10"), so it stays correct across digit-count boundaries.
+        //
+        // `UPDATE` takes a row lock, so concurrent advances on this single row
+        // serialise: the second transaction blocks until the first commits,
+        // then re-evaluates the guard against the committed value rather than
+        // the snapshot it started with.
         sqlx::query(
-            "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+            r#"
+            UPDATE system_state
+            SET value = $1, updated_at = NOW()
+            WHERE key = 'latest_ledger_cursor'
+              AND (value ~ '^[0-9]+$' IS NOT TRUE OR value::numeric < $2)
+            "#,
         )
         .bind(cursor.to_string())
+        .bind(cursor as i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page set_cursor")))?;
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("commit_page set_cursor"))
+        })?;
     }
 
     if let Some(ledger) = commit.ledger {
@@ -710,24 +755,31 @@ pub async fn update_health_stats(
     Ok(())
 }
 
-/// Load all contract IDs from `indexed_contracts` for the given network (or
-/// network-agnostic rows where `network IS NULL`).
+/// Load all contract IDs and their `index_from` values from
+/// `indexed_contracts` for the given network (or network-agnostic rows where
+/// `network IS NULL`).
 ///
-/// Returns an empty set if the table has no rows — the caller treats an empty
-/// set as "index all contracts" (issue #47).
+/// Returns an empty map if the table has no rows — the caller treats an empty
+/// map as "index all contracts" (issue #47).
+///
+/// `index_from` (BIGINT, default 0, added in 0001_init.sql) is the first
+/// ledger from which events for that contract should be indexed. Events below
+/// it are skipped client-side, because `getEvents` carries a single
+/// `startLedger` for the whole request and so cannot express a per-contract
+/// boundary (issue #202).
 pub async fn load_indexed_contracts(
     pool: &PgPool,
     network: &str,
-) -> Result<HashSet<String>, TridentError> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT contract_id FROM indexed_contracts WHERE network = $1 OR network IS NULL",
+) -> Result<HashMap<String, i64>, TridentError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT contract_id, index_from FROM indexed_contracts WHERE network = $1 OR network IS NULL",
     )
     .bind(network)
     .fetch_all(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("load_indexed_contracts")))?;
 
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    Ok(rows.into_iter().collect())
 }
 
 /// Read alert state (last_alert_at, alert_fired) from system_state (issue #75).
@@ -742,6 +794,8 @@ pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertStat
     Ok(crate::alerting::AlertState {
         last_alert_at: row.0,
         alert_fired: row.1,
+        rpc_degraded_fired: false,
+        rpc_degraded_last_alert_at: None,
     })
 }
 
@@ -1144,6 +1198,262 @@ mod tests {
         sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
             .bind(&contract_id)
             .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Resolve the shared test database URL, honouring the same
+    /// skip-vs-hard-fail contract as the other integration tests here.
+    fn test_db_url(test_name: &str) -> Option<String> {
+        match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => Some(url),
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: {test_name} requires TEST_DATABASE_URL");
+                None
+            }
+        }
+    }
+
+    /// Two indexer replicas committing the SAME ledger range concurrently against
+    /// one database must produce exactly one row per event — no duplicates, no
+    /// lost events (issue #418).
+    ///
+    /// This is the deliberate-scale-out / double-deploy scenario: both writers
+    /// see the same RPC page and race to persist it. Exactly-once persistence
+    /// rests on the natural-key UNIQUE constraint (migration 0025) combined with
+    /// the ON CONFLICT DO NOTHING insert path.
+    ///
+    /// Note the integration job runs with `--test-threads=1`, so the concurrency
+    /// here comes from tokio tasks over independent pools inside the test, not
+    /// from the test harness running tests in parallel.
+    #[tokio::test]
+    async fn concurrent_indexers_persist_each_event_exactly_once() {
+        let Some(db_url) = test_db_url("concurrent_indexers_persist_each_event_exactly_once")
+        else {
+            return;
+        };
+
+        // Independent pools stand in for independent indexer processes: separate
+        // connections, separate transactions, no shared in-process state.
+        let pool_a = PgPool::connect(&db_url).await.unwrap();
+        let pool_b = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CCONC_{}", Uuid::new_v4());
+        const EVENT_COUNT: u32 = 50;
+        // Distinct transaction hashes, as real protocol events have: separate
+        // events come from separate transactions. `make_event` hardcodes one
+        // hash, which is fine for a single-ledger test but would make the
+        // natural key repeat across the ledgers this test spans.
+        let events: Vec<SorobanEvent> = (0..EVENT_COUNT)
+            .map(|i| {
+                let mut event = make_event(&contract_id, 1000 + u64::from(i) / 10, i);
+                event.transaction_hash = format!("txhash_conc_{i:04}");
+                event
+            })
+            .collect();
+
+        fn page(events: &[SorobanEvent], cursor: u64) -> PageCommit<'_> {
+            PageCommit {
+                events,
+                token_events: &[],
+                invocation_metrics: &[],
+                storage_snapshots: &[],
+                network: "testnet",
+                cursor: Some(cursor),
+                ledger: None,
+                batch_size: 10,
+            }
+        }
+
+        // Both replicas commit the identical page at the same time.
+        let events_a = events.clone();
+        let events_b = events.clone();
+        let (res_a, res_b) = tokio::join!(
+            tokio::spawn(async move { commit_page(&pool_a, page(&events_a, 1004)).await }),
+            tokio::spawn(async move { commit_page(&pool_b, page(&events_b, 1004)).await }),
+        );
+
+        res_a
+            .expect("replica A task panicked")
+            .expect("replica A commit failed");
+        res_b
+            .expect("replica B task panicked")
+            .expect("replica B commit failed");
+
+        let verify = PgPool::connect(&db_url).await.unwrap();
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&verify)
+                .await
+                .unwrap();
+        assert_eq!(
+            count.0,
+            i64::from(EVENT_COUNT),
+            "concurrent replicas must not lose or duplicate events"
+        );
+
+        // Explicitly assert the natural key is unique — a duplicate would show up
+        // here as a group with count > 1 even if the total happened to match.
+        let dupes: Vec<(i64, i32, i64)> = sqlx::query_as(
+            r#"
+            SELECT ledger_sequence, event_index, COUNT(*)
+            FROM soroban_events
+            WHERE contract_id = $1
+            GROUP BY ledger_sequence, event_index
+            HAVING COUNT(*) > 1
+            "#,
+        )
+        .bind(&contract_id)
+        .fetch_all(&verify)
+        .await
+        .unwrap();
+        assert!(
+            dupes.is_empty(),
+            "natural key (ledger_sequence, event_index) duplicated under concurrency: {dupes:?}"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&verify)
+            .await
+            .unwrap();
+    }
+
+    /// The cursor must never move backwards, even when a slower replica commits
+    /// an older page after a faster one has already advanced (issue #418).
+    ///
+    /// Without the monotonic guard in `commit_page` this is a lost-update race:
+    /// the stale writer's `SET value = $1` lands last and rewinds the cursor
+    /// behind data already committed.
+    #[tokio::test]
+    async fn cursor_never_rewinds_under_concurrent_writers() {
+        let Some(db_url) = test_db_url("cursor_never_rewinds_under_concurrent_writers") else {
+            return;
+        };
+
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Establish a known starting point.
+        sqlx::query("UPDATE system_state SET value = '5000' WHERE key = 'latest_ledger_cursor'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let contract_id = format!("CCURS_{}", Uuid::new_v4());
+        let ahead = [make_event(&contract_id, 5100, 0)];
+        let behind = [make_event(&contract_id, 5050, 1)];
+
+        fn page(events: &[SorobanEvent], cursor: u64) -> PageCommit<'_> {
+            PageCommit {
+                events,
+                token_events: &[],
+                invocation_metrics: &[],
+                storage_snapshots: &[],
+                network: "testnet",
+                cursor: Some(cursor),
+                ledger: None,
+                batch_size: 10,
+            }
+        }
+
+        // The faster replica advances to 5100 first.
+        commit_page(&pool, page(&ahead, 5100))
+            .await
+            .expect("advance commit failed");
+        assert_eq!(get_cursor(&pool).await.unwrap(), 5100);
+
+        // The slower replica now commits an older page. Its events must still
+        // land, but the cursor must hold at 5100.
+        commit_page(&pool, page(&behind, 5050))
+            .await
+            .expect("stale commit failed");
+
+        assert_eq!(
+            get_cursor(&pool).await.unwrap(),
+            5100,
+            "a stale replica must not rewind the cursor"
+        );
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 2, "a stale page's events must still be persisted");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Many writers racing to advance the cursor must converge on the highest
+    /// value, not on whichever transaction happened to commit last (issue #418).
+    #[tokio::test]
+    async fn concurrent_cursor_advances_converge_on_maximum() {
+        let Some(db_url) = test_db_url("concurrent_cursor_advances_converge_on_maximum") else {
+            return;
+        };
+
+        let setup = PgPool::connect(&db_url).await.unwrap();
+        sqlx::query("UPDATE system_state SET value = '0' WHERE key = 'latest_ledger_cursor'")
+            .execute(&setup)
+            .await
+            .unwrap();
+
+        let contract_id = format!("CRACE_{}", Uuid::new_v4());
+
+        // Interleave ascending and descending orders so the "last writer" is not
+        // the highest cursor: a lost-update bug lands on a low value here.
+        let cursors: Vec<u64> = (1..=12).map(|i| i * 100).rev().collect();
+
+        let mut handles = Vec::new();
+        for cursor in cursors {
+            let url = db_url.clone();
+            let contract = contract_id.clone();
+            handles.push(tokio::spawn(async move {
+                let pool = PgPool::connect(&url).await.unwrap();
+                let events = [make_event(&contract, cursor, 0)];
+                commit_page(
+                    &pool,
+                    PageCommit {
+                        events: &events,
+                        token_events: &[],
+                        invocation_metrics: &[],
+                        storage_snapshots: &[],
+                        network: "testnet",
+                        cursor: Some(cursor),
+                        ledger: None,
+                        batch_size: 10,
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .await
+                .expect("writer task panicked")
+                .expect("writer commit failed");
+        }
+
+        assert_eq!(
+            get_cursor(&setup).await.unwrap(),
+            1200,
+            "cursor must settle on the highest committed ledger, not the last writer"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&setup)
             .await
             .unwrap();
     }

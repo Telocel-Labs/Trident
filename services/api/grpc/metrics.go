@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 )
@@ -48,7 +49,11 @@ func metricsUnaryInterceptor(
 ) error {
 	start := time.Now()
 	err := invoker(ctx, method, req, reply, cc, opts...)
-	clientMetrics.record(method, status.Code(err).String(), time.Since(start))
+	elapsed := time.Since(start)
+	code := status.Code(err).String()
+	clientMetrics.record(method, code, elapsed)
+	metrics.GRPCClientRequestsTotal.WithLabelValues(method, code).Inc()
+	metrics.GRPCClientRequestDuration.WithLabelValues(method, code).Observe(elapsed.Seconds())
 	return err
 }
 

@@ -5,12 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
 )
+
+// contractSpecQueryTimeout bounds the DB call in ContractSpec so a runaway
+// query can't hold a pool connection for the request's full budget (issue
+// #238).
+const contractSpecQueryTimeout = 5 * time.Second
 
 // ContractSpecFunction is one function captured from a contract's parsed
 // spec (issue #260).
@@ -46,8 +52,11 @@ func ContractSpec(db SchemaRegistryDB) http.HandlerFunc {
 			return
 		}
 
+		ctx, cancel := context.WithTimeout(r.Context(), contractSpecQueryTimeout)
+		defer cancel()
+
 		network := middleware.NetworkFromContext(r.Context())
-		resp, err := loadContractSpec(r.Context(), db, contractID, network)
+		resp, err := loadContractSpec(ctx, db, contractID, network)
 		if errors.Is(err, pgx.ErrNoRows) {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "no spec recorded for this contract")
 			return

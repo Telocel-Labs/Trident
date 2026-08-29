@@ -1,0 +1,131 @@
+---
+title: "GraphQL Queries"
+description: "Example GraphQL queries for fetching Soroban events by contract, topic, and with pagination."
+---
+
+<Warning>
+**Pending #66.** These examples are based on the planned schema and will be verified against the live API once [issue #66](https://github.com/Telocel-Labs/Trident/issues/66) is merged.
+</Warning>
+
+## Events by contract
+
+```graphql
+query EventsByContract($contractId: String!, $first: Int, $after: String) {
+  events(contractId: $contractId, first: $first, after: $after) {
+    edges {
+      node {
+        id
+        ledgerSequence
+        ledgerTimestamp
+        transactionHash
+        eventIndex
+        eventType
+        topics
+        data
+      }
+      cursor
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+```
+
+**Variables:**
+
+```json
+{
+  "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  "first": 50
+}
+```
+
+---
+
+## Events by topic
+
+```graphql
+query TransferEvents($contractId: String!) {
+  events(contractId: $contractId, topic0: "transfer", first: 20) {
+    edges {
+      node {
+        id
+        ledgerSequence
+        transactionHash
+        topics
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+```
+
+---
+
+## Single event by ID
+
+```graphql
+query GetEvent($id: ID!) {
+  event(id: $id) {
+    id
+    contractId
+    ledgerSequence
+    ledgerTimestamp
+    transactionHash
+    eventType
+    topics
+    data
+    createdAt
+  }
+}
+```
+
+**Variables:**
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+---
+
+## Paginating all events
+
+```graphql
+query PaginateEvents($contractId: String!, $first: Int!, $after: String) {
+  events(contractId: $contractId, first: $first, after: $after) {
+    edges {
+      node {
+        id
+        ledgerSequence
+        transactionHash
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+```
+
+Iterate using `pageInfo.endCursor` as the `after` variable on subsequent requests until `pageInfo.hasNextPage` is `false`.
+
+---
+
+## Running queries
+
+```bash
+curl -X POST https://api.trident.telocel.com/graphql \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $TRIDENT_API_KEY" \
+  -d '{
+    "query": "query { events(contractId: \"CAAA...AD2KM\", first: 5) { edges { node { id ledgerSequence } } pageInfo { hasNextPage } } }"
+  }'
+```

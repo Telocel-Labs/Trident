@@ -16,7 +16,7 @@
 //!   #200). Redis delivery is owned by `redis_stream::relay`, so a crash
 //!   between the commit and the publish cannot drop an event.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
@@ -44,10 +44,15 @@ pub struct Streamer {
     rpc: RpcClient,
     parser: Parser,
     /// `None`  → index all contracts (empty `indexed_contracts` table).
-    /// `Some`  → allowlist; events from unlisted contracts are skipped.
-    contract_filter: Option<HashSet<String>>,
+    /// `Some`  → allowlist with per-contract `index_from` boundaries (issue
+    ///           #202); events from unlisted contracts, or from listed ones
+    ///           below their `index_from`, are skipped.
+    contract_filter: Option<HashMap<String, i64>>,
     /// Server-side `getEvents` filters derived from `contract_filter` (issue
-    /// #203). Rebuilt whenever the allowlist is reloaded.
+    /// #203). Rebuilt whenever the allowlist is reloaded. Only the contract
+    /// ids matter to the RPC — the per-contract `index_from` boundaries are
+    /// applied client-side, since `getEvents` has one `startLedger` for the
+    /// whole request.
     filter_plan: FilterPlan,
     /// Counts poll cycles so we know when to refresh the filter.
     poll_count: u32,
@@ -94,13 +99,11 @@ impl Streamer {
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
             },
-            config.rpc_failover_threshold,
-            config.rpc_endpoint_cooldown,
         )?;
         tracing::info!(
             endpoints = config.stellar_rpc_urls.len(),
             primary = %config.stellar_rpc_url,
-            "RPC endpoint pool configured"
+            "RPC endpoint pool configured with health scoring"
         );
         let sac_registry = crate::parser::sac::SacRegistry::build(
             &config.tracked_sac_assets,
@@ -147,20 +150,45 @@ impl Streamer {
     async fn load_filter(
         pool: &PgPool,
         network: &str,
-    ) -> Result<Option<HashSet<String>>, TridentError> {
-        let set = db::load_indexed_contracts(pool, network).await?;
-        if set.is_empty() {
+    ) -> Result<Option<HashMap<String, i64>>, TridentError> {
+        let map = db::load_indexed_contracts(pool, network).await?;
+        if map.is_empty() {
             Ok(None)
         } else {
-            tracing::info!(count = set.len(), "Contract allowlist loaded");
-            Ok(Some(set))
+            tracing::info!(count = map.len(), "Contract allowlist loaded");
+            Ok(Some(map))
         }
     }
 
     /// Reload the contract filter from DB. Called periodically inside `run`.
+    /// Detects newly-registered contracts with a historical `index_from` and
+    /// logs a backfill suggestion (issue #202).
     pub async fn refresh_contract_filter(&mut self) -> Result<(), TridentError> {
         match Self::load_filter(&self.db, &self.config.network).await {
             Ok(filter) => {
+                // Detect newly added contracts whose index_from is behind the
+                // current cursor, which means historical events are missing.
+                if let Some(ref new_map) = filter {
+                    if let Some(ref old_map) = self.contract_filter {
+                        let cursor = crate::db::get_cursor(&self.db).await.unwrap_or(0);
+                        for (id, &index_from) in new_map {
+                            if !old_map.contains_key(id)
+                                && index_from > 0
+                                && (index_from as u64) < cursor
+                            {
+                                tracing::warn!(
+                                    contract_id = id,
+                                    index_from = index_from,
+                                    cursor = cursor,
+                                    "Contract registered with historical index_from; \
+                                     enqueue a backfill for ledgers {}..{}",
+                                    index_from,
+                                    cursor - 1,
+                                );
+                            }
+                        }
+                    }
+                }
                 self.filter_plan = plan_filters(filter.as_ref(), &self.config.topic_filters);
                 self.contract_filter = filter;
                 Ok(())
@@ -184,7 +212,9 @@ impl Streamer {
             return;
         };
 
-        for contract_id in filter {
+        // Only the ids matter here — spec sync is per contract and unrelated
+        // to each contract's index_from boundary.
+        for contract_id in filter.into_keys() {
             match crate::spec::fetch_contract_spec(&self.rpc, &self.spec_cache, &contract_id).await
             {
                 Ok(Some(contract_spec)) => {
@@ -252,6 +282,12 @@ impl Streamer {
                 break;
             }
 
+            // Dead-man's-switch: ticks once per loop iteration regardless of
+            // poll outcome, so Prometheus can alert on a hung/crashed process
+            // even when lag itself still looks fine.
+            metrics::record_heartbeat();
+            metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
+
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
@@ -280,7 +316,30 @@ impl Streamer {
                             return Err(e);
                         }
                         Severity::Retryable => {
-                            tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                            // A fresh index anchors at ledger 1, but the RPC
+                            // prunes old ledgers, so on a network whose retained
+                            // window has moved past 1 every poll is rejected
+                            // identically and the cursor never advances —
+                            // retrying alone can never clear it (issue #388).
+                            // Adopt the floor the error reports so the next poll
+                            // starts inside the retained window.
+                            match parse_retained_floor(&e.to_string()) {
+                                Some(floor) if cursor < floor.saturating_sub(1) => {
+                                    // page_request_params sends `cursor + 1`, so
+                                    // store floor - 1 to make the next request
+                                    // anchor exactly at the oldest retained ledger.
+                                    cursor = floor.saturating_sub(1);
+                                    tracing::warn!(
+                                        error = %e,
+                                        retained_floor = floor,
+                                        cursor,
+                                        "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
+                                    );
+                                }
+                                _ => {
+                                    tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                                }
+                            }
                         }
                         Severity::Skip => {
                             tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
@@ -312,7 +371,7 @@ impl Streamer {
             }
         }
 
-        tracing::info!("Streamer stopped cleanly");
+        tracing::info!(cursor, "Streamer stopped cleanly; cursor persisted");
         Ok(())
     }
 
@@ -444,15 +503,44 @@ impl Streamer {
     /// Returns the total number of events processed in this cycle.
     async fn poll_once(&mut self, cursor: &mut u64) -> Result<usize, TridentError> {
         let poll_start = Instant::now();
+        // Cursor and lag as this cycle begins, so catch-up throughput can be
+        // measured over the cycle (issue #420). `last_chain_tip` is the tip
+        // observed by the previous cycle; the current cycle's first RPC page
+        // refreshes it, but the deficit we were working against is this one.
+        let cursor_at_start = *cursor;
+        let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
             .take(5);
 
         // The first page of a poll anchors by ledger (startLedger); every later
         // page in the same poll resumes via the RPC paging token. A fresh index
-        // (cursor 0) starts at ledger 1; a resume starts at the ledger after the
-        // last one we fully processed. startLedger and cursor are mutually
-        // exclusive in the Soroban RPC, so only one is ever sent per request.
+        // (cursor 0) starts at ledger 1 (or the minimum index_from across all
+        // tracked contracts, whichever is higher); a resume starts at the ledger
+        // after the last one we fully processed. startLedger and cursor are
+        // mutually exclusive in the Soroban RPC, so only one is ever sent per
+        // request.
+        //
+        // When per-contract index_from values are set, we compute an effective
+        // cursor so that the first startLedger respects the earliest index_from,
+        // avoiding unnecessary scanning of ledgers that will produce no events
+        // for any tracked contract (issue #202).
+        let effective_cursor = if *cursor == 0 {
+            match &self.contract_filter {
+                Some(filter) => {
+                    // index_from is a BIGINT and cursors are u64; clamp at 0 so
+                    // a negative or unset value cannot wrap on conversion.
+                    let min_from = filter.values().copied().min().unwrap_or(0).max(0) as u64;
+                    // Set effective_cursor to min_from - 1 so page_request_params
+                    // returns startLedger = min_from. Saturating so 0 and 1 both
+                    // yield 0 rather than wrapping.
+                    min_from.saturating_sub(1)
+                }
+                None => 0,
+            }
+        } else {
+            *cursor
+        };
         let mut page_cursor: Option<String> = None;
         let mut total = 0;
 
@@ -462,7 +550,7 @@ impl Streamer {
         let filters = self.filter_plan.filters.clone();
 
         loop {
-            let (sl, pc) = page_request_params(*cursor, page_cursor.as_deref());
+            let (sl, pc) = page_request_params(effective_cursor, page_cursor.as_deref());
             let mut attempt = 0u32;
             let limit = self.config.max_events_per_poll;
             // Server-side narrowing (issue #203). Empty in index-all mode; the
@@ -491,7 +579,7 @@ impl Streamer {
                 break;
             }
 
-            let last_paging_token = page.events.last().map(|e| e.paging_token.clone());
+            let last_paging_token = page.events.last().map(|e| e.page_cursor());
 
             let mut events_in_page: i32 = 0;
             let mut skipped_in_page: u64 = 0;
@@ -503,25 +591,54 @@ impl Streamer {
             // Indices, not references, because `page_events` is still growing.
             let mut page_tokens: Vec<(usize, crate::parser::token_events::TokenEvent)> = Vec::new();
             for raw in &page.events {
+                let decode_start = Instant::now();
                 let parse_result = {
                     let _span = tracing::info_span!("parse_events").entered();
                     self.parser.parse_event_with_projection(raw)
                 };
+                metrics::record_decode_duration(decode_start.elapsed().as_secs_f64());
+
                 match parse_result {
                     Ok(Some(parsed)) => {
                         let event = parsed.event;
-                        // Contract allowlist filtering (issue #47).
-                        // None → index all; Some(set) → only listed contracts.
+                        // Contract allowlist filtering (issues #47, #202).
+                        // None → index all; Some(map) → only listed contracts,
+                        // and only at or above their per-contract index_from.
                         if let Some(ref filter) = self.contract_filter {
-                            if !filter.contains(&event.contract_id) {
-                                tracing::trace!(
-                                    contract_id = %event.contract_id,
-                                    "Skipping event from unlisted contract"
-                                );
-                                skipped_in_page += 1;
-                                continue;
+                            match filter.get(&event.contract_id) {
+                                None => {
+                                    tracing::trace!(
+                                        contract_id = %event.contract_id,
+                                        "Skipping event from unlisted contract"
+                                    );
+                                    // Unlisted contracts land in the "other" bucket to
+                                    // bound cardinality (issue #212).
+                                    metrics::record_events_by_contract("other", 1);
+                                    skipped_in_page += 1;
+                                    continue;
+                                }
+                                Some(&index_from)
+                                    if (event.ledger_sequence as i64) < index_from =>
+                                {
+                                    tracing::trace!(
+                                        contract_id = %event.contract_id,
+                                        ledger = event.ledger_sequence,
+                                        index_from = index_from,
+                                        "Skipping event below contract index_from"
+                                    );
+                                    // Listed, but below its start ledger — still a
+                                    // skip, so bucket it the same way.
+                                    metrics::record_events_by_contract("other", 1);
+                                    skipped_in_page += 1;
+                                    continue;
+                                }
+                                _ => {}
                             }
                         }
+                        // Allowlisted or index-all: record under the real contract_id.
+                        // In index-all mode cardinality is unbounded — operators should
+                        // configure an allowlist if per-contract metrics are needed.
+                        metrics::record_events_by_contract(&event.contract_id, 1);
                         // Events are accumulated and committed as one page,
                         // together with their outbox rows; the relay owns the
                         // Redis publish (issues #199, #200). Publishing inline
@@ -547,12 +664,9 @@ impl Streamer {
                         );
                         metrics::record_parse_error();
                         let ledger_seq: u64 = raw.ledger.parse().unwrap_or(0);
-                        let event_idx: u32 = raw
-                            .id
-                            .split('-')
-                            .next_back()
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
+                        // Same derivation as the happy path so a parse_errors
+                        // row points at the event it actually came from.
+                        let event_idx: u32 = crate::parser::raw_event_index(raw);
                         let raw_payload = serde_json::to_string(&serde_json::json!({
                             "type": &raw.event_type,
                             "ledger": &raw.ledger,
@@ -563,19 +677,38 @@ impl Streamer {
                             "value": &raw.value,
                         }))
                         .unwrap_or_else(|_| "{}".to_string());
-                        if let Err(db_err) = db::insert_parse_error(
-                            &self.db,
-                            ledger_seq,
-                            event_idx,
-                            &raw_payload,
-                            &e.to_string(),
-                        )
+                        // Retry dead-letter insert with bounded backoff so a
+                        // transient DB hiccup does not lose the audit record
+                        // (issue #414).
+                        let db = self.db.clone();
+                        let payload = raw_payload.clone();
+                        let errmsg = e.to_string();
+                        let dead_letter_strategy = ExponentialBackoff::from_millis(100)
+                            .max_delay(Duration::from_secs(1))
+                            .take(3);
+                        if let Err(db_err) = Retry::start(dead_letter_strategy, || {
+                            let db = db.clone();
+                            let payload = payload.clone();
+                            let errmsg = errmsg.clone();
+                            async move {
+                                db::insert_parse_error(
+                                    &db, ledger_seq, event_idx, &payload, &errmsg,
+                                )
+                                .await
+                            }
+                        })
                         .await
                         {
                             tracing::error!(
                                 error = %db_err,
-                                "Failed to record parse error in database"
+                                "Failed to record parse error in database after retries"
                             );
+                        } else {
+                            // Only count a dead-letter once the row is durably
+                            // recorded (issue #414). Incrementing on the failure
+                            // path instead would make the alert fire for events
+                            // that were never actually captured for replay.
+                            metrics::record_dead_lettered();
                         }
                         skipped_in_page += 1;
                     }
@@ -614,6 +747,12 @@ impl Streamer {
                     };
                 }
             }
+
+            // Guarantee the natural key from migration 0025 holds across this
+            // batch before it reaches Postgres. Mutates event_index in place
+            // only, so the positional indices in `page_tokens` stay valid
+            // (issue #388).
+            crate::parser::assign_unique_event_indexes(&mut page_events);
 
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave
@@ -806,6 +945,16 @@ impl Streamer {
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
         metrics::record_poll_duration(poll_duration.as_secs_f64());
+
+        // Catch-up throughput for this cycle (issue #420). Published only while
+        // meaningfully behind the tip — see `set_catchup_rates` — so the gauges
+        // describe backfill speed rather than steady-state tip-following.
+        metrics::set_catchup_rates(
+            cursor.saturating_sub(cursor_at_start),
+            total as u64,
+            poll_duration.as_secs_f64(),
+            lag_at_start,
+        );
         if let Err(e) =
             db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
         {
@@ -821,6 +970,7 @@ impl Streamer {
                         chain_tip_ledger: self.last_chain_tip,
                         lag_threshold: self.config.alert_lag_threshold,
                         network: self.config.network.clone(),
+                        rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
                     };
                     self.alerter.evaluate(&ctx, &mut alert_state).await;
                     if let Err(e) = db::set_alert_state(&self.db, &alert_state).await {
@@ -843,8 +993,18 @@ impl Streamer {
 /// A `degraded` plan means the allowlist is too large to express within the
 /// RPC's filter caps, so we index everything and rely on the client-side
 /// allowlist check in `poll_once` — correct, just less efficient.
-fn plan_filters(allowlist: Option<&HashSet<String>>, topic_filters: &[Vec<String>]) -> FilterPlan {
-    let plan = build_event_filters(allowlist, topic_filters);
+/// Build the server-side filter plan from the allowlist.
+///
+/// Takes the `index_from` map but uses only its keys: `getEvents` carries a
+/// single `startLedger` for the whole request, so per-contract boundaries
+/// cannot be pushed down and are applied client-side in `poll_once`
+/// (issues #202, #203).
+fn plan_filters(
+    allowlist: Option<&HashMap<String, i64>>,
+    topic_filters: &[Vec<String>],
+) -> FilterPlan {
+    let contract_ids: Option<HashSet<String>> = allowlist.map(|map| map.keys().cloned().collect());
+    let plan = build_event_filters(contract_ids.as_ref(), topic_filters);
 
     if plan.degraded {
         tracing::warn!(
@@ -881,6 +1041,44 @@ fn page_request_params(cursor: u64, page_cursor: Option<&str>) -> (Option<u64>, 
         None if cursor == 0 => (Some(1), None),
         None => (Some(cursor + 1), None),
     }
+}
+
+/// Extract the oldest retained ledger from an out-of-range `getEvents` error.
+///
+/// The Soroban RPC only keeps a recent window of ledgers. Asking for one it has
+/// already pruned fails with, verbatim:
+///
+/// ```text
+/// getEvents: RPC error -32600: startLedger must be within the ledger range: 7 - 457
+/// ```
+///
+/// There is no machine-readable field for the retained range — the same
+/// limitation noted for out-of-range cursors in `RpcClient::execute` — so the
+/// message is the only place the floor is available. Returns the lower bound
+/// (`7` above), or `None` when this is some other error.
+///
+/// Matching is deliberately narrow: both the `ledger range` phrase and a
+/// `<low> - <high>` pair must be present, so an unrelated RPC error can never
+/// be mistaken for a retention signal and silently move the cursor.
+fn parse_retained_floor(message: &str) -> Option<u64> {
+    let lower = message.to_lowercase();
+    if !lower.contains("ledger range") {
+        return None;
+    }
+    let after = &lower[lower.find("ledger range")? + "ledger range".len()..];
+    let (low, high) = after
+        .split_once('-')
+        .map(|(l, r)| (l.trim_matches(|c: char| !c.is_ascii_digit()), r))?;
+    let high: String = high
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let low: u64 = low.parse().ok()?;
+    let high: u64 = high.parse().ok()?;
+    // A well-formed range only; anything inverted means the message shape
+    // changed and the value should not be trusted.
+    (low <= high).then_some(low)
 }
 
 #[cfg(test)]
@@ -937,6 +1135,53 @@ mod tests {
             page_request_params(100, Some("100-5")),
             (None, Some("100-5".to_string()))
         );
+    }
+
+    #[test]
+    fn retained_floor_parsed_from_the_real_rpc_message() {
+        // Verbatim from the E2E contract events job (issue #388): a fresh index
+        // anchored at ledger 1 against a network retaining only 7 onwards.
+        assert_eq!(
+            parse_retained_floor(
+                "getEvents: RPC error -32600: startLedger must be within the ledger range: 7 - 457"
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn retained_floor_ignores_unrelated_rpc_errors() {
+        // Anything that is not a retention complaint must not move the cursor.
+        assert_eq!(
+            parse_retained_floor("getEvents: RPC error -32602: invalid cursor"),
+            None
+        );
+        assert_eq!(parse_retained_floor("getEvents: empty result"), None);
+        assert_eq!(parse_retained_floor(""), None);
+    }
+
+    #[test]
+    fn retained_floor_rejects_a_malformed_range() {
+        // An inverted or truncated range means the message shape changed; the
+        // value must not be trusted rather than silently skipping ledgers.
+        assert_eq!(
+            parse_retained_floor("startLedger must be within the ledger range: 500 - 7"),
+            None
+        );
+        assert_eq!(
+            parse_retained_floor("startLedger must be within the ledger range: 7"),
+            None
+        );
+    }
+
+    #[test]
+    fn retained_floor_maps_to_a_cursor_that_anchors_on_the_floor() {
+        // The recovery stores floor - 1 because page_request_params sends
+        // cursor + 1; the next request must land exactly on the floor, not
+        // one past it (which would skip the oldest retained ledger).
+        let floor =
+            parse_retained_floor("startLedger must be within the ledger range: 7 - 457").unwrap();
+        assert_eq!(page_request_params(floor - 1, None), (Some(7), None));
     }
 
     fn sym_xdr(s: &str) -> String {
@@ -1924,5 +2169,160 @@ mod tests {
             total, 205,
             "should process 200 + 5 = 205 events across two pages"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-contract index_from gating (issue #202)
+    // -----------------------------------------------------------------------
+
+    fn events_page_multi(entries: Vec<(u64, &str, u32)>) -> serde_json::Value {
+        // Computed before the into_iter() below consumes `entries`.
+        let latest = entries.iter().map(|(l, _, _)| *l).max().unwrap_or(0);
+        let events: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|(ledger, contract_id, idx)| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": contract_id,
+                    "id": format!("{:016}-{}", ledger, idx),
+                    "pagingToken": format!("{}-{}", ledger, idx),
+                    "txHash": format!("hash{}{}{}", ledger, contract_id, idx),
+                    "topic": [sym_xdr("transfer")],
+                    "value": void_xdr(),
+                    "inSuccessfulContractCall": true,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": latest,
+            }
+        })
+    }
+
+    /// Seed `indexed_contracts` with the given (contract_id, index_from, network) tuples.
+    async fn seed_contracts(pool: &sqlx::PgPool, contracts: Vec<(&str, i64, &str)>) {
+        for (id, index_from, network) in contracts {
+            sqlx::query(
+                r#"
+                INSERT INTO indexed_contracts (contract_id, network, index_from)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (contract_id, network) DO UPDATE SET index_from = EXCLUDED.index_from
+                "#,
+            )
+            .bind(id)
+            .bind(network)
+            .bind(index_from)
+            .execute(pool)
+            .await
+            .expect("seed_contracts failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn index_from_gating_filters_out_below_threshold() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // Register two contracts with different index_from values.
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        reset_db(&pool).await;
+        seed_contracts(
+            &pool,
+            vec![("CTEST_A", 100, "testnet"), ("CTEST_B", 200, "testnet")],
+        )
+        .await;
+        // Clean seed from streamer load_filter won't double-count.
+        // Streamer is created after seeding, so its initial load picks up the contracts.
+
+        // RPC returns events at ledgers 50, 150, and 250 for both contracts.
+        // With index_from=100 for A and index_from=200 for B:
+        //   A50  → skipped (< 100)
+        //   A150 → indexed (≥ 100)
+        //   A250 → indexed (≥ 100)
+        //   B50  → skipped (< 200)
+        //   B150 → skipped (< 200)
+        //   B250 → indexed (≥ 200)
+
+        // getLedgers mock (required for cursor advancement)
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        // First getEvents page: events at ledgers 50, 150, 250
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page_multi(vec![
+                (50, "CTEST_A", 0),
+                (50, "CTEST_B", 1),
+                (150, "CTEST_A", 2),
+                (150, "CTEST_B", 3),
+                (250, "CTEST_A", 4),
+                (250, "CTEST_B", 5),
+            ])))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Subsequent getEvents returns empty (stop pagination)
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page_multi(vec![])))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        // Verify the filter was loaded with index_from values.
+        let filter = s.contract_filter.as_ref().expect("filter should be Some");
+        assert_eq!(filter.get("CTEST_A"), Some(&100));
+        assert_eq!(filter.get("CTEST_B"), Some(&200));
+
+        let mut cursor = 0u64;
+        let total = s.poll_once(&mut cursor).await.unwrap();
+
+        // Only 3 events should be indexed:
+        //   CTEST_A at 150, CTEST_A at 250, CTEST_B at 250
+        assert_eq!(total, 3, "only in-range events should be indexed");
+
+        // Verify stored events in the database.
+        let count_a: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_A'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count_a.0, 2,
+            "CTEST_A should have 2 events (ledgers 150, 250)"
+        );
+
+        let count_b: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = 'CTEST_B'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count_b.0, 1, "CTEST_B should have 1 event (ledger 250)");
+
+        pool.close().await;
     }
 }

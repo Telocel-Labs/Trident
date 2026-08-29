@@ -1,0 +1,84 @@
+---
+title: "Monitoring & Observability"
+description: "Prometheus metrics, key performance indicators, lag tracking, and operational alert setup for Trident."
+---
+
+## Overview
+
+Trident emits comprehensive Prometheus metrics to monitor indexer throughput, RPC lag, database connection pools, and API endpoint latencies.
+
+---
+
+## Prometheus Metrics Summary
+
+The indexer exposes metrics on `:9090/metrics` (configurable via `METRICS_PORT`).
+
+### Core Indexer Metrics
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `trident_indexer_latest_ledger` | Gauge | Most recent ledger sequence ingested by Trident. |
+| `trident_indexer_chain_tip_ledger` | Gauge | Latest ledger reported by the Stellar Soroban RPC node. |
+| `trident_indexer_ledger_lag` | Gauge | Difference between chain tip and current indexer ledger. |
+| `trident_indexer_events_processed_total` | Counter | Cumulative count of Soroban events decoded and indexed. |
+| `trident_indexer_rpc_duration_seconds` | Histogram | Latency of `getEvents` RPC calls made to Soroban nodes. |
+
+### Database & Pool Metrics
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `trident_db_pool_active_connections` | Gauge | Active connections currently leased from PgBouncer/Postgres. |
+| `trident_db_pool_idle_connections` | Gauge | Idle connections available in pool. |
+| `trident_db_batch_insert_duration_seconds` | Histogram | Time spent writing event batches to PostgreSQL. |
+
+---
+
+## Alerting Guidelines
+
+Configure key Prometheus rules for early detection of degradation:
+
+### 1. High Ledger Lag
+
+Alert if the indexer lags behind the network tip by more than 200 ledgers (~15–20 minutes):
+
+```yaml
+groups:
+  - name: trident_alerts
+    rules:
+      - alert: TridentHighLedgerLag
+        expr: trident_indexer_ledger_lag > 200
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trident indexer is lagging behind chain tip"
+          description: "Indexer lag is currently {{ $value }} ledgers."
+```
+
+### 2. High RPC Error Rate
+
+Alert when RPC failover thresholds are triggered or request failure rates spike:
+
+```yaml
+      - alert: TridentRPCFailures
+        expr: rate(trident_indexer_rpc_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated RPC error rate detected"
+```
+
+---
+
+## Webhook Alerts
+
+The indexer supports outbound alerting via `ALERT_WEBHOOK_URL`. Configure in `.env`:
+
+```bash
+ALERT_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
+ALERT_LAG_THRESHOLD=200
+ALERT_COOLDOWN_MINUTES=30
+```
+
+When triggered, Trident sends JSON payloads containing lag details directly to your webhook endpoint.

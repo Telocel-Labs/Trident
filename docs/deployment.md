@@ -76,6 +76,42 @@ indefinitely: the retry wrapper only reacts to returned errors, never to a call
 that never returns. Timeouts are classified retryable, so they engage backoff
 and count toward the failover threshold.
 
+#### Indexer replica count — single-writer by design
+
+**The indexer runs as exactly one replica. This is enforced, not advisory.**
+
+`helm/trident/templates/indexer-deployment.yaml` fails template rendering if
+`indexer.replicaCount` is greater than 1, and sets the deployment strategy to
+`Recreate` so a rolling update cannot briefly run two pods at once.
+
+Why enforce rather than merely recommend (issue #418):
+
+- **Correctness is not the problem.** Two indexers against one database are
+  safe. Event persistence is exactly-once via the natural-key `UNIQUE`
+  constraint (migration `0025_soroban_events_natural_key.sql`) combined with
+  `ON CONFLICT DO NOTHING`, and the cursor advance is monotonic — a lagging
+  replica cannot rewind a cursor another replica has already moved forward.
+  Both properties are covered by integration tests in
+  `crates/indexer/src/db/mod.rs`.
+- **Usefulness is the problem.** There is no leader election and no work
+  partitioning, so every replica polls the same ledger ranges and decodes the
+  same events. Two replicas do the same work twice and consume double the RPC
+  quota for no additional throughput.
+
+So the guarantees above exist to make an *accidental* double-deploy survivable —
+a rollout overlap, a stale pod that outlives its replacement — not to make
+scale-out a supported configuration.
+
+Verify the invariants against a live database with:
+
+```bash
+scripts/test-concurrent-persistence.sh --database-url "$DATABASE_URL"
+```
+
+If indexing throughput becomes a bottleneck, the fix is vertical (more CPU for
+decode, a larger `MAX_EVENTS_PER_POLL`, a faster RPC endpoint) or a genuine
+work-partitioning design — not raising the replica count.
+
 #### Indexer outbox relay
 
 | Variable | Description |
@@ -147,13 +183,13 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up
 ### 7. Verify health
 
 ```bash
-curl https://your-domain.com/v1/health
+curl https://your-domain.com/v1/ready
 ```
 
-Expected response:
+Expected response (Postgres/Redis/gRPC all reachable):
 
 ```json
-{"status":"ok"}
+{"status":"ok","indexer_lag":0,"checks":{"postgres":"ok","redis":"ok","grpc_api":"ok"}}
 ```
 
 ---
@@ -198,7 +234,7 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
 ### 4. Verify deployment
 
 ```bash
-curl https://your-domain.com/v1/health
+curl https://your-domain.com/v1/ready
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
   logs --tail=50 api
 ```
@@ -227,7 +263,7 @@ Migrations in `database/migrations/` are plain SQL and have no automated down pa
 ### 4. Verify health after rollback
 
 ```bash
-curl https://your-domain.com/v1/health
+curl https://your-domain.com/v1/ready
 ```
 
 ---
@@ -285,20 +321,26 @@ curl https://your-domain.com/v1/health
 
 | Endpoint | Description |
 |---|---|
-| `GET /v1/health` | Public liveness check. Returns indexer poll status. |
+| `GET /v1/health` | Public liveness check. No dependency calls — just confirms the process is up (issue #243). |
+| `GET /v1/ready` | Public readiness check. Verifies Postgres, Redis, and the gRPC backend (issue #243); 503 if any is unreachable. |
 | `GET /internal/status` | Internal metrics endpoint (planned for a future release). |
 
-`/v1/health` response shapes:
+`/v1/health` response shape (always 200 while the process is alive):
 
 ```json
 {"status":"ok"}
 ```
-Indexer is polling within the last 60 seconds.
+
+`/v1/ready` response shapes:
 
 ```json
-{"status":"degraded"}
+{"status":"ok","indexer_lag":3,"checks":{"postgres":"ok","redis":"ok","grpc_api":"ok"}}
 ```
-Indexer has stalled or the database is unreachable.
+
+```json
+{"status":"degraded","indexer_lag":null,"checks":{"postgres":"error: dial tcp: connection refused","redis":"ok","grpc_api":"ok"}}
+```
+`indexer_lag` is null whenever Postgres is unreachable or the chain-tip cache hasn't been populated yet. Any non-"ok" entry in `checks` returns HTTP 503.
 
 ### PostgreSQL Disk Usage
 
@@ -321,10 +363,10 @@ A growing `trident:events` stream length indicates consumer lag. Investigate the
 
 ### Indexer Lag
 
-Check `last_poll_at` in the health response. If `status` is `degraded` or `last_poll_at` is more than 5 minutes ago, the indexer has stalled.
+Check `indexer_lag` in the readiness response, or query `GET /v1/stats/indexer` directly for `last_poll_at` and `status`. If `indexer_lag` is large or `checks.postgres` is not `ok`, investigate the indexer/database.
 
 ```bash
-curl https://your-domain.com/v1/health | jq .
+curl https://your-domain.com/v1/ready | jq .
 ```
 
 ### nginx / WebSocket Connections
@@ -588,8 +630,10 @@ lasting change.
   under the top-level `[checks]` section so Fly restarts the machine if
   readiness fails, not just if the TCP port stops accepting connections.
 - **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
-- **Go API health check**: `GET /v1/health` (used by Fly's HTTP service check
-  in `fly/api.toml`)
+- **Go API health check**: `GET /v1/ready` (used by Fly's HTTP service check
+  in `fly/api.toml` to gate traffic routing). `/v1/ready` verifies
+  Postgres/Redis/gRPC reachability, unlike `/v1/health`, which is a cheap
+  liveness check that says only that the process is up (issue #243).
 - **gRPC API**: no HTTP health endpoint exists in `crates/api` today; Fly's
   check in `fly/grpc-api.toml` is a plain TCP check against port 50051. This
   proves the socket is listening, not that gRPC calls actually succeed — if a
@@ -617,6 +661,7 @@ fly config validate -c fly/api.toml
 fly config validate -c fly/grpc-api.toml
 fly config validate -c fly/indexer.toml
 ```
+>>>>>>> origin/dev
 
 ### Updating secrets
 
@@ -727,14 +772,16 @@ without access to a real Kubernetes cluster or cloud credentials — the
 following require you to provision them once:
 
 - **Secrets**: `STAGING_KUBECONFIG` (repo/org secret, base64-encoded
-  kubeconfig scoped to the staging namespace) and `STAGING_API_KEY` must be
+  kubeconfig scoped to the staging namespace), `STAGING_API_KEY`,
+  `STAGING_DATABASE_URL` (when runner migrations are used), and
+  `STAGING_ALERT_WEBHOOK_URL` (optional) are stored as encrypted secrets. The
+  kubeconfig and API key must be
   set for `deploy-staging`/`smoke-test-staging` to run at all. Without them,
   those jobs are skipped (not failed) — see `check-staging-config` in the
   workflow.
-- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`),
+- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`) and
   `STAGING_URL` (public URL of the deployed staging stack, used by the smoke
-  test), `STAGING_DATABASE_URL` (for the migration step, if runner-reachable),
-  and `STAGING_ALERT_WEBHOOK_URL` (optional).
+  test). Variables must never contain credentials.
 - **Migrations are stubbed pending issue #308** ("database migration job as
   a Helm hook", still open): the workflow currently runs
   `sqlx migrate run` directly from the GitHub Actions runner against

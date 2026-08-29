@@ -1,0 +1,131 @@
+---
+title: "Pagination"
+description: "How cursor-based pagination works in Trident — the opaque cursor, the after parameter, hasMore, and iterating all pages."
+---
+
+All Trident list endpoints use **cursor-based pagination**. Each response includes an opaque `cursor` string that you pass as `after` to fetch the next page.
+
+---
+
+## How it works
+
+A typical paginated response looks like:
+
+```json
+{
+  "events": [ /* up to `limit` events */ ],
+  "cursor": "eyJpZCI6IjU1MGU4NDAwLWUyOWItNDFkNC1hNzE2LTQ0NjY1NTQ0MDAwMCJ9",
+  "hasMore": true
+}
+```
+
+| Field     | Type            | Description                                                  |
+|-----------|-----------------|--------------------------------------------------------------|
+| `events`  | `SorobanEvent[]`| Events on this page, ordered by ledger sequence ascending.   |
+| `cursor`  | `string \| null`| Pass this as `after` to get the next page. `null` = no more pages. |
+| `hasMore` | `boolean`       | `true` if more pages exist; `false` when you've reached the end. |
+
+---
+
+## The opaque cursor
+
+<Warning>
+The cursor is **opaque**. Do not parse, decode, construct, or modify it. Its internal structure may change between API versions. Only pass back cursors you received from a previous response.
+</Warning>
+
+Passing a cursor you did not receive from the API will result in a `400 INVALID_ARGUMENT` error.
+
+---
+
+## Fetching the next page
+
+Pass the `cursor` from the previous response as the `after` query parameter:
+
+```bash
+# Page 1
+curl "https://api.trident.telocel.com/v1/events?limit=50" \
+  -H "X-API-Key: $TRIDENT_API_KEY"
+
+# Page 2 — use the cursor from the page 1 response
+curl "https://api.trident.telocel.com/v1/events?limit=50&after=eyJpZCI6..." \
+  -H "X-API-Key: $TRIDENT_API_KEY"
+```
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { PaginatedEvents, SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+// Fetch two pages manually
+const page1: PaginatedEvents = await client.queryEvents({ limit: 50 });
+
+if (page1.hasMore && page1.cursor) {
+  const page2: PaginatedEvents = await client.queryEvents({
+    after: page1.cursor,
+    limit: 50,
+  });
+  console.log(page2.events);
+}
+```
+
+---
+
+## Draining all pages automatically
+
+The SDK's `iterEvents` method handles cursor management automatically:
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+const allEvents: SorobanEvent[] = [];
+
+for await (const event of client.iterEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+})) {
+  allEvents.push(event);
+}
+
+console.log(`Total: ${allEvents.length} events`);
+```
+
+`iterEvents` stops when `hasMore` is `false`. By default it fetches at most **100 pages**. Raise the limit for large backfills:
+
+```typescript
+for await (const event of client.iterEvents(
+  { contractId: "C..." },
+  { maxPages: 5000 }
+)) {
+  // handle event
+}
+```
+
+If the page cap is hit while results remain, a `TridentError` with `code: "ITERATION_LIMIT"` is thrown.
+
+---
+
+## Cursor stability
+
+Cursors are **stable**: inserting new events does not shift the position of cursors issued before those events were indexed. You can safely checkpoint a cursor, restart your process, and resume from where you left off.
+
+---
+
+## Parameters summary
+
+| Parameter | Location    | Type     | Description                                           |
+|-----------|-------------|----------|-------------------------------------------------------|
+| `limit`   | query       | integer  | Max events per page. Range: 1–200. Default: 50.      |
+| `after`   | query       | string   | Opaque cursor from a previous response.               |
+| `cursor`  | response    | string?  | Pass as `after` to get the next page. Null = end.    |
+| `hasMore` | response    | boolean  | Whether another page is available.                    |

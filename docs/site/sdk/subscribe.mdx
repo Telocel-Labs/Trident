@@ -1,0 +1,147 @@
+---
+title: "subscribeToContract()"
+description: "Open a real-time WebSocket subscription to events from a Soroban contract."
+---
+
+## Signature
+
+```typescript
+subscribeToContract(params: SubscribeToContractParams): Subscription
+```
+
+Opens a WebSocket connection and begins delivering events to your callback. The connection auto-reconnects with exponential backoff (500ms → 30s max) on unexpected disconnects.
+
+---
+
+## Parameters
+
+| Parameter    | Type                            | Required | Description                                                                 |
+|--------------|---------------------------------|----------|-----------------------------------------------------------------------------|
+| `contractId` | `string`                        | ✅       | Stellar contract address (C… strkey) to subscribe to.                     |
+| `topic0`     | `string`                        |          | Optional topic filter. Only events where the first topic matches are delivered. |
+| `onEvent`    | `(event: SorobanEvent) => void` | ✅       | Called for every incoming event matching the subscription filter.           |
+| `onError`    | `(error: Error) => void`        |          | Called on WebSocket errors. The subscription continues to auto-reconnect.  |
+
+---
+
+## Returns
+
+`Subscription`
+
+```typescript
+interface Subscription {
+  /** Close the WebSocket connection and cancel any pending reconnect. */
+  unsubscribe: () => void;
+}
+```
+
+Calling `unsubscribe()` is idempotent — calling it multiple times is safe.
+
+---
+
+## Examples
+
+### Basic subscription
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent, Subscription } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+const sub: Subscription = client.subscribeToContract({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  topic0: "transfer",
+  onEvent: (event: SorobanEvent) => {
+    console.log(`[${event.ledgerSequence}] ${event.transactionHash}`);
+    console.log("  Topics:", event.topics);
+  },
+  onError: (err: Error) => {
+    console.warn("WebSocket error (auto-retrying):", err.message);
+  },
+});
+
+// Close after 5 minutes
+setTimeout(() => sub.unsubscribe(), 5 * 60_000);
+```
+
+### React hook example
+
+```typescript
+import { useEffect, useState } from "react";
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.NEXT_PUBLIC_TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+function useContractEvents(contractId: string): SorobanEvent[] {
+  const [events, setEvents] = useState<SorobanEvent[]>([]);
+
+  useEffect(() => {
+    const sub = client.subscribeToContract({
+      contractId,
+      onEvent: (event) => {
+        setEvents((prev) => [event, ...prev].slice(0, 100)); // keep last 100
+      },
+    });
+    return () => sub.unsubscribe(); // cleanup on unmount
+  }, [contractId]);
+
+  return events;
+}
+```
+
+### Node.js server — graceful shutdown
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+const sub = client.subscribeToContract({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  onEvent: (event) => {
+    // Process event — write to database, emit webhook, etc.
+    console.log("Event:", event.id);
+  },
+  onError: (err) => console.error("WS error:", err.message),
+});
+
+// Graceful shutdown
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    sub.unsubscribe();
+    process.exit(0);
+  });
+}
+```
+
+---
+
+## Reconnection behaviour
+
+The SDK reconnects automatically after unexpected disconnects:
+
+| Attempt | Wait   |
+|---------|--------|
+| 1st     | 500ms  |
+| 2nd     | 1s     |
+| 3rd     | 2s     |
+| 4th     | 4s     |
+| 5th+    | 30s    |
+
+All subscriptions are re-registered automatically after each reconnect. Calling `unsubscribe()` cancels any pending reconnect immediately.
+
+See [Reconnection Behavior](/websocket/reconnection) for full details.

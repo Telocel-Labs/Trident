@@ -1,0 +1,164 @@
+---
+title: "Quick Start — Self-Hosted"
+description: "Run the full Trident stack locally with Docker Compose and make your first curl request in minutes."
+---
+
+## Prerequisites
+
+Make sure the following are installed before you begin:
+
+| Requirement         | Minimum version | Notes                                              |
+|---------------------|-----------------|----------------------------------------------------|
+| Docker              | 24+             | [Install Docker](https://docs.docker.com/get-docker/) |
+| Docker Compose v2   | 2.0+            | `docker compose` (not `docker-compose`)            |
+| Git                 | any             |                                                    |
+
+No Rust, Go, or Node.js installation is required to run the stack — everything runs inside containers.
+
+---
+
+## 1. Clone the repository
+
+```bash
+git clone https://github.com/Telocel-Labs/Trident.git
+cd Trident
+```
+
+---
+
+## 2. Create your `.env` file
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and set the required variables. For a local testnet setup, the minimum required changes are:
+
+```bash
+# Already set correctly for local development:
+DATABASE_URL=postgresql://trident:password@localhost:5432/trident
+REDIS_URL=redis://localhost:6379
+STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+NETWORK=testnet
+
+# Change this before running in production:
+API_KEY_SALT=change-this-to-a-random-string
+```
+
+<Note>
+For a full list of every environment variable and what it controls, see the [Configuration Reference](/self-hosting/configuration).
+</Note>
+
+---
+
+## 3. Start the stack
+
+```bash
+docker compose up
+```
+
+This starts four services:
+- **postgres** — durable event storage
+- **redis** — real-time event fan-out stream
+- **indexer** (Rust) — polls Soroban RPC, decodes XDR, writes to Postgres and Redis
+- **api** (Go) — serves REST, WebSocket, and GraphQL APIs
+
+Wait until you see log lines like:
+
+```
+indexer  | INFO  trident_indexer: indexer started, polling testnet
+api      | INFO  server listening on :3000
+```
+
+---
+
+## 4. Verify the stack is healthy
+
+```bash
+curl http://localhost:3000/v1/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "indexer": {
+    "status": "healthy",
+    "lastLedger": 12345678,
+    "lagLedgers": 0
+  },
+  "database": "ok",
+  "redis": "ok"
+}
+```
+
+---
+
+## 5. Query your first events
+
+```bash
+curl "http://localhost:3000/v1/events?network=testnet&limit=10" \
+  -H "X-API-Key: your-api-key"
+```
+
+<Note>
+In self-hosted mode, API keys are managed via the `API_KEY_HASHES` environment variable.
+See the [Authentication](/api-reference/authentication) page for details.
+</Note>
+
+Expected response shape:
+
+```json
+{
+  "events": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      "ledgerSequence": 12345678,
+      "ledgerTimestamp": "2025-01-01T00:00:00Z",
+      "transactionHash": "abc123...",
+      "eventIndex": 0,
+      "eventType": "contract",
+      "topics": ["AAAADQAAAAh0cmFuc2Zlcg=="],
+      "data": null,
+      "createdAt": "2025-01-01T00:00:01Z"
+    }
+  ],
+  "cursor": "eyJpZCI6IjU1MGU4...",
+  "hasMore": true
+}
+```
+
+---
+
+## 6. Stop the stack
+
+```bash
+docker compose down
+```
+
+Data is persisted in Docker volumes. To also wipe all data:
+
+```bash
+docker compose down -v
+```
+
+---
+
+## What's next?
+
+<CardGroup cols={2}>
+  <Card title="Configuration Reference" icon="gear" href="/self-hosting/configuration">
+    Every environment variable, its type, default, and what happens if it is missing.
+  </Card>
+  <Card title="Fly.io Deployment" icon="rocket" href="/self-hosting/fly-io">
+    Deploy Trident to production on Fly.io.
+  </Card>
+  <Card title="REST API Reference" icon="server" href="/api-reference/events-list">
+    Explore all API endpoints, parameters, and response schemas.
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/self-hosting/monitoring">
+    Prometheus metrics, alerting, and observability.
+  </Card>
+</CardGroup>

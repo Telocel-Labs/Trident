@@ -1,0 +1,39 @@
+---
+title: "Changelog"
+description: "Version history and release notes for Trident API, SDK, and Indexer releases."
+---
+
+## v0.1.0 (Phase 1 — MVP Release)
+
+*Released: Q1 2026*
+
+### Added
+
+- **Rust Indexer Core (`crates/indexer`)**:
+  - Soroban RPC ledger ingestion pipeline decoding XDR events directly.
+  - PostgreSQL batch storage adapter with configurable batch size (`DB_BATCH_SIZE`).
+  - Redis Stream publisher (`trident:events`) for low-latency event relay.
+  - Adaptive poll interval scaling based on chain-tip lag (`POLL_INTERVAL_FLOOR_MS` / `POLL_INTERVAL_CEILING_MS`).
+  - Outbound webhook lag alerting system.
+
+- **Rust gRPC Internal API (`crates/api`)**:
+  - High-performance gRPC interface serving indexed Soroban events over protobuf schemas.
+  - Event streaming support (`StreamEvents`).
+
+- **Go Public Front Office (`services/api`)**:
+  - REST API endpoints (`GET /v1/events`, `GET /v1/events/:id`, `GET /v1/health`).
+  - Opaque cursor-based pagination supporting stable result iteration.
+  - Rate limiting middleware with per-tier quotas (`Free`, `Pro`, `Internal`).
+  - Real-time WebSocket event fan-out (`GET /ws`).
+
+- **TypeScript SDK (`@trident-indexer/sdk`)**:
+  - `TridentClient` providing full TypeScript typings out-of-the-box.
+  - Historical query support (`queryEvents`, `getEventById`).
+  - Auto-paginating async iterator (`iterEvents`).
+  - Real-time subscription handle with automatic exponential backoff reconnection (`subscribeToContract`).
+  - Custom `TridentError` class categorizing error status codes.
+
+- **Developer Documentation Site**:
+  - Full documentation site built with Mintlify.
+  - Comprehensive configuration reference covering every `.env.example` parameter.
+  - Step-by-step guides for quickstart, self-hosting, Fly.io, and monitoring setup.

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -74,25 +75,26 @@ type tierEntry struct {
 type TierCache struct {
 	mu      sync.RWMutex
 	entries map[string]tierEntry
+	now     func() time.Time
 }
 
 const tierCacheTTL = 5 * time.Minute
 
 // NewTierCache returns an empty, ready-to-use tier cache.
 func NewTierCache() *TierCache {
-	return &TierCache{entries: map[string]tierEntry{}}
+	return &TierCache{entries: map[string]tierEntry{}, now: time.Now}
 }
 
 func (tc *TierCache) get(hash string) (string, bool) {
 	tc.mu.RLock()
 	e, ok := tc.entries[hash]
 	tc.mu.RUnlock()
-	return e.tier, ok && time.Now().Before(e.exp)
+	return e.tier, ok && tc.now().Before(e.exp)
 }
 
 func (tc *TierCache) set(hash, tier string) {
 	tc.mu.Lock()
-	tc.entries[hash] = tierEntry{tier: tier, exp: time.Now().Add(tierCacheTTL)}
+	tc.entries[hash] = tierEntry{tier: tier, exp: tc.now().Add(tierCacheTTL)}
 	tc.mu.Unlock()
 }
 
@@ -222,6 +224,7 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 			allowed, count, err := slide(r.Context(), redisKey, limit, windowMs)
 			if err != nil {
 				slog.Warn("rate limit check failed; failing open", "err", err)
+				metrics.RateLimitFailOpenTotal.WithLabelValues("per_key").Inc()
 				rlAllowed.Add(1)
 				next.ServeHTTP(w, r)
 				return
@@ -235,6 +238,7 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 
 			if !allowed {
 				rlRejected.Add(1)
+				metrics.RateLimitRejectionsTotal.WithLabelValues("per_key").Inc()
 				retryAfter := int64(math.Ceil(tcfg.Window.Seconds()))
 				w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
 				httputil.WriteErrorCtx(r.Context(), w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "rate limit exceeded")

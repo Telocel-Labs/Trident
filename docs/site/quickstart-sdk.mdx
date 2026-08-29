@@ -1,0 +1,155 @@
+---
+title: "Quick Start — SDK"
+description: "Install the TypeScript SDK, get an API key, and make your first Soroban event query in under 5 minutes."
+---
+
+## 1. Install the SDK
+
+```bash
+npm install @trident-indexer/sdk
+# or
+yarn add @trident-indexer/sdk
+# or
+pnpm add @trident-indexer/sdk
+```
+
+The package ships pre-built CJS + ESM bundles and a `dist/index.d.ts` declaration for full autocomplete.
+
+---
+
+## 2. Get an API key
+
+Sign up at [trident.telocel.com](https://trident.telocel.com/signup) to get a free API key. The free tier gives you **10 requests/second** against the hosted testnet API.
+
+Your key looks like:
+
+```
+tdk_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Keep it secret — it is sent as a plain HTTP header on every request.
+
+---
+
+## 3. Make your first query
+
+The hosted testnet API is available at `https://api.trident.telocel.com`.
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!, // set in your environment
+  network: "testnet",
+});
+
+// Query the last 10 events from any contract on testnet
+const result = await client.queryEvents({ limit: 10 });
+
+console.log(`Found ${result.events.length} events`);
+for (const event of result.events) {
+  console.log(
+    `  [${event.ledgerSequence}] ${event.contractId} — topics: ${event.topics.join(", ")}`
+  );
+}
+```
+
+**Expected output** (values will vary):
+
+```
+Found 10 events
+  [12345678] CAAAA...AD2KM — topics: AAAADQAAAAh0cmFuc2Zlcg==, ...
+  [12345677] CAAAA...AD2KM — topics: AAAADQAAAARtaW50, ...
+  ...
+```
+
+---
+
+## 4. Filter by contract and topic
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+// Filter to transfer events from a specific contract
+const page = await client.queryEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  topic0: "transfer",
+  limit: 50,
+});
+
+console.log(`Page 1: ${page.events.length} events, hasMore=${page.hasMore}`);
+
+// Fetch the next page
+if (page.hasMore && page.cursor) {
+  const page2 = await client.queryEvents({
+    after: page.cursor,
+    limit: 50,
+  });
+  console.log(`Page 2: ${page2.events.length} events`);
+}
+```
+
+---
+
+## 5. Drain all pages with the async iterator
+
+For large backlogs, use `iterEvents` instead of managing cursors manually:
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+let count = 0;
+for await (const event of client.iterEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+})) {
+  count++;
+  // process event — typed as SorobanEvent
+  console.log(event.id, event.transactionHash);
+}
+console.log(`Total events: ${count}`);
+```
+
+`iterEvents` fetches pages automatically until `hasMore` is false, up to a default cap of 100 pages. Raise `maxPages` for large backfills:
+
+```typescript
+for await (const event of client.iterEvents(
+  { contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM" },
+  { maxPages: 1000 }
+)) {
+  // ...
+}
+```
+
+---
+
+## What's next?
+
+<CardGroup cols={2}>
+  <Card title="SDK Reference" icon="code" href="/sdk/client">
+    Explore every method, parameter, and type exported by the SDK.
+  </Card>
+  <Card title="REST API Reference" icon="server" href="/api-reference/events-list">
+    Query the API directly with curl or any HTTP client.
+  </Card>
+  <Card title="WebSocket Subscriptions" icon="bolt" href="/websocket/connecting">
+    Subscribe to live events as they land on-chain.
+  </Card>
+  <Card title="Self-Hosting" icon="docker" href="/quickstart-self-hosted">
+    Run your own Trident stack with Docker Compose.
+  </Card>
+</CardGroup>

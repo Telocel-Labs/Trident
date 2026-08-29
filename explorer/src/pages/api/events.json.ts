@@ -1,15 +1,15 @@
-import type { APIRoute } from 'astro';
-import { listEvents } from '../../lib/api';
-import type { Network } from '../../lib/types';
+import type { APIRoute } from "astro";
+import { listEvents } from "../../lib/api";
+import type { Network } from "../../lib/types";
 
 export const GET: APIRoute = async ({ url }) => {
-  const rawNetwork = url.searchParams.get('network');
-  const network: Network = rawNetwork === 'mainnet' ? 'mainnet' : 'testnet';
-  const contractId = url.searchParams.get('contractId') ?? undefined;
-  const topic0 = url.searchParams.get('topic0') ?? undefined;
-  const cursor = url.searchParams.get('cursor') ?? undefined;
-  const rawFrom = url.searchParams.get('ledgerFrom');
-  const rawTo = url.searchParams.get('ledgerTo');
+  const rawNetwork = url.searchParams.get("network");
+  const network: Network = rawNetwork === "mainnet" ? "mainnet" : "testnet";
+  const contractId = url.searchParams.get("contractId") ?? undefined;
+  const topic0 = url.searchParams.get("topic0") ?? undefined;
+  const cursor = url.searchParams.get("cursor") ?? undefined;
+  const rawFrom = url.searchParams.get("ledgerFrom");
+  const rawTo = url.searchParams.get("ledgerTo");
 
   try {
     const result = await listEvents({
@@ -23,14 +23,17 @@ export const GET: APIRoute = async ({ url }) => {
     });
     return new Response(JSON.stringify(result), {
       headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-store',
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=5, s-maxage=5",
       },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: 'Failed to fetch events' }), {
+    return new Response(JSON.stringify({ error: "Failed to fetch events" }), {
       status: 502,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=2",
+      },
     });
   }
 };

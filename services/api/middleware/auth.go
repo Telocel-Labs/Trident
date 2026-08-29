@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -27,6 +28,12 @@ type DBAuthConfig struct {
 }
 
 const authCacheTTL = 5 * time.Minute
+
+// authDBQueryTimeout bounds the DB fallback lookup in NewDBAuth (issue #238)
+// — this runs on nearly every request, so it gets a tight deadline rather
+// than the full request budget, matching handlers/status.go's convention for
+// other hot/lightweight DB reads.
+const authDBQueryTimeout = 2 * time.Second
 
 // ParseKeyHashes parses a comma-separated list of HMAC-SHA256 hex digests
 // (as stored in API_KEY_HASHES) into a set for O(1) lookup.
@@ -67,6 +74,22 @@ func authRedisCacheKey(hash string) string {
 	return fmt.Sprintf("apiauth:%s", hash)
 }
 
+// withAuthenticatedKey attaches the authenticated key's id/network to ctx for
+// downstream handlers (contextKeyAPIKeyID/contextKeyNetwork) and, when idStr
+// parses as a UUID, also for the audit log writer (auditLogAPIKeyIDKey) so
+// audit_log.api_key_id — and anything derived from it, like per-key usage
+// rollups — is actually populated for DB-backed keys.
+func withAuthenticatedKey(ctx context.Context, idStr, network string) context.Context {
+	ctx = WithAPIKeyID(ctx, idStr)
+	if network != "" {
+		ctx = context.WithValue(ctx, contextKeyNetwork, network)
+	}
+	if id, err := uuid.Parse(idStr); err == nil {
+		ctx = WithAuditAPIKeyID(ctx, &id)
+	}
+	return ctx
+}
+
 // NewDBAuth returns an authentication middleware that:
 //  1. Looks up the hashed API key in Redis cache (5 min TTL).
 //  2. Falls back to the api_keys database table (active keys only).
@@ -79,7 +102,12 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Public paths — skip auth entirely.
 			path := r.URL.Path
-			if path == "/v1/health" || path == "/metrics" {
+			// /v1/version stays authenticated: it publishes the exact commit
+			// SHA and applied schema version, which narrows an attacker's
+			// search for known-vulnerable code paths. Operators debugging
+			// "which build is live?" have a key; anonymous callers do not
+			// need one. /v1/ready already covers unauthenticated liveness.
+			if path == "/v1/health" || path == "/v1/ready" || path == "/metrics" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -100,10 +128,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 				if cached, err := cfg.Redis.Get(r.Context(), authRedisCacheKey(dbHash)).Result(); err == nil {
 					// Cached value format: "<uuid>:<network>"
 					parts := strings.SplitN(cached, ":", 2)
-					ctx := context.WithValue(r.Context(), contextKeyAPIKeyID, parts[0])
+					network := ""
 					if len(parts) == 2 {
-						ctx = context.WithValue(ctx, contextKeyNetwork, parts[1])
+						network = parts[1]
 					}
+					ctx := withAuthenticatedKey(r.Context(), parts[0], network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
@@ -111,8 +140,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 
 			// ── 2. Database lookup ──────────────────────────────────────────
 			if cfg.DB != nil {
+				dbCtx, cancel := context.WithTimeout(r.Context(), authDBQueryTimeout)
+				defer cancel()
+
 				var id, network string
-				err := cfg.DB.QueryRow(r.Context(),
+				err := cfg.DB.QueryRow(dbCtx,
 					`SELECT id, network FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
 					dbHash,
 				).Scan(&id, &network)
@@ -122,8 +154,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 						cfg.Redis.Set(r.Context(), authRedisCacheKey(dbHash),
 							id+":"+network, authCacheTTL)
 					}
-					ctx := context.WithValue(r.Context(), contextKeyAPIKeyID, id)
-					ctx = context.WithValue(ctx, contextKeyNetwork, network)
+					ctx := withAuthenticatedKey(r.Context(), id, network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}

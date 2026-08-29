@@ -1,0 +1,105 @@
+---
+title: "WebSocket — SDK Example"
+description: "Subscribe to real-time Soroban contract events using the TypeScript SDK."
+---
+
+## subscribeToContract()
+
+The SDK's `subscribeToContract` method opens a WebSocket connection, registers your subscription, and delivers events to your callback — with automatic reconnection built in.
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent, Subscription } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+// Subscribe to all transfer events from a contract
+const sub: Subscription = client.subscribeToContract({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  topic0: "transfer", // optional — filter by first topic
+  onEvent: (event: SorobanEvent) => {
+    console.log(`[ledger ${event.ledgerSequence}] ${event.contractId}`);
+    console.log(`  tx: ${event.transactionHash}`);
+    console.log(`  topics: ${event.topics.join(", ")}`);
+  },
+  onError: (err: Error) => {
+    // Called on errors — the SDK continues to reconnect
+    console.error("WebSocket error:", err.message);
+  },
+});
+
+// The subscription stays open until you call unsubscribe()
+// To close it after 60 seconds:
+setTimeout(() => {
+  sub.unsubscribe();
+  console.log("Unsubscribed.");
+}, 60_000);
+```
+
+---
+
+## Listening to multiple contracts
+
+Call `subscribeToContract` multiple times — each call creates an independent WebSocket connection with its own reconnect lifecycle:
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+function handleEvent(label: string) {
+  return (event: SorobanEvent) => {
+    console.log(`[${label}] Event: ${event.id}`);
+  };
+}
+
+const sub1 = client.subscribeToContract({
+  contractId: "CAAA...token1",
+  topic0: "transfer",
+  onEvent: handleEvent("token1"),
+});
+
+const sub2 = client.subscribeToContract({
+  contractId: "CBBB...token2",
+  topic0: "mint",
+  onEvent: handleEvent("token2"),
+});
+
+// Tear down both subscriptions
+process.on("SIGINT", () => {
+  sub1.unsubscribe();
+  sub2.unsubscribe();
+  process.exit(0);
+});
+```
+
+---
+
+## TypeScript types
+
+```typescript
+interface SubscribeToContractParams {
+  /** Stellar contract address to subscribe to (C… strkey). */
+  contractId: string;
+  /** Optional topic filter — only events where the first topic matches are delivered. */
+  topic0?: string;
+  /** Called for every incoming event matching the filter. */
+  onEvent: (event: SorobanEvent) => void;
+  /** Called on WebSocket errors. The subscription continues to auto-reconnect. */
+  onError?: (error: Error) => void;
+}
+
+interface Subscription {
+  /** Close the WebSocket connection and cancel any pending reconnect. */
+  unsubscribe: () => void;
+}
+```

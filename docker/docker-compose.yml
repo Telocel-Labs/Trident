@@ -3,7 +3,7 @@
 
 services:
   postgres:
-    image: postgres:15-alpine@sha256:2d4c9e0e6b3cade6c0a5e0a8c0a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6
+    image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -38,7 +38,14 @@ services:
   # for the prepared-statement / session-variable caveats this implies.
   # ---------------------------------------------------------------------------
   pgbouncer:
-    image: pgbouncer/pgbouncer:1.22@sha256:7c8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f
+    # NOTE: pgbouncer/pgbouncer never published a 1.22 tag — its newest is
+    # 1.15.0 — and the digest previously pinned here did not exist either, so
+    # this service could not start at all (issue #371). Pinned to the real
+    # 1.15.0. If a newer PgBouncer is needed, edoburu/pgbouncer tracks
+    # upstream far more closely (v1.25.x), but it takes a different
+    # configuration contract than the PGBOUNCER_* variables set below, so
+    # switching is a deliberate change rather than a retag.
+    image: pgbouncer/pgbouncer:1.15.0@sha256:aa8a38b7b33e5fe70c679053f97a8e55c74d52b00c195f0880845e52b50ce516
     environment:
       DATABASES_HOST: postgres
       DATABASES_PORT: 5432
@@ -47,6 +54,15 @@ services:
       DATABASES_PASSWORD: ${POSTGRES_PASSWORD}
       PGBOUNCER_LISTEN_PORT: 6432
       PGBOUNCER_AUTH_TYPE: scram-sha-256
+      # With scram-sha-256 and no userlist file, PgBouncer has no credentials
+      # to verify against and rejects every login to the virtual `pgbouncer`
+      # database with "no such user" — which is why GET /v1/admin/db could
+      # never return 200 (the admin console was unreachable, not misrouted).
+      # AUTH_USER/AUTH_QUERY let it look the hash up in Postgres instead of
+      # maintaining a userlist that would duplicate the password in a second
+      # place.
+      PGBOUNCER_AUTH_USER: ${POSTGRES_USER}
+      PGBOUNCER_AUTH_QUERY: SELECT usename, passwd FROM pg_shadow WHERE usename=$$1
       PGBOUNCER_POOL_MODE: transaction
       PGBOUNCER_MAX_CLIENT_CONN: 1000
       # DEFAULT_POOL_SIZE must be >= the sum of every service's per-instance
@@ -119,16 +135,24 @@ services:
       PORT: ${PORT}
       API_KEY_SALT: ${API_KEY_SALT}
       API_KEY_HASHES: ${API_KEY_HASHES}
+      # Required: middleware.ValidateAllowedOrigins fails startup when this is
+      # unset. There is deliberately no default — a wildcard fallback here
+      # would silently disable CORS enforcement for every deployment.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
       LOG_LEVEL: ${LOG_LEVEL}
     ports:
       - "${PORT}:${PORT}"
-    # Probe the health endpoint we just implemented. wget is used instead of
-    # curl because it is available in the scratch/alpine base images without
-    # adding an extra layer. The 4-second timeout matches the handler's
-    # 3-second per-check timeout plus one second of slack.
+    # Probe /v1/ready (issue #243), not /v1/health — compose's healthcheck
+    # gates other services' `depends_on: condition: service_healthy`, so it
+    # needs the readiness semantics (DB/Redis/gRPC reachable), not just
+    # liveness. wget is used instead of curl because it is available in the
+    # scratch/alpine base images without adding an extra layer. The
+    # 4-second timeout matches the handler's 3-second per-check timeout plus
+    # one second of slack.
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
-             "http://localhost:${PORT}/v1/health"]
+             "http://localhost:${PORT}/v1/ready"]
       interval: 15s
       timeout: 5s
       retries: 3

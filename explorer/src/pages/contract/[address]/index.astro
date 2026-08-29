@@ -1,7 +1,10 @@
 ---
 import Base from '../../../layouts/Base.astro';
+import ErrorState from '../../../components/ErrorState.astro';
+import EmptyState from '../../../components/EmptyState.astro';
 import { listEvents } from '../../../lib/api';
 import { truncate, relativeTime, stellarExpertBase, tryFormatJson } from '../../../lib/format';
+import { ErrorType, getErrorState, classifyError } from '../../../lib/errors';
 import type { Network, SorobanEvent } from '../../../lib/types';
 
 const { address } = Astro.params as { address: string };
@@ -15,7 +18,7 @@ const cursor = Astro.url.searchParams.get('cursor') ?? '';
 let events: SorobanEvent[] = [];
 let hasMore = false;
 let nextCursor: string | null = null;
-let fetchError = '';
+let errorState = null as ReturnType<typeof getErrorState> | null;
 
 try {
   const result = await listEvents({
@@ -27,12 +30,274 @@ try {
     cursor: cursor || undefined,
     limit: 25,
   });
+  
   events = result.events;
   hasMore = result.has_more;
   nextCursor = result.next_cursor;
+
+  // No events at all
+  if (events.length === 0 && !cursor) {
+    errorState = getErrorState(ErrorType.NO_DATA, { address });
+  }
+  // Empty result with filters
+  else if (events.length === 0 && (topic0Filter || ledgerFrom || ledgerTo)) {
+    errorState = getErrorState(ErrorType.EMPTY_RESULT, {
+      filter: topic0Filter || `ledgers ${ledgerFrom}-${ledgerTo}`,
+      clearUrl: `/contract/${address}?network=${network}`,
+    });
+  }
 } catch (err) {
-  fetchError = err instanceof Error ? err.message : 'Failed to fetch events';
+  const error = err instanceof Error ? err : new Error(String(err));
+  
+  // Classify the error
+  let errorType = classifyError(error);
+  
+  // Special handling for timeout
+  if (error.message.includes('AbortError') || error.name === 'AbortError') {
+    errorType = ErrorType.TIMEOUT;
+  }
+  
+  errorState = getErrorState(errorType, {
+    error,
+    statusCode: error.message.match(/API (\d+)/)?.[1],
+    timeout: 30,
+    address,
+  });
 }
+
+// Collect distinct topic_0 values for the filter dropdown
+const distinctTypes = [...new Set(events.map((e) => e.topics[0] ?? e.event_type))].sort();
+
+// OG meta
+const shortAddr = truncate(address);
+const ogTitle = `Events for ${shortAddr} on Stellar ${network.charAt(0).toUpperCase() + network.slice(1)}`;
+const latestEvent = events[0];
+const ogDescription = latestEvent
+  ? `Events indexed for this contract. Latest: ${latestEvent.topics[0] ?? latestEvent.event_type} at ledger ${latestEvent.ledger_sequence}.`
+  : `Soroban contract events on Stellar ${network}.`;
+
+const expertBase = stellarExpertBase(network);
+
+// Build filter URL helper
+function filterUrl(overrides: Record<string, string>): string {
+  const params = new URLSearchParams({
+    network,
+    ...(topic0Filter ? { topic0: topic0Filter } : {}),
+    ...(ledgerFrom ? { ledgerFrom } : {}),
+    ...(ledgerTo ? { ledgerTo } : {}),
+  });
+  for (const [k, v] of Object.entries(overrides)) {
+    if (v) params.set(k, v);
+    else params.delete(k);
+  }
+  return `?${params.toString()}`;
+}
+---
+
+<Base
+  title={`Events — ${shortAddr}`}
+  description={ogDescription}
+  ogTitle={ogTitle}
+  ogDescription={ogDescription}
+>
+  <!-- Breadcrumb -->
+  <nav class="text-xs text-gray-500 mb-6 flex items-center gap-1.5" aria-label="Breadcrumb">
+    <a href={`/?network=${network}`} class="hover:text-white">Home</a>
+    <span>/</span>
+    <span class="text-gray-300 font-mono" title={address}>{shortAddr}</span>
+  </nav>
+
+  <!-- Contract header -->
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center gap-3">
+    <div class="flex-1 min-w-0">
+      <h1 class="text-xl font-bold text-white flex items-center gap-2 flex-wrap">
+        <span class="font-mono text-indigo-300 break-all" id="contract-address">{address}</span>
+      </h1>
+      <div class="mt-1 flex gap-3 text-xs text-gray-400">
+        <a
+          href={`${expertBase}/contract/${address}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          class="hover:text-white underline underline-offset-2"
+        >
+          Stellar Expert ↗
+        </a>
+        <span
+          class={`px-2 py-0.5 rounded-full text-xs font-medium ${
+            network === 'mainnet'
+              ? 'bg-amber-900/40 text-amber-400'
+              : 'bg-blue-900/40 text-blue-400'
+          }`}
+        >
+          {network}
+        </span>
+      </div>
+    </div>
+
+    <button
+      id="copy-address"
+      class="text-xs px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white transition-colors shrink-0 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+      data-address={address}
+    >
+      Copy address
+    </button>
+  </div>
+
+  <!-- Error state -->
+  {errorState && !events.length && (
+    <ErrorState error={errorState} />
+  )}
+
+  <!-- Filters (only show if we have data or are paginating) -->
+  {(events.length > 0 || cursor) && (
+    <form method="get" class="mb-5 flex flex-wrap gap-3 items-end text-sm">
+      <input type="hidden" name="network" value={network} />
+
+      <div class="flex flex-col gap-1">
+        <label for="topic0-filter" class="text-xs text-gray-400">Event type</label>
+        <select
+          id="topic0-filter"
+          name="topic0"
+          class="px-3 py-1.5 rounded bg-gray-800 border border-gray-700 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+        >
+          <option value="">All types</option>
+          {distinctTypes.map((t) => (
+            <option value={t} selected={t === topic0Filter}>{t}</option>
+          ))}
+        </select>
+      </div>
+
+      <div class="flex flex-col gap-1">
+        <label for="ledger-from" class="text-xs text-gray-400">Ledger from</label>
+        <input
+          id="ledger-from"
+          type="number"
+          name="ledgerFrom"
+          value={ledgerFrom}
+          min="1"
+          placeholder="e.g. 55000"
+          class="w-32 px-3 py-1.5 rounded bg-gray-800 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+        />
+      </div>
+
+      <div class="flex flex-col gap-1">
+        <label for="ledger-to" class="text-xs text-gray-400">Ledger to</label>
+        <input
+          id="ledger-to"
+          type="number"
+          name="ledgerTo"
+          value={ledgerTo}
+          min="1"
+          placeholder="e.g. 56000"
+          class="w-32 px-3 py-1.5 rounded bg-gray-800 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+        />
+      </div>
+
+      <button
+        type="submit"
+        class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-white font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500"
+      >
+        Apply
+      </button>
+
+      {(topic0Filter || ledgerFrom || ledgerTo) && (
+        <a
+          href={filterUrl({ topic0: '', ledgerFrom: '', ledgerTo: '' })}
+          class="px-4 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500"
+        >
+          Clear
+        </a>
+      )}
+    </form>
+  )}
+
+  <!-- Events table -->
+  {events.length > 0 ? (
+    <div>
+      <div class="overflow-x-auto rounded-lg border border-gray-800">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-900 text-xs text-gray-400 uppercase tracking-wide">
+            <tr>
+              <th class="px-4 py-3 text-left">Time</th>
+              <th class="px-4 py-3 text-left">Ledger</th>
+              <th class="px-4 py-3 text-left">Type</th>
+              <th class="px-4 py-3 text-left hidden md:table-cell">Topic 1</th>
+              <th class="px-4 py-3 text-left hidden lg:table-cell">Tx Hash</th>
+              <th class="px-4 py-3 text-left hidden xl:table-cell">Data</th>
+            </tr>
+          </thead>
+          <tbody id="events-tbody" class="divide-y divide-gray-800">
+            {events.map((e) => (
+              <tr
+                class="hover:bg-gray-900/60 cursor-pointer transition-colors"
+                data-href={`/contract/${address}/event/${e.id}?network=${network}`}
+              >
+                <td class="px-4 py-3 text-gray-400 whitespace-nowrap text-xs" title={e.ledger_timestamp}>
+                  {relativeTime(e.ledger_timestamp)}
+                </td>
+                <td class="px-4 py-3 font-mono text-gray-300 text-xs">
+                  <a
+                    href={`?${new URLSearchParams({ network, ledgerFrom: String(e.ledger_sequence), ledgerTo: String(e.ledger_sequence) })}`}
+                    class="hover:text-indigo-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded"
+                  >
+                    {e.ledger_sequence}
+                  </a>
+                </td>
+                <td class="px-4 py-3">
+                  <span class="px-2 py-0.5 rounded-full text-xs bg-indigo-900/50 text-indigo-300 font-medium">
+                    {e.topics[0] ?? e.event_type}
+                  </span>
+                </td>
+                <td class="px-4 py-3 font-mono text-gray-400 text-xs truncate max-w-[180px] hidden md:table-cell" title={e.topics[1]}>
+                  {e.topics[1] ? truncate(e.topics[1], 12, 8) : '—'}
+                </td>
+                <td class="px-4 py-3 hidden lg:table-cell">
+                  <a
+                    href={`${expertBase}/tx/${e.transaction_hash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="font-mono text-xs text-gray-400 hover:text-indigo-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded"
+                    title={e.transaction_hash}
+                  >
+                    {truncate(e.transaction_hash, 8, 6)}
+                  </a>
+                </td>
+                <td class="px-4 py-3 hidden xl:table-cell font-mono text-xs text-gray-500 max-w-[200px] truncate" title={e.data}>
+                  {e.data ? tryFormatJson(e.data).slice(0, 60) : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Pagination -->
+      <div class="mt-4 flex items-center justify-between">
+        {cursor ? (
+          <a
+            href={filterUrl({ cursor: '' })}
+            class="text-sm text-gray-400 hover:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded"
+          >
+            ← Back to first page
+          </a>
+        ) : <span />}
+
+        {hasMore && nextCursor && (
+          <div>
+            <a
+              id="load-more-link"
+              href={filterUrl({ cursor: nextCursor })}
+              class="px-5 py-2 rounded bg-gray-800 hover:bg-gray-700 text-white text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              data-cursor={nextCursor}
+            >
+              Load more
+            </a>
+          </div>
+        )}
+      </div>
+    </div>
+  ) : null}
+</Base>
 
 // Collect distinct topic_0 values for the filter dropdown
 const distinctTypes = [...new Set(events.map((e) => e.topics[0] ?? e.event_type))].sort();
@@ -174,15 +439,7 @@ function filterUrl(overrides: Record<string, string>): string {
   </form>
 
   <!-- Events table -->
-  {fetchError ? (
-    <div class="rounded-lg bg-red-900/30 border border-red-800 px-4 py-3 text-sm text-red-300">
-      Failed to load events: {fetchError}
-    </div>
-  ) : events.length === 0 ? (
-    <div class="text-center py-16 text-gray-500">
-      No events found for this contract{topic0Filter ? ` with type "${topic0Filter}"` : ''}.
-    </div>
-  ) : (
+  {events.length > 0 ? (
     <div>
       <div class="overflow-x-auto rounded-lg border border-gray-800">
         <table class="w-full text-sm">

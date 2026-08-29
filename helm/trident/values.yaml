@@ -5,7 +5,9 @@
 
 global:
   # Name of a pre-existing Secret that holds sensitive env vars.
-  # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY
+  # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY, API_KEY_SALT,
+  # STELLAR_RPC_URL. Production values files contain references only; the
+  # values themselves live in the external backend configured below.
   #
   # This name is also the *target* Secret when externalSecret.enabled is
   # true below — the operator writes/syncs into a Secret with this same
@@ -35,7 +37,8 @@ global:
       kind: ClusterSecretStore
     refreshInterval: 1h
     # Maps each key the chart's Secret needs (DATABASE_URL, REDIS_URL,
-    # ADMIN_API_KEY) to its path in the backend. Defaults assume a
+    # ADMIN_API_KEY, API_KEY_SALT, STELLAR_RPC_URL) to its path in the backend.
+    # Defaults assume a
     # single JSON/KV secret at "trident/prod" with matching keys —
     # override remoteRef.key / .property per backend layout.
     data:
@@ -51,6 +54,14 @@ global:
         remoteRef:
           key: trident/prod
           property: ADMIN_API_KEY
+      - secretKey: API_KEY_SALT
+        remoteRef:
+          key: trident/prod
+          property: API_KEY_SALT
+      - secretKey: STELLAR_RPC_URL
+        remoteRef:
+          key: trident/prod
+          property: STELLAR_RPC_URL
 
 # ---------------------------------------------------------------------------
 # Database migrations (issue #308) — runs as a Helm pre-install/pre-upgrade
@@ -190,6 +201,9 @@ goApi:
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
+  # Liveness hits the cheap, dependency-free /v1/health (issue #243) — it
+  # must never fail just because Postgres/Redis/the gRPC backend is
+  # unreachable, since restarting this pod can't fix an external dependency.
   livenessProbe:
     httpGet:
       path: /v1/health
@@ -198,15 +212,20 @@ goApi:
     periodSeconds: 10
     failureThreshold: 3
     timeoutSeconds: 2
+  # Readiness hits /v1/ready (issue #243), which checks Postgres, Redis, and
+  # the gRPC backend concurrently with a 3s-per-dependency timeout in the
+  # handler (services/api/handlers/health.go) — timeoutSeconds here must
+  # exceed that, or the probe itself times out before a legitimately slow
+  # (but healthy) dependency check can complete.
   readinessProbe:
     httpGet:
-      path: /v1/health
+      path: /v1/ready
       port: 3000
     initialDelaySeconds: 5
     periodSeconds: 5
     # Stricter than liveness — pod is removed from rotation faster
     failureThreshold: 1
-    timeoutSeconds: 2
+    timeoutSeconds: 4
   # Grace period must be >= the bounded shutdown window in main.go so SIGTERM
   # drains in-flight requests before K8s force-kills the pod (issue #233).
   terminationGracePeriodSeconds: 30
