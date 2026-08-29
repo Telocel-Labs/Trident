@@ -135,7 +135,7 @@ func TestContractsStatsBadInputReturnsCanonicalEnvelope(t *testing.T) {
 		query     string
 		wantField string
 	}{
-		{"unknown network", "?network=futurenet", "network"},
+		{"unknown network", "?network=invalidnet", "network"},
 		{"limit above maximum", "?limit=101", "limit"},
 		{"negative from_ledger", "?from_ledger=-3", "from_ledger"},
 		{"inverted ledger range", "?from_ledger=90&to_ledger=10", "to_ledger"},

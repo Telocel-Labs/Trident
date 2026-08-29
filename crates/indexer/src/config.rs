@@ -108,7 +108,14 @@ impl Config {
         };
 
         // ── Network ─────────────────────────────────────────────────────────
-        let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into());
+        let raw_network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into());
+        let network = match trident_common::types::Network::parse_normalized(&raw_network) {
+            Ok(net) => net.as_str().to_string(),
+            Err(e) => {
+                errors.push(format!("[trident-indexer] NETWORK: {e}"));
+                raw_network
+            }
+        };
 
         // Network passphrase for SAC contract id derivation (issue #262).
         let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {

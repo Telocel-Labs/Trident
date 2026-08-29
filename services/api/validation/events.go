@@ -114,10 +114,12 @@ const (
 // DefaultNetwork is applied when a request does not specify one.
 const DefaultNetwork = "testnet"
 
-// validNetworks holds the accepted values for the ?network filter.
+// validNetworks holds the accepted values for the ?network filter (issue #252).
 var validNetworks = map[string]bool{
-	"testnet": true,
-	"mainnet": true,
+	"pubnet":    true,
+	"testnet":   true,
+	"futurenet": true,
+	"local":     true,
 }
 
 // QueryStatsParams holds validated parameters for GET /v1/stats/contracts.
@@ -137,7 +139,7 @@ type QueryStatsParams struct {
 // Validation rules:
 //   - from_ledger: non-negative integer if present; default 0 (all time)
 //   - to_ledger:   non-negative integer if present; default latest indexed
-//   - network:     one of "testnet", "mainnet"; default "testnet"
+//   - network:     one of "pubnet", "testnet", "futurenet", "local" (or "mainnet" alias); default "testnet"
 //   - limit:       integer in [1, 100]; default 50
 func ValidateQueryStats(
 	fromLedgerStr, toLedgerStr, networkStr, limitStr string,

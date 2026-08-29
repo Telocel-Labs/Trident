@@ -1,6 +1,61 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Issue #252 — Network scoping and validation
+// ---------------------------------------------------------------------------
+
+/// Stellar network names supported by Trident (issue #252).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    Pubnet,
+    Testnet,
+    Futurenet,
+    Local,
+}
+
+impl Network {
+    pub const ALLOWED_NETWORKS: &'static [&'static str] = &["pubnet", "testnet", "futurenet", "local"];
+
+    /// Normalizes and parses a network string.
+    /// Maps "mainnet" to `Pubnet` and "standalone" to `Local`. Rejects unknown values.
+    pub fn parse_normalized(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pubnet" | "mainnet" => Ok(Network::Pubnet),
+            "testnet" => Ok(Network::Testnet),
+            "futurenet" => Ok(Network::Futurenet),
+            "local" | "standalone" => Ok(Network::Local),
+            other => Err(format!(
+                "Invalid network '{other}'. Allowed networks: {:?}",
+                Self::ALLOWED_NETWORKS
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Network::Pubnet => "pubnet",
+            Network::Testnet => "testnet",
+            Network::Futurenet => "futurenet",
+            Network::Local => "local",
+        }
+    }
+}
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for Network {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_normalized(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Issue #271 — Contract liveness / TTL tracking
 // ---------------------------------------------------------------------------
 

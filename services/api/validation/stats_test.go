@@ -18,13 +18,13 @@ func TestValidateQueryStats_Defaults(t *testing.T) {
 }
 
 func TestValidateQueryStats_ValidParams(t *testing.T) {
-	params, err := ValidateQueryStats("1000", "5000", "mainnet", "100")
+	params, err := ValidateQueryStats("1000", "5000", "pubnet", "100")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assert.Equal(t, int64(1000), params.FromLedger)
 	assert.Equal(t, int64(5000), params.ToLedger)
-	assert.Equal(t, "mainnet", params.Network)
+	assert.Equal(t, "pubnet", params.Network)
 	assert.Equal(t, int64(100), params.Limit)
 }
 
@@ -71,7 +71,7 @@ func TestValidateQueryStats_NetworkCaseInsensitive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assert.Equal(t, "mainnet", params.Network)
+	assert.Equal(t, "pubnet", params.Network)
 }
 
 func TestValidateQueryStats_InvalidLimit_TooSmall(t *testing.T) {

@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash         TEXT        NOT NULL UNIQUE,   -- SHA-256 hex of full key
     key_prefix       TEXT        NOT NULL,           -- first 16 chars of plaintext key (for display)
     label            TEXT        NOT NULL DEFAULT '',
-    network          TEXT        NOT NULL DEFAULT 'mainnet',
+    network          TEXT        NOT NULL DEFAULT 'pubnet',
     rate_limit_tier  TEXT        NOT NULL DEFAULT 'standard',
     created_by       TEXT,                           -- optional creator identifier
     last_used_at     TIMESTAMPTZ,
@@ -516,3 +516,23 @@ ALTER TABLE contract_storage_snapshots ADD CONSTRAINT contract_storage_snapshots
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_storage_snapshots_contract_id_network_storage_key__key ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence);
 CREATE INDEX IF NOT EXISTS idx_contract_storage_snapshots_latest ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence DESC);
+
+-- ---------------------------------------------------------------------------
+-- Network Constraints  (migration 0027)
+-- Typed constraint on network column across all scoped tables (issue #252).
+-- ---------------------------------------------------------------------------
+ALTER TABLE soroban_events ADD CONSTRAINT chk_soroban_events_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE indexed_contracts ADD CONSTRAINT chk_indexed_contracts_network CHECK (network IS NULL OR network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE api_keys ADD CONSTRAINT chk_api_keys_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE audit_log ADD CONSTRAINT chk_audit_log_network CHECK (network IS NULL OR network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE webhook_subscriptions ADD CONSTRAINT chk_webhook_subscriptions_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE token_events ADD CONSTRAINT chk_token_events_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE contract_invocation_metrics ADD CONSTRAINT chk_contract_invocation_metrics_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE contract_liveness ADD CONSTRAINT chk_contract_liveness_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE contract_verification ADD CONSTRAINT chk_contract_verification_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE contract_specs ADD CONSTRAINT chk_contract_specs_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE contract_stats_rollup ADD CONSTRAINT chk_contract_stats_rollup_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE contract_event_schemas ADD CONSTRAINT chk_contract_event_schemas_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE token_metadata ADD CONSTRAINT chk_token_metadata_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+ALTER TABLE contract_storage_snapshots ADD CONSTRAINT chk_contract_storage_snapshots_network CHECK (network IN ('pubnet', 'testnet', 'futurenet', 'local'));
+
