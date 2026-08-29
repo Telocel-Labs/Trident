@@ -122,11 +122,11 @@ func ValidateNetwork(field, value, def string) (string, *ValidationError) {
 	if value == "" {
 		return def, nil
 	}
-	lower := strings.ToLower(value)
-	if !validNetworks[lower] {
-		return "", Errorf(field, "must be one of: %s", allowedValues(validNetworks))
+	normalized := NormalizeNetwork(value)
+	if !AllowedNetworks[normalized] {
+		return "", Errorf(field, "must be one of: %s", allowedValues(AllowedNetworks))
 	}
-	return lower, nil
+	return normalized, nil
 }
 
 // ValidateEventType checks the event-type enum. An empty value means "no
@@ -145,16 +145,19 @@ func ValidateEventType(field, value string) (string, *ValidationError) {
 // ValidateRFC3339 parses a required RFC3339 timestamp parameter.
 func ValidateRFC3339(field, value string) (time.Time, *ValidationError) {
 	if value == "" {
-		return time.Time{}, Errorf(field, "is required (RFC3339 timestamp)")
+		return time.Time{}, Errorf(field, "is required")
 	}
-	ts, err := time.Parse(time.RFC3339, value)
+	t, err := time.Parse(time.RFC3339, value)
 	if err != nil {
-		return time.Time{}, Errorf(field, "must be an RFC3339 timestamp (e.g. 2024-01-02T15:04:05Z)")
+		return time.Time{}, Errorf(field, "must be an RFC 3339 timestamp (e.g. 2024-01-15T12:00:00Z)")
 	}
-	return ts, nil
+	return t, nil
 }
 
-// ValidateTimeRange parses a required [from, to) timestamp window.
+// ValidateTimeRange parses both ends of a time window. It enforces:
+//   - both from and to are present and valid RFC3339 timestamps
+//   - from <= to
+//   - (to - from) <= maxDuration (when maxDuration > 0)
 func ValidateTimeRange(fromField, toField, fromValue, toValue string, maxDuration time.Duration) (time.Time, time.Time, *ValidationError) {
 	from, verr := ValidateRFC3339(fromField, fromValue)
 	if verr != nil {
@@ -168,15 +171,31 @@ func ValidateTimeRange(fromField, toField, fromValue, toValue string, maxDuratio
 		return time.Time{}, time.Time{}, Errorf(toField, "must be >= %s", fromField)
 	}
 	if maxDuration > 0 && to.Sub(from) > maxDuration {
-		return time.Time{}, time.Time{}, Errorf(toField, "range cannot exceed %v", maxDuration)
+		return time.Time{}, time.Time{}, Errorf(
+			toField,
+			"range (%s to %s) exceeds the maximum allowed window of %s",
+			fromField,
+			toField,
+			formatDuration(maxDuration),
+		)
 	}
 	return from, to, nil
 }
 
-// RejectUnknownParams fails the request when the query string carries a
-// parameter the endpoint does not understand. Silently ignoring a typo such as
-// `?limitt=5` hides client bugs behind a wrong-looking page size, so an unknown
-// parameter is an INVALID_ARGUMENT (issue #222).
+func formatDuration(d time.Duration) string {
+	if d%(24*time.Hour) == 0 {
+		days := d / (24 * time.Hour)
+		if days == 1 {
+			return "1 day"
+		}
+		return fmt.Sprintf("%d days", days)
+	}
+	return d.String()
+}
+
+// RejectUnknownParams returns a ValidationError naming the first unrecognized
+// query parameter key, or nil when all supplied keys are in the allowed set
+// (issue #222). Keys are sorted so the error message is deterministic.
 func RejectUnknownParams(q url.Values, allowed ...string) *ValidationError {
 	known := make(map[string]bool, len(allowed))
 	for _, a := range allowed {
@@ -219,4 +238,38 @@ func sortedCopy(in []string) []string {
 	copy(out, in)
 	sort.Strings(out)
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Issue #252 — Network scoping and validation
+// ---------------------------------------------------------------------------
+
+// AllowedNetworks is the canonical set of supported Stellar network names.
+var AllowedNetworks = map[string]bool{
+	"pubnet":    true,
+	"testnet":   true,
+	"futurenet": true,
+	"local":     true,
+}
+
+// NormalizeNetwork maps network aliases to their canonical enum representation.
+// (e.g. mainnet -> pubnet, standalone -> local).
+func NormalizeNetwork(val string) string {
+	normalized := strings.TrimSpace(strings.ToLower(val))
+	switch normalized {
+	case "mainnet":
+		return "pubnet"
+	case "standalone":
+		return "local"
+	default:
+		return normalized
+	}
+}
+
+// ValidateRequiredNetwork rejects empty or invalid network names.
+func ValidateRequiredNetwork(field, value string) (string, *ValidationError) {
+	if strings.TrimSpace(value) == "" {
+		return "", Errorf(field, "is required")
+	}
+	return ValidateNetwork(field, value, "")
 }

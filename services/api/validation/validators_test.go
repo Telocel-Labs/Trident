@@ -168,9 +168,12 @@ func TestValidateNetwork(t *testing.T) {
 	}{
 		{"absent uses default", "", "testnet", false},
 		{"testnet", "testnet", "testnet", false},
-		{"mainnet", "mainnet", "mainnet", false},
-		{"case insensitive", "MAINNET", "mainnet", false},
-		{"unknown network", "futurenet", "", true},
+		{"pubnet", "pubnet", "pubnet", false},
+		{"mainnet alias", "mainnet", "pubnet", false},
+		{"futurenet", "futurenet", "futurenet", false},
+		{"local", "local", "local", false},
+		{"case insensitive", "PUBNET", "pubnet", false},
+		{"unknown network", "invalidnet", "", true},
 	}
 
 	for _, tt := range tests {
