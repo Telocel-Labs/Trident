@@ -118,6 +118,11 @@ FUNCS = {
     "sort_desc","timestamp","year","month","day_of_month","days_in_month",
 }
 
+# Prefixes owned by exporters we deploy alongside Trident rather than by
+# Trident itself. A metric under one of these is verified by that exporter
+# being present in the deployment, which is a different check from this one.
+EXTERNAL_EXPORTER_PREFIXES = ("node_", "pg_", "redis_", "container_")
+
 doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
 found = set()
 for group in doc.get("groups") or []:
@@ -140,6 +145,14 @@ for group in doc.get("groups") or []:
             # service, so it will never appear on a /metrics endpoint. Its
             # own inputs are checked when its `record:` rule is scanned.
             if ":" in tok:
+                continue
+            # Metrics exported by a different agent, not by Trident. Disk
+            # capacity alerts (issue #432) read node_exporter's filesystem
+            # series, which will never appear on the API or indexer /metrics
+            # endpoints — the indexer does not, and should not, report the
+            # host's disk usage. Excluded by prefix rather than by name so a
+            # new node_* alert does not have to update this script.
+            if tok.startswith(EXTERNAL_EXPORTER_PREFIXES):
                 continue
             found.add(tok)
 

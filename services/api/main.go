@@ -117,10 +117,15 @@ func initTracer(ctx context.Context) func() {
 		res = resource.Default()
 	}
 
+	// Issue #457: a fixed low ratio alone means the one failing/slow
+	// request is almost never the one sampled. newAlwaysRecordSampler +
+	// newAlwaysKeepExporter together guarantee every error and every
+	// slow (>2s) request is exported regardless of the ratio, while the
+	// rest of traffic still samples at samplingRatio.
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(newAlwaysKeepExporter(exporter)),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.TraceIDRatioBased(samplingRatio)),
+		sdktrace.WithSampler(newAlwaysRecordSampler(samplingRatio)),
 	)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})

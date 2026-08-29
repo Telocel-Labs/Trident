@@ -1060,6 +1060,53 @@ jobs:
         run: bash scripts/check-image-digests.sh
 
   # ---------------------------------------------------------------------------
+  # Schema guard — migration lint + schema.sql drift detection (issue #436,
+  # closes #246).
+  #
+  # Exists because of #437: migration 0017 ran `CREATE INDEX IF NOT EXISTS`
+  # against names that still belonged to the pre-rename table, so six indexes
+  # silently failed to be created and were then dropped with the legacy table.
+  # schema.sql still listed them, nothing compared the two, and the database
+  # ran without them for nine migrations. Both checks below would have caught
+  # it on the commit that introduced it.
+  # ---------------------------------------------------------------------------
+  schema-guard:
+    name: Schema guard
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_schema_check
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Static checks first: they need no database and fail in under a second,
+      # so a numbering or destructive-statement mistake does not wait on a
+      # container to start.
+      - name: Lint migrations
+        run: bash scripts/lint-migrations.sh
+
+      # SDK versions must equal the OpenAPI spec version they are generated
+      # from (issue #429), so a published client's version identifies the API
+      # contract it implements. Needs no database, so it rides along here.
+      - name: Check SDK versions match the spec
+        run: bash scripts/check-sdk-versions.sh
+
+      - name: Check schema.sql matches the migration chain
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_schema_check
+        run: bash scripts/check-schema-drift.sh
+
+  # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
   helm:
@@ -1118,3 +1165,206 @@ jobs:
           kubectl get deployments
           kubectl get services
           kubectl get hpa
+
+  # ---------------------------------------------------------------------------
+  # Coverage — collect for Rust, Go, and the TS/Python SDKs, publish a PR
+  # summary, and enforce a floor on MVP-critical packages (issue #325).
+  #
+  # Thresholds are set from *measured* baselines, not aspiration: a floor above
+  # today's number turns the very next merge red for a reason unrelated to that
+  # merge. Each floor below sits at or just under the figure the package
+  # actually reports, so it catches regression without blocking work. Ratchet
+  # them upward deliberately as suites grow — that is the point of the gate.
+  #
+  # Scope is deliberately "critical packages", not the whole tree, per the
+  # issue's explicit non-goal of a repo-wide coverage mandate.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # --- Rust ------------------------------------------------------------
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          shared-key: rust-workspace
+
+      # cargo-llvm-cov, per the issue. (Not tarpaulin: llvm-cov uses the
+      # compiler's own instrumentation, so it reports the same regions rustc
+      # sees rather than a ptrace approximation.)
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@daa3c1f1f9a9d46f686d9fc2f65773d0c293688b # v2.44.68
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: trident
+        run: |
+          set -euo pipefail
+          for f in database/migrations/*.sql; do
+            psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d trident_test -f "$f"
+          done
+
+      - name: Rust coverage
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info -- --test-threads=1
+          cargo llvm-cov report --summary-only | tee rust-coverage.txt
+
+      # Report-only for now. The Rust floor is deliberately not enforced in
+      # this change: unlike Go, no baseline had been measured before this job
+      # existed, and picking a number without one is exactly the guesswork the
+      # Go gate's own comment warns against. The first scheduled run publishes
+      # the real figure; enforce from that, in a follow-up.
+      - name: Rust coverage summary (report only)
+        run: |
+          echo "### Rust coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat rust-coverage.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # --- Go --------------------------------------------------------------
+      - name: Set up Go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.25"
+          cache-dependency-path: services/api/go.sum
+
+      - name: Go coverage
+        working-directory: services/api
+        run: |
+          go test ./... -coverprofile=coverage.out
+          go tool cover -func=coverage.out | tee go-coverage.txt
+
+      # Per-package floors on the MVP-critical paths the issue names (handlers,
+      # middleware, cursor). Baselines measured on this commit: handlers 45.5%,
+      # middleware 69.6%, cursor 94.4%. Floors sit just below each so normal
+      # variation does not flap the build.
+      - name: Enforce Go critical-package floors
+        working-directory: services/api
+        run: |
+          set -euo pipefail
+          check() {
+            pkg="$1"; floor="$2"
+            actual=$(go test "./$pkg" -coverprofile="cov-$pkg.out" 2>/dev/null \
+              | grep -oE 'coverage: [0-9.]+%' | grep -oE '[0-9.]+' || echo "0")
+            echo "$pkg: ${actual}% (floor ${floor}%)"
+            awk -v a="$actual" -v f="$floor" 'BEGIN { exit !(a + 0 < f + 0) }' \
+              && { echo "::error::$pkg coverage ${actual}% is below the ${floor}% floor"; exit 1; } || true
+          }
+          check handlers 43
+          check middleware 66
+          check cursor 90
+          check validation 95
+
+      - name: Go coverage summary
+        run: |
+          echo "### Go coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -1 services/api/go-coverage.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # --- SDKs ------------------------------------------------------------
+      - name: Set up Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+
+      # The coverage provider is installed here rather than added to
+      # package.json devDependencies on purpose: package-lock.json carries the
+      # platform-specific optional deps (@rollup/rollup-linux-*, @emnapi/*) that
+      # this Linux runner needs, and regenerating it from a non-Linux dev machine
+      # prunes them — `npm ci` then passes locally and fails here. Installing the
+      # provider as a separate no-save step keeps the lockfile untouched.
+      - name: TypeScript SDK coverage
+        working-directory: sdk/typescript
+        run: |
+          npm ci
+          npm install --no-save --no-package-lock @vitest/coverage-v8
+          npx vitest run --coverage --coverage.reporter=text --coverage.reporter=lcov
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: "3.12"
+
+      # `--cov-fail-under=0` overrides the 90 configured in pyproject.toml for
+      # this reporting step. That 90 is aspirational: measured coverage on this
+      # commit is 53%, dragged down by the generated openapi_models_gen.py.
+      # Enforcing it as-is would fail every build immediately. The floor below
+      # gates the hand-written client code, which is what the issue means by a
+      # critical package.
+      - name: Python SDK coverage
+        working-directory: sdk/python
+        run: |
+          pip install -e ".[dev]" pytest-cov
+          pytest -q --cov --cov-report=term --cov-report=xml --cov-fail-under=0
+
+      - name: Enforce Python SDK floor (hand-written client only)
+        working-directory: sdk/python
+        run: python ../../scripts/check-python-sdk-coverage.py coverage.xml --floor 75
+
+      # --- Artefacts -------------------------------------------------------
+      # Uploaded rather than pushed to a third party: the issue accepts "CI
+      # artifact and/or Codecov", and an artifact needs no external account or
+      # token to be useful on a fork PR.
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: coverage-reports
+          path: |
+            lcov.info
+            rust-coverage.txt
+            services/api/coverage.out
+            services/api/go-coverage.txt
+            sdk/typescript/coverage/
+            sdk/python/coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats

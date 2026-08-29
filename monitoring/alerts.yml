@@ -258,3 +258,81 @@ groups:
             out for 10 minutes. Requests will start queuing or timing out on
             acquire once it's fully saturated.
           runbook_url: "docs/runbooks/alerts.md#tridentapidbpoolsaturated"
+
+  # ---------------------------------------------------------------------------
+  # Disk capacity — soroban_events grows without bound (issue #432).
+  #
+  # Thresholds are derived from a measured growth rate rather than picked as
+  # round numbers: 890 bytes per event including indexes, measured over 500k
+  # synthetic rows on the full migration chain (see
+  # docs/performance.md#storage-capacity-and-disk-growth).
+  #
+  # The design goal is lead time, not detection. A disk alert that fires at 95%
+  # gives roughly a day of warning at the 10x rate, which is not enough to
+  # provision and migrate. These fire on projected exhaustion instead, so the
+  # page arrives while there is still time to act.
+  #
+  # Requires node_exporter (node_filesystem_*) on the database host. If your
+  # Postgres is managed and does not expose those series, substitute the
+  # provider's equivalent disk metric — the thresholds still apply.
+  # ---------------------------------------------------------------------------
+  - name: trident.storage.capacity
+    rules:
+      - alert: TridentDiskFillingWithin14Days
+        expr: >
+          predict_linear(
+            node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}[6h],
+            14 * 24 * 3600
+          ) < 0
+        for: 1h
+        labels:
+          severity: warning
+          service: database
+        annotations:
+          summary: "Postgres volume projected to fill within 14 days"
+          description: >
+            Extrapolating the last 6 hours of growth, the Postgres data volume
+            on {{ $labels.instance }} runs out of space within 14 days. At the
+            measured 890 bytes/event this is the expected trajectory once
+            sustained event rates rise; it is a provisioning signal, not an
+            incident. Plan a volume resize or enable partition retention.
+          runbook_url: "docs/runbooks/alerts.md#tridentdiskfillingwithin14days"
+
+      - alert: TridentDiskFillingWithin48Hours
+        expr: >
+          predict_linear(
+            node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}[6h],
+            48 * 3600
+          ) < 0
+        for: 30m
+        labels:
+          severity: critical
+          service: database
+        annotations:
+          summary: "Postgres volume projected to fill within 48 hours"
+          description: >
+            The Postgres data volume on {{ $labels.instance }} is projected to
+            be full within 48 hours. A full volume stops ingest and fails
+            writes across the API. Resize now, or drop the oldest
+            soroban_events partition if retention allows.
+          runbook_url: "docs/runbooks/alerts.md#tridentdiskfillingwithin48hours"
+
+      # Backstop for the case predict_linear cannot see: a step change in
+      # consumption (a large backfill, a WAL pileup) that outruns a 6h trend.
+      - alert: TridentDiskSpaceLow
+        expr: >
+          node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}
+            < 0.15
+        for: 15m
+        labels:
+          severity: warning
+          service: database
+        annotations:
+          summary: "Postgres volume below 15% free ({{ $value | humanizePercentage }})"
+          description: >
+            Less than 15% of the Postgres data volume remains on
+            {{ $labels.instance }}. Unlike the predictive alerts above this
+            fires regardless of trend, so it also catches a sudden step in
+            usage such as a backfill or a WAL pileup.
+          runbook_url: "docs/runbooks/alerts.md#tridentdiskspacelow"

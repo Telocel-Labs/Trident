@@ -20,6 +20,10 @@ mod rpc;
 mod spec;
 mod storage;
 mod streamer;
+/// Scheduled testnet ingest-correctness suite (issue #419). Test-only; compiled
+/// out of the binary entirely.
+#[cfg(test)]
+mod testnet_correctness;
 mod token_metadata;
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {

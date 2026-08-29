@@ -69,6 +69,20 @@ pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
 /// Indexer's own Postgres pool, documented in docs/metrics-catalog.md.
 pub const DB_POOL_SIZE: &str = "trident_indexer_db_pool_size";
 pub const DB_POOL_IDLE_CONNECTIONS: &str = "trident_indexer_db_pool_idle_connections";
+/// Backfill rate in ledgers per second, measured over each poll cycle that
+/// made forward progress while behind the chain tip (issue #420).
+///
+/// This is the production-observable form of the catch-up benchmark: a cold
+/// start or a recovery from an outage can be watched live rather than only
+/// reproduced offline. It is published only while catching up — see
+/// [`set_catchup_rates`] — so a caught-up indexer polling one ledger every few
+/// seconds does not drag the reported rate toward zero and make a healthy
+/// indexer look slow.
+pub const CATCHUP_LEDGERS_PER_SECOND: &str = "trident_indexer_catchup_ledgers_per_second";
+/// Backfill rate in events per second, measured over the same window as
+/// [`CATCHUP_LEDGERS_PER_SECOND`] (issue #420). Ledgers/sec alone hides the
+/// binding constraint: a sparse range moves fast in ledgers and slow in events.
+pub const CATCHUP_EVENTS_PER_SECOND: &str = "trident_indexer_catchup_events_per_second";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -161,6 +175,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_HEALTH_SCORE,
         "Health score (0-100) for each RPC endpoint (multi-RPC failover)"
     );
+    describe_gauge!(
+        CATCHUP_LEDGERS_PER_SECOND,
+        "Backfill rate in ledgers/sec while behind the chain tip (issue #420)"
+    );
+    describe_gauge!(
+        CATCHUP_EVENTS_PER_SECOND,
+        "Backfill rate in events/sec while behind the chain tip (issue #420)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -238,6 +260,38 @@ pub fn record_heartbeat() {
 pub fn set_db_pool_stats(size: u32, idle: u32) {
     gauge!(DB_POOL_SIZE).set(size as f64);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(idle as f64);
+}
+
+/// Minimum ledger lag before a poll cycle counts as "catching up" (issue #420).
+///
+/// At the chain tip the indexer polls faster than ledgers close, so cycles
+/// advance 0-1 ledgers and the instantaneous rate is dominated by the poll
+/// interval rather than by throughput. Only cycles with a real deficit behind
+/// them describe backfill speed.
+pub const CATCHUP_LAG_THRESHOLD_LEDGERS: i64 = 10;
+
+/// Publish catch-up throughput for one poll cycle (issue #420).
+///
+/// Called after a cycle that advanced the cursor. `lag_before` is the ledger
+/// deficit at the start of the cycle; the rates are published only when that
+/// deficit exceeds [`CATCHUP_LAG_THRESHOLD_LEDGERS`], so the gauges describe
+/// backfill speed rather than steady-state tip-following.
+///
+/// Gauges rather than counters: the question these answer is "how fast is it
+/// going right now", which is what sizes a recovery window. Cumulative totals
+/// are already available from `EVENTS_TOTAL`.
+pub fn set_catchup_rates(
+    ledgers_advanced: u64,
+    events_processed: u64,
+    elapsed_secs: f64,
+    lag_before: i64,
+) {
+    if lag_before <= CATCHUP_LAG_THRESHOLD_LEDGERS || elapsed_secs <= 0.0 {
+        return;
+    }
+
+    gauge!(CATCHUP_LEDGERS_PER_SECOND).set(ledgers_advanced as f64 / elapsed_secs);
+    gauge!(CATCHUP_EVENTS_PER_SECOND).set(events_processed as f64 / elapsed_secs);
 }
 
 pub fn record_events_processed(count: u64) {

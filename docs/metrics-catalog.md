@@ -26,6 +26,8 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_last_poll_timestamp_seconds` | gauge | — | unix seconds | Set once per poll-loop iteration regardless of outcome — the dead-man's-switch (#218). Stale means the loop is hung, not just slow. |
 | `trident_indexer_db_pool_size` | gauge | — | connections | Current size of the indexer's own Postgres pool. |
 | `trident_indexer_db_pool_idle_connections` | gauge | — | connections | Idle connections in the indexer's own Postgres pool. |
+| `trident_indexer_catchup_ledgers_per_second` | gauge | — | ledgers/sec | Backfill rate while behind the chain tip (issue #420). **Only exported while catching up** — absent, not zero, once the lag drops below 10 ledgers. See [performance.md](performance.md#indexer-catch-up-throughput). |
+| `trident_indexer_catchup_events_per_second` | gauge | — | events/sec | Backfill rate in events, over the same window as the gauge above. Reported alongside it because ledgers/sec alone hides whether a sparse or dense range is being processed. |
 
 ## Go API (`services/api`)
 

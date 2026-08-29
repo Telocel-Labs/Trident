@@ -76,6 +76,42 @@ indefinitely: the retry wrapper only reacts to returned errors, never to a call
 that never returns. Timeouts are classified retryable, so they engage backoff
 and count toward the failover threshold.
 
+#### Indexer replica count — single-writer by design
+
+**The indexer runs as exactly one replica. This is enforced, not advisory.**
+
+`helm/trident/templates/indexer-deployment.yaml` fails template rendering if
+`indexer.replicaCount` is greater than 1, and sets the deployment strategy to
+`Recreate` so a rolling update cannot briefly run two pods at once.
+
+Why enforce rather than merely recommend (issue #418):
+
+- **Correctness is not the problem.** Two indexers against one database are
+  safe. Event persistence is exactly-once via the natural-key `UNIQUE`
+  constraint (migration `0025_soroban_events_natural_key.sql`) combined with
+  `ON CONFLICT DO NOTHING`, and the cursor advance is monotonic — a lagging
+  replica cannot rewind a cursor another replica has already moved forward.
+  Both properties are covered by integration tests in
+  `crates/indexer/src/db/mod.rs`.
+- **Usefulness is the problem.** There is no leader election and no work
+  partitioning, so every replica polls the same ledger ranges and decodes the
+  same events. Two replicas do the same work twice and consume double the RPC
+  quota for no additional throughput.
+
+So the guarantees above exist to make an *accidental* double-deploy survivable —
+a rollout overlap, a stale pod that outlives its replacement — not to make
+scale-out a supported configuration.
+
+Verify the invariants against a live database with:
+
+```bash
+scripts/test-concurrent-persistence.sh --database-url "$DATABASE_URL"
+```
+
+If indexing throughput becomes a bottleneck, the fix is vertical (more CPU for
+decode, a larger `MAX_EVENTS_PER_POLL`, a faster RPC endpoint) or a genuine
+work-partitioning design — not raising the replica count.
+
 #### Indexer outbox relay
 
 | Variable | Description |

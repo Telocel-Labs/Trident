@@ -485,3 +485,72 @@ bottleneck, indexer restart during high activity).
 
 **Escalation:** page on-call — this crosses the "API consumers are reading
 meaningfully stale data" threshold.
+
+## TridentDiskFillingWithin14Days
+
+**Means:** extrapolating the last 6 hours of growth, the Postgres data volume
+runs out of space within 14 days.
+
+**Why this threshold:** it is a provisioning signal, not an incident. Disk
+growth is measured, not guessed — 890 bytes per event including indexes, over
+500k rows on the full migration chain
+(docs/performance.md#storage-capacity-and-disk-growth). At the 10x testnet
+rate that is ~17 GiB/month, so a volume can go from comfortable to full inside
+a quarter. 14 days is chosen to leave room to provision, migrate, and verify
+rather than to react.
+
+**First steps:**
+1. Confirm the trend is real and not a one-off:
+   `node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql"}` over 7d.
+2. Check what is actually growing — `soroban_events` is the expected answer:
+   ```sql
+   SELECT relname, pg_size_pretty(pg_total_relation_size(c.oid))
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+    ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 10;
+   ```
+3. Decide between resizing the volume and enabling partition retention. Because
+   `soroban_events` is RANGE-partitioned by `ledger_sequence` (migration 0017),
+   dropping the oldest partition is a fast metadata operation, not a bulk
+   DELETE:
+   ```sql
+   DROP TABLE soroban_events_p0_1999999;
+   ```
+   Confirm the retention policy before dropping — those events are gone.
+
+## TridentDiskFillingWithin48Hours
+
+**Means:** the same projection, now inside 48 hours.
+
+**Why this threshold:** at this point provisioning lead time is mostly gone, so
+this pages rather than warns. A full volume does not degrade gracefully — the
+indexer stops committing and the API fails writes.
+
+**First steps:**
+1. Resize the volume now if the platform supports online resize. This is the
+   only action that does not lose data.
+2. If a resize is not immediately available, drop the oldest
+   `soroban_events` partition (see the query above) to buy time.
+3. Check for a non-obvious consumer before assuming it is event growth: an
+   unrotated WAL (`SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir();`) or a
+   stalled replication slot holds space that no partition drop will release.
+
+## TridentDiskSpaceLow
+
+**Means:** less than 15% of the Postgres data volume remains, regardless of
+trend.
+
+**Why this threshold:** the two predictive alerts above extrapolate a 6-hour
+trend, which cannot see a step change — a large backfill, a WAL pileup behind a
+stalled replication slot, or a runaway temp file. This is the backstop for
+those, so it fires on the level rather than the slope.
+
+**First steps:**
+1. Identify the consumer: `pg_ls_waldir()` for WAL,
+   `pg_stat_replication` / `pg_replication_slots` for a stalled slot, and the
+   table-size query above for ordinary growth.
+2. A stalled replication slot is the most common non-obvious cause — an
+   inactive slot pins WAL indefinitely. Drop it if the replica is genuinely
+   gone: `SELECT pg_drop_replication_slot('<name>');`
+3. If it is ordinary growth, treat it as
+   `TridentDiskFillingWithin48Hours` above.
