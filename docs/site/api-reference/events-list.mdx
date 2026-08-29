@@ -1,0 +1,151 @@
+---
+title: "GET /v1/events"
+description: "List Soroban contract events with optional filtering by contract, topics, ledger range, and cursor-based pagination."
+---
+
+## Endpoint
+
+```
+GET /v1/events
+```
+
+Returns a paginated list of indexed Soroban contract events. All parameters are optional — omitting all returns the most recent events across all indexed contracts.
+
+---
+
+## Authentication
+
+Requires `X-API-Key` header. See [Authentication](/api-reference/authentication).
+
+---
+
+## Query parameters
+
+| Parameter     | Type      | Default  | Description                                                                     |
+|---------------|-----------|----------|---------------------------------------------------------------------------------|
+| `contract_id` | `string`  | —        | Filter by Soroban contract address (C… strkey, 56 chars). |
+| `topic_0`     | `string`  | —        | Filter by the first event topic (XDR base64-encoded value, e.g. the symbol `"transfer"`). |
+| `topic_1`     | `string`  | —        | Filter by the second event topic.                                               |
+| `from_ledger` | `integer` | —        | Lower bound of ledger range, inclusive. Must be ≥ 0.                            |
+| `to_ledger`   | `integer` | —        | Upper bound of ledger range, inclusive. Must be ≥ `from_ledger`.              |
+| `network`     | `string`  | `testnet`| Network to query. One of: `testnet`, `mainnet`.                               |
+| `limit`       | `integer` | `50`     | Max events per page. Range: 1–200.                                             |
+| `after`       | `string`  | —        | Opaque pagination cursor from a previous response. See [Pagination](/api-reference/pagination). |
+
+### Validation rules
+
+- `contract_id` must match `^C[A-Z2-7]{55}$` (Stellar strkey format).
+- `from_ledger` and `to_ledger` must be non-negative integers.
+- `to_ledger` must be ≥ `from_ledger` when both are provided.
+- `limit` must be an integer between 1 and 200.
+- `after` must be an opaque cursor from a previous response — constructed values are rejected with `400`.
+- Unknown query parameters are rejected (`?limitt=5` returns `400 INVALID_ARGUMENT`).
+
+---
+
+## Example request
+
+```bash
+curl "https://api.trident.telocel.com/v1/events?contract_id=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM&topic_0=transfer&limit=2&network=testnet" \
+  -H "X-API-Key: $TRIDENT_API_KEY"
+```
+
+---
+
+## Response
+
+### 200 OK
+
+```json
+{
+  "events": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      "ledgerSequence": 12345678,
+      "ledgerTimestamp": "2025-01-15T10:30:00Z",
+      "transactionHash": "3389e9f0f1a65f19935ef8b398905b88e74e9b0bb72a13dea36dc0cfd4ab2bd1",
+      "eventIndex": 0,
+      "eventType": "contract",
+      "topics": [
+        "AAAADQAAAAh0cmFuc2Zlcg==",
+        "AAAAE..."
+      ],
+      "data": null,
+      "createdAt": "2025-01-15T10:30:01Z"
+    },
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440001",
+      "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      "ledgerSequence": 12345679,
+      "ledgerTimestamp": "2025-01-15T10:30:05Z",
+      "transactionHash": "ab12cd...",
+      "eventIndex": 1,
+      "eventType": "contract",
+      "topics": [
+        "AAAADQAAAAh0cmFuc2Zlcg=="
+      ],
+      "data": null,
+      "createdAt": "2025-01-15T10:30:06Z"
+    }
+  ],
+  "cursor": "eyJpZCI6IjU1MGU4NDAwLWUyOWItNDFkNC1hNzE2LTQ0NjY1NTQ0MDAwMSJ9",
+  "hasMore": true
+}
+```
+
+### SorobanEvent schema
+
+| Field              | Type     | Description                                                   |
+|--------------------|----------|---------------------------------------------------------------|
+| `id`               | `string` | UUID v4 assigned by the indexer.                              |
+| `contractId`       | `string` | Stellar contract address (C… strkey).                        |
+| `ledgerSequence`   | `number` | Ledger sequence number when the event occurred.               |
+| `ledgerTimestamp`  | `string` | ISO-8601 timestamp of the ledger close.                       |
+| `transactionHash`  | `string` | Transaction hash (hex).                                       |
+| `eventIndex`       | `number` | Zero-based index of this event within the transaction.        |
+| `eventType`        | `string` | One of: `contract`, `system`, `diagnostic`.                  |
+| `topics`           | `string[]`| XDR-encoded topic values (base64 strings).                   |
+| `data`             | `unknown`| Decoded event data payload.                                   |
+| `createdAt`        | `string` | ISO-8601 timestamp when the record was written to the index.  |
+
+---
+
+## Error responses
+
+| Status | Code               | When                                                       |
+|--------|--------------------|------------------------------------------------------------|
+| `400`  | `INVALID_ARGUMENT` | A query parameter failed validation.                       |
+| `401`  | `UNAUTHORIZED`     | Missing or invalid `X-API-Key`.                            |
+| `429`  | `RATE_LIMITED`     | Rate limit exceeded. See [Rate Limiting](/api-reference/rate-limiting). |
+| `503`  | `UNAVAILABLE`      | Indexer or database is temporarily unavailable.            |
+
+```json
+{
+  "error": {
+    "code": "INVALID_ARGUMENT",
+    "message": "limit must be an integer between 1 and 200"
+  }
+}
+```
+
+---
+
+## SDK equivalent
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { PaginatedEvents } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+const result: PaginatedEvents = await client.queryEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  topic0: "transfer",
+  limit: 2,
+});
+```

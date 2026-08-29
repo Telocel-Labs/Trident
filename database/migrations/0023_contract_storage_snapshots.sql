@@ -1,3 +1,13 @@
+-- Renumbered from 0019 to 0023 (issue #371). It was merged as a second 0019
+-- alongside 0019_contract_stats_rollup, and sqlx derives a migration's version
+-- from the filename prefix — so the pair collided on the primary key of
+-- _sqlx_migrations and `sqlx migrate run` aborted for everyone.
+--
+-- Forward-only and safe to re-apply: every statement below is guarded with
+-- IF NOT EXISTS, so a database that already applied this file under the old
+-- 0019 version records 0023 and makes no schema changes. Nothing here depends
+-- on 0019-0022, so the later position is not a behaviour change.
+--
 -- Issue #270: contract storage (ledger entry) snapshots for tracked
 -- contracts. One row per observed change to a storage key — an append-only
 -- change log with ledger provenance, not a single mutable "current value"

@@ -1,0 +1,107 @@
+---
+title: "GraphQL Subscriptions"
+description: "Subscribe to real-time Soroban events over GraphQL WebSocket subscriptions."
+---
+
+<Warning>
+**Pending #66.** GraphQL subscriptions are part of [issue #66](https://github.com/Telocel-Labs/Trident/issues/66) and will be verified once merged.
+</Warning>
+
+## Subscription endpoint
+
+GraphQL subscriptions use the `graphql-ws` protocol over WebSocket:
+
+```
+wss://api.trident.telocel.com/graphql
+```
+
+---
+
+## Example subscription
+
+```graphql
+subscription OnEventAdded($contractId: String!, $topic0: String) {
+  eventAdded(contractId: $contractId, topic0: $topic0) {
+    id
+    contractId
+    ledgerSequence
+    ledgerTimestamp
+    transactionHash
+    eventIndex
+    eventType
+    topics
+    data
+  }
+}
+```
+
+**Variables:**
+
+```json
+{
+  "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  "topic0": "transfer"
+}
+```
+
+---
+
+## Using graphql-ws client (TypeScript)
+
+```typescript
+import { createClient } from "graphql-ws";
+
+const client = createClient({
+  url: "wss://api.trident.telocel.com/graphql",
+  connectionParams: {
+    "X-API-Key": process.env.TRIDENT_API_KEY!,
+  },
+});
+
+const unsubscribe = client.subscribe(
+  {
+    query: `
+      subscription OnEventAdded($contractId: String!) {
+        eventAdded(contractId: $contractId) {
+          id
+          ledgerSequence
+          transactionHash
+          topics
+        }
+      }
+    `,
+    variables: {
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    },
+  },
+  {
+    next: (data) => {
+      const event = data.data?.eventAdded;
+      console.log("New event:", event?.id, event?.transactionHash);
+    },
+    error: (err) => {
+      console.error("Subscription error:", err);
+    },
+    complete: () => {
+      console.log("Subscription complete");
+    },
+  }
+);
+
+// Stop the subscription
+setTimeout(unsubscribe, 60_000);
+```
+
+Install: `npm install graphql-ws`
+
+---
+
+## Comparison: GraphQL subscriptions vs WebSocket subscriptions
+
+| Feature                        | GraphQL subscriptions        | WebSocket `/ws`             |
+|--------------------------------|------------------------------|-----------------------------|
+| Protocol                       | `graphql-ws` over WebSocket  | Custom JSON over WebSocket  |
+| Field selection                | ✅ Select only needed fields  | ❌ Full event always sent   |
+| Multiple subscriptions         | ✅ Per operation variable     | ✅ Multiple subscribe frames|
+| SDK support                    | Use `graphql-ws` library      | `subscribeToContract()` SDK |
+| Best for                       | Browser apps, dashboards     | Server-side, non-JS clients |

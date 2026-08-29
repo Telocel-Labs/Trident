@@ -1,0 +1,214 @@
+---
+title: "WebSocket — Raw Client Example"
+description: "Connect to the Trident WebSocket API from non-TypeScript clients using the raw protocol."
+---
+
+This page shows how to use the Trident WebSocket API without the TypeScript SDK — useful for Python, Go, Rust, or browser-native clients.
+
+---
+
+## Protocol overview
+
+1. Open a WebSocket connection to `wss://api.trident.telocel.com/ws?api_key=<key>`
+2. Send a `subscribe` frame (JSON)
+3. Receive `event` messages (JSON) for every matching contract event
+4. Respond to `ping` messages with `pong` to keep the connection alive
+5. Send `unsubscribe` or close the connection when done
+
+All messages are UTF-8 encoded JSON text frames.
+
+---
+
+## Browser (JavaScript)
+
+```javascript
+const apiKey = "tdk_live_xxx";
+const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+const ws = new WebSocket(
+  `wss://api.trident.telocel.com/ws?api_key=${apiKey}`
+);
+
+ws.addEventListener("open", () => {
+  console.log("Connected");
+  ws.send(JSON.stringify({
+    type: "subscribe",
+    contractId,
+    topic0: "transfer",
+  }));
+});
+
+ws.addEventListener("message", (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === "event") {
+    console.log("New event:", msg.event.id, msg.event.transactionHash);
+  } else if (msg.type === "ping") {
+    ws.send(JSON.stringify({ type: "pong" }));
+  } else if (msg.type === "error") {
+    console.error("Server error:", msg.code, msg.message);
+  }
+});
+
+ws.addEventListener("close", (ev) => {
+  console.warn(`Disconnected: code=${ev.code}, reason=${ev.reason}`);
+  // Implement your own reconnect logic here
+});
+```
+
+---
+
+## Python
+
+```python
+import asyncio
+import json
+import websockets
+
+API_KEY = "tdk_live_xxx"
+CONTRACT_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+
+async def main() -> None:
+    url = f"wss://api.trident.telocel.com/ws?api_key={API_KEY}"
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({
+            "type": "subscribe",
+            "contractId": CONTRACT_ID,
+            "topic0": "transfer",
+        }))
+
+        async for raw in ws:
+            msg = json.loads(raw)
+            match msg["type"]:
+                case "event":
+                    evt = msg["event"]
+                    print(f"[{evt['ledgerSequence']}] {evt['id']} — {evt['transactionHash']}")
+                case "ping":
+                    await ws.send(json.dumps({"type": "pong"}))
+                case "subscribed":
+                    print("Subscription confirmed:", msg["contractId"])
+                case "error":
+                    print("Error:", msg["code"], msg["message"])
+
+asyncio.run(main())
+```
+
+Install the dependency: `pip install websockets`
+
+---
+
+## Go
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/url"
+
+    "github.com/gorilla/websocket"
+)
+
+type SubscribeFrame struct {
+    Type       string `json:"type"`
+    ContractID string `json:"contractId"`
+    Topic0     string `json:"topic0,omitempty"`
+}
+
+type IncomingMessage struct {
+    Type  string          `json:"type"`
+    Event json.RawMessage `json:"event,omitempty"`
+    Code  string          `json:"code,omitempty"`
+}
+
+func main() {
+    apiKey := "tdk_live_xxx"
+    u := url.URL{
+        Scheme:   "wss",
+        Host:     "api.trident.telocel.com",
+        Path:     "/ws",
+        RawQuery: "api_key=" + apiKey,
+    }
+
+    conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+    if err != nil {
+        log.Fatal("dial:", err)
+    }
+    defer conn.Close()
+
+    sub := SubscribeFrame{
+        Type:       "subscribe",
+        ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        Topic0:     "transfer",
+    }
+    if err := conn.WriteJSON(sub); err != nil {
+        log.Fatal("subscribe:", err)
+    }
+
+    for {
+        _, msg, err := conn.ReadMessage()
+        if err != nil {
+            log.Println("disconnect:", err)
+            break
+        }
+
+        var incoming IncomingMessage
+        json.Unmarshal(msg, &incoming)
+
+        switch incoming.Type {
+        case "event":
+            fmt.Printf("Event: %s\n", incoming.Event)
+        case "ping":
+            conn.WriteJSON(map[string]string{"type": "pong"})
+        case "error":
+            fmt.Printf("Error: %s\n", incoming.Code)
+        }
+    }
+}
+```
+
+Install the dependency: `go get github.com/gorilla/websocket`
+
+---
+
+## Rust
+
+```rust
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[tokio::main]
+async fn main() {
+    let api_key = "tdk_live_xxx";
+    let url = format!(
+        "wss://api.trident.telocel.com/ws?api_key={api_key}"
+    );
+
+    let (mut ws, _) = connect_async(&url).await.expect("Failed to connect");
+
+    // Subscribe
+    let sub = json!({
+        "type": "subscribe",
+        "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "topic0": "transfer"
+    });
+    ws.send(Message::Text(sub.to_string())).await.unwrap();
+
+    while let Some(msg) = ws.next().await {
+        if let Ok(Message::Text(text)) = msg {
+            let parsed: Value = serde_json::from_str(&text).unwrap();
+            match parsed["type"].as_str() {
+                Some("event") => println!("Event: {}", parsed["event"]["id"]),
+                Some("ping") => {
+                    ws.send(Message::Text(r#"{"type":"pong"}"#.to_string()))
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+}
+```

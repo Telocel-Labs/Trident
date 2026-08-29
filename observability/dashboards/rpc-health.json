@@ -1,0 +1,208 @@
+{
+  "title": "Trident Indexer — RPC Provider Health",
+  "uid": "trident-rpc-health",
+  "description": "RPC call latency, error rate, and active-endpoint/failover status for the Stellar RPC pool the indexer depends on (issue #294). Pairs with docs/observability/event-delivery.md.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "utc",
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "tags": ["trident", "indexer", "rpc"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus",
+        "current": {}
+      },
+      {
+        "name": "method",
+        "type": "query",
+        "label": "RPC method",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(trident_indexer_rpc_call_duration_seconds_count, method)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "RPC call latency (p50 / p95 / p99) by method",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum(rate(trident_indexer_rpc_call_duration_seconds_bucket{method=~\"$method\"}[5m])) by (le, method))",
+          "legendFormat": "p50 {{method}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(trident_indexer_rpc_call_duration_seconds_bucket{method=~\"$method\"}[5m])) by (le, method))",
+          "legendFormat": "p95 {{method}}"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum(rate(trident_indexer_rpc_call_duration_seconds_bucket{method=~\"$method\"}[5m])) by (le, method))",
+          "legendFormat": "p99 {{method}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "RPC call volume by method and endpoint",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(trident_indexer_rpc_call_duration_seconds_count{method=~\"$method\"}[5m])) by (method, endpoint)",
+          "legendFormat": "{{method}} (endpoint {{endpoint}})"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "RPC error rate by type",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(trident_indexer_rpc_errors_total{method=~\"$method\"}[5m])) by (error_type)",
+          "legendFormat": "{{error_type}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "RPC error ratio (errors / calls)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "max": 1, "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(trident_indexer_rpc_errors_total{method=~\"$method\"}[5m])) / sum(rate(trident_indexer_rpc_call_duration_seconds_count{method=~\"$method\"}[5m]))",
+          "legendFormat": "error ratio"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Active RPC endpoint",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "trident_indexer_rpc_active_endpoint", "legendFormat": "endpoint index" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "RPC failovers (1h)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "increase(trident_indexer_rpc_failovers_total[1h])", "legendFormat": "failovers" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "RPC timeouts (5m rate)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(trident_indexer_rpc_timeouts_total[5m]))", "legendFormat": "timeouts/s" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "RPC retries (5m rate)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(trident_indexer_rpc_retries_total[5m]))", "legendFormat": "retries/s" }
+      ]
+    }
+  ]
+}

@@ -1,14 +1,21 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
 )
+
+// tokenMetadataQueryTimeout bounds the DB call in TokenMetadata so a
+// runaway query can't hold a pool connection for the request's full budget
+// (issue #238).
+const tokenMetadataQueryTimeout = 5 * time.Second
 
 // TokenMetadataResponse is the JSON body for GET /v1/contracts/{id}/metadata.
 //
@@ -55,7 +62,10 @@ func TokenMetadata(db DBPool) http.HandlerFunc {
 			decimals   *int32
 			resolvedAt *string
 		)
-		err := db.QueryRow(r.Context(), `
+		ctx, cancel := context.WithTimeout(r.Context(), tokenMetadataQueryTimeout)
+		defer cancel()
+
+		err := db.QueryRow(ctx, `
 			SELECT is_token, name, symbol, decimals, resolved_at::text
 			FROM token_metadata
 			WHERE contract_id = $1 AND network = $2

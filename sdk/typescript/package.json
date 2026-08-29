@@ -1,6 +1,6 @@
 {
   "name": "@trident-indexer/sdk",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "TypeScript client SDK for the Trident Soroban event indexer",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -22,7 +22,12 @@
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "generate:types": "openapi-typescript ../../api/openapi.yaml -o src/api-types.gen.ts"
+    "generate:types": "python3 ../../scripts/generate_sdk_models.py --language typescript",
+    "generate:models": "python3 ../../scripts/generate_sdk_models.py",
+    "generate:models:go": "python3 ../../scripts/generate_sdk_models.py --language go",
+    "generate:models:python": "python3 ../../scripts/generate_sdk_models.py --language python",
+    "generate:models:rust": "python3 ../../scripts/generate_sdk_models.py --language rust",
+    "generate:models:typescript": "python3 ../../scripts/generate_sdk_models.py --language typescript"
   },
   "dependencies": {
     "ws": "^8.21.0",

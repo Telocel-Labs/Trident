@@ -8,15 +8,15 @@ alerting has principled thresholds instead of guessed ones (issue #296).
 | SLO | Metrics it needs | Status |
 |---|---|---|
 | Ingest freshness | `trident_indexer_ledger_lag`, `trident_indexer_last_poll_timestamp_seconds` | **Live today** — see `crates/indexer/src/metrics.rs` |
-| API latency | RED metrics (`http_requests_total`, `http_request_duration_seconds`) on `services/api` | **Not yet instrumented** — tracked by issue #295 |
-| API availability | Same RED metrics as above | **Not yet instrumented** — tracked by issue #295 |
+| API latency | RED metrics (`trident_api_http_requests_total`, `trident_api_http_request_duration_seconds`) on `services/api` | **Live today** — see `services/api/middleware/metrics.go` |
+| API availability | Same RED metrics as above | **Live today** — see `services/api/middleware/metrics.go` |
 
-The API latency/availability PromQL below is the target contract for issue
-#295's instrumentation — the metric names, label names (`route`,
-`method`, `status_code`), and histogram bucket boundaries a RED
-implementation needs to produce for these exact queries to work. Until #295
-ships, those two SLOs are defined but not yet measurable; the ingest
-freshness SLO is fully measurable today.
+The API latency/availability PromQL below uses the actual metric names and
+labels (`route`, `method`, `status`) emitted by `services/api/middleware/metrics.go`.
+The ingest freshness SLO is fully measurable today, and API RED metrics are
+live but still being validated against production traffic patterns before
+burn-rate alert thresholds can be confidently set (see the stub comment in
+`observability/burn-rate-alerts.yml`).
 
 ## SLO 1 — Ingest freshness
 
@@ -52,6 +52,15 @@ trident_indexer_ledger_lag
 **Error budget:** 30 days × (1 − 0.95) allowed-breach-time = 36 hours/month
 where p95 lag may exceed 30s before the budget is exhausted.
 
+**Public API contract:** the same lag figure (plus an estimated-seconds
+conversion, `trident_indexer_ledger_lag_seconds_estimated`) is exposed
+outside Prometheus too, as `lag_ledgers` / `lag_seconds_estimated` on
+`GET /v1/stats/indexer` — see `docs/observability/data-freshness.md` for the
+full public freshness contract (issue #294) and
+`TridentIngestLagSustainedHigh` in `observability/burn-rate-alerts.yml` for a
+direct threshold alert on sustained high lag, independent of the burn-rate
+math below (issue #293).
+
 **Dead-man's-switch (heartbeat) companion query** — catches a fully stalled
 indexer, which a lag metric alone can miss if the indexer stops updating its
 own gauge:
@@ -73,20 +82,26 @@ interpolated in) so cardinality stays bounded, plus a coarse `class` label
 (`read` | `write`) if per-route budgets prove too granular to alert on
 individually.
 
-**Measuring query** (once #295 ships `http_request_duration_seconds` as a
-histogram with `route` and `class` labels):
+**Measuring query** (using the actual emitted metric names and labels from
+`services/api/middleware/metrics.go`, which exports `method`, `route` and
+`status` — there is no `class` label today, so read/write is split on the
+HTTP method until one is added):
 
 ```promql
 histogram_quantile(0.95,
-  sum(rate(http_request_duration_seconds_bucket{class="read"}[5m])) by (le)
+  sum(rate(trident_api_http_request_duration_seconds_bucket{method="GET"}[5m])) by (le)
 )
 ```
 
 ```promql
 histogram_quantile(0.95,
-  sum(rate(http_request_duration_seconds_bucket{class="write"}[5m])) by (le)
+  sum(rate(trident_api_http_request_duration_seconds_bucket{method!="GET"}[5m])) by (le)
 )
 ```
+
+A real `class="read"|"write"` label is the better long-term shape — see the
+per-class budget note above — but it has to be emitted by the middleware
+before any query can select on it.
 
 **Error budget:** 28 days × (1 − 0.95) = 33.6 hours where p95 may exceed
 target before the budget is exhausted, per class.
@@ -101,12 +116,13 @@ default (see `docs/kubernetes.md` — those are BYO), so a single-AZ outage on
 either dependency should be within budget rather than paging immediately.
 Revisit once managed HA Postgres/Redis is the documented default.
 
-**Measuring query** (once #295 ships `http_requests_total{status_code}`):
+**Measuring query** (using the actual emitted metric names from
+`services/api/middleware/metrics.go`):
 
 ```promql
-sum(rate(http_requests_total{status_code!~"5.."}[5m]))
+sum(rate(trident_api_http_requests_total{status!~"5.."}[5m]))
 /
-sum(rate(http_requests_total[5m]))
+sum(rate(trident_api_http_requests_total[5m]))
 ```
 
 **Error budget:** 28 days × (1 − 0.995) = 3.36 hours of unavailability
@@ -143,4 +159,7 @@ this was authored in; verify in CI or locally before merging).
   current targets are initial estimates, not yet validated against
   production load.
 - **On every new route added:** confirm it's classified into `read` or
-  `write` for SLO 2's per-class budget (once #295 ships).
+  `write` for SLO 2's per-class budget. The RED metrics are live today
+  (see `services/api/middleware/metrics.go`), but route classification and
+  burn-rate alert thresholds are still being validated against production
+  traffic before they can be confidently set.

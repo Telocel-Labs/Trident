@@ -1,0 +1,119 @@
+---
+title: "getEventById()"
+description: "Fetch a single Soroban event by its UUID."
+---
+
+## Signature
+
+```typescript
+getEventById(params: GetEventByIdParams): Promise<SorobanEvent>
+```
+
+---
+
+## Parameters
+
+| Parameter | Type     | Required | Description                        |
+|-----------|----------|----------|------------------------------------|
+| `id`      | `string` | ✅       | UUID v4 of the event to retrieve.  |
+
+---
+
+## Returns
+
+`Promise<SorobanEvent>`
+
+```typescript
+interface SorobanEvent {
+  /** UUID v4 assigned by the indexer. */
+  id: string;
+  /** Stellar contract address that emitted the event (C… strkey). */
+  contractId: string;
+  /** Ledger sequence number in which the event occurred. */
+  ledgerSequence: number;
+  /** ISO-8601 timestamp of the ledger close. */
+  ledgerTimestamp: string;
+  /** Transaction hash (hex). */
+  transactionHash: string;
+  /** Zero-based index of this event within the transaction. */
+  eventIndex: number;
+  /** Whether this is a contract-emitted, system, or diagnostic event. */
+  eventType: EventType;
+  /** Array of XDR-encoded topic values (as base64 strings). */
+  topics: string[];
+  /** Decoded event data payload. */
+  data: unknown;
+  /** ISO-8601 timestamp when this record was written to the index. */
+  createdAt: string;
+}
+
+type EventType = "contract" | "system" | "diagnostic";
+```
+
+---
+
+## Throws
+
+| Error code       | When                                                  |
+|------------------|-------------------------------------------------------|
+| `NOT_FOUND`      | No event with this UUID exists in the index.         |
+| `UNAUTHORIZED`   | Missing or invalid `X-API-Key`.                      |
+| `RATE_LIMITED`   | Rate limit exceeded.                                  |
+| `INVALID_ARGUMENT`| `id` is not a valid UUID v4.                        |
+| `INTERNAL`       | Unexpected server or network error.                   |
+
+---
+
+## Examples
+
+### Basic usage
+
+```typescript
+import { TridentClient } from "@trident-indexer/sdk";
+import type { SorobanEvent } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+const event: SorobanEvent = await client.getEventById({
+  id: "550e8400-e29b-41d4-a716-446655440000",
+});
+
+console.log("Ledger:", event.ledgerSequence);
+console.log("Contract:", event.contractId);
+console.log("Transaction:", event.transactionHash);
+console.log("Topics:", event.topics);
+```
+
+### Handling 404
+
+```typescript
+import { TridentClient, TridentError } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+try {
+  const event = await client.getEventById({
+    id: "550e8400-e29b-41d4-a716-446655440000",
+  });
+  return event;
+} catch (err) {
+  if (err instanceof TridentError) {
+    if (err.code === "NOT_FOUND") {
+      console.warn("Event not found in index");
+      return null;
+    }
+    if (err.code === "UNAUTHORIZED") {
+      throw new Error("Invalid API key — check your TRIDENT_API_KEY");
+    }
+  }
+  throw err;
+}
+```

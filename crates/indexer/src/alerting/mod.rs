@@ -18,6 +18,7 @@
 //! - **Severity levels**: `info`, `warning`, `critical` route to different
 //!   sinks or the same sink with formatted payloads.
 
+#![allow(dead_code)] // Slack/PagerDuty sinks and Severity::Info are configured but not yet wired into the Alerter constructor.
 use chrono::Utc;
 use reqwest::Client;
 use serde::Serialize;
@@ -52,6 +53,8 @@ pub struct AlertContext {
     pub chain_tip_ledger: u64,
     pub lag_threshold: u64,
     pub network: String,
+    /// Whether all RPC endpoints are critically degraded (score < 20).
+    pub rpc_all_degraded: bool,
 }
 
 /// Persistent alert state read from / written to `system_state`.
@@ -59,10 +62,13 @@ pub struct AlertContext {
 pub struct AlertState {
     pub last_alert_at: Option<chrono::DateTime<Utc>>,
     pub alert_fired: bool,
+    /// State for RPC all-degraded alert.
+    pub rpc_degraded_fired: bool,
+    pub rpc_degraded_last_alert_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
-struct WebhookPayload {
+pub(crate) struct WebhookPayload {
     alert: &'static str,
     severity: String,
     indexer: &'static str,
@@ -78,9 +84,20 @@ struct WebhookPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct RecoveryPayload {
+pub(crate) struct RecoveryPayload {
     alert: &'static str,
     lag_ledgers: u64,
+    timestamp: String,
+    message: String,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RpcDegradedPayload {
+    alert: &'static str,
+    severity: String,
+    indexer: &'static str,
+    network: String,
     timestamp: String,
     message: String,
     text: String,
@@ -95,6 +112,14 @@ pub trait AlertSink: Send + Sync {
 
     /// Post a recovery payload.
     async fn post_recovery(&self, client: &Client, url: &str, payload: &RecoveryPayload) -> bool;
+
+    /// Post an RPC degraded payload.
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool;
 }
 
 /// Generic JSON webhook sink — posts the serialised payload as-is.
@@ -107,6 +132,15 @@ impl AlertSink for GenericWebhook {
     }
 
     async fn post_recovery(&self, client: &Client, url: &str, payload: &RecoveryPayload) -> bool {
+        post_json_with_retry(client, url, payload).await
+    }
+
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool {
         post_json_with_retry(client, url, payload).await
     }
 }
@@ -130,7 +164,7 @@ impl AlertSink for SlackWebhook {
             blocks: Vec<SlackBlock>,
         }
 
-        let color = match payload.severity.as_str() {
+        let _color = match payload.severity.as_str() {
             "critical" => "#FF0000",
             "warning" => "#FFA500",
             _ => "#CCCCCC",
@@ -167,6 +201,46 @@ impl AlertSink for SlackWebhook {
 
         let slack = SlackPayload {
             text: payload.text.clone(),
+        };
+
+        post_json_with_retry(client, url, &slack).await
+    }
+
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool {
+        #[derive(Serialize)]
+        struct SlackBlock {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct SlackPayload {
+            text: String,
+            blocks: Vec<SlackBlock>,
+        }
+
+        let blocks = vec![SlackBlock {
+            kind: "section",
+            text: serde_json::json!({
+                "type": "mrkdwn",
+                "text": format!(
+                    "*{}* {} - All RPC endpoints critically degraded (health score < 20)\n{}",
+                    payload.alert.to_uppercase(),
+                    payload.network,
+                    payload.message
+                ),
+            }),
+        }];
+
+        let slack = SlackPayload {
+            text: payload.text.clone(),
+            blocks,
         };
 
         post_json_with_retry(client, url, &slack).await
@@ -251,8 +325,52 @@ impl AlertSink for PagerDuty {
             payload: PDResolve {
                 r#type: "alert",
                 summary: payload.text.clone(),
-                source: "trident-indexer",
+                source: "trident-indexer".to_string(),
                 timestamp: payload.timestamp.clone(),
+            },
+        };
+
+        post_json_with_retry(client, url, &pd).await
+    }
+
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool {
+        #[derive(Serialize)]
+        struct PDEvent {
+            r#type: &'static str,
+            severity: String,
+            summary: String,
+            source: String,
+            timestamp: String,
+            custom_details: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct PDPayload {
+            routing_key: String,
+            event_action: &'static str,
+            dedup_key: String,
+            payload: PDEvent,
+        }
+
+        let pd = PDPayload {
+            routing_key: self.routing_key.clone(),
+            event_action: "trigger",
+            dedup_key: format!("{}-{}-rpc-degraded", payload.network, payload.indexer),
+            payload: PDEvent {
+                r#type: "alert",
+                severity: "critical".to_string(),
+                summary: payload.text.clone(),
+                source: payload.indexer.to_string(),
+                timestamp: payload.timestamp.clone(),
+                custom_details: serde_json::json!({
+                    "network": payload.network,
+                    "alert_type": "rpc_all_degraded",
+                }),
             },
         };
 
@@ -271,6 +389,23 @@ pub struct Alerter {
 }
 
 impl Alerter {
+    /// Build an `Alerter` from a single webhook URL (convenience method).
+    ///
+    /// Uses a generic webhook sink. Returns a disabled alerter if no URL is provided.
+    pub fn from_config(
+        webhook_url: Option<String>,
+        lag_threshold: u64,
+        cooldown_minutes: u64,
+    ) -> Result<Self, TridentError> {
+        let sinks = if webhook_url.is_some() {
+            vec![Box::new(GenericWebhook) as Box<dyn AlertSink>]
+        } else {
+            vec![]
+        };
+        let urls = webhook_url.map(|s| vec![s]).unwrap_or_default();
+        Self::from_sinks(sinks, urls, lag_threshold, cooldown_minutes)
+    }
+
     /// Build an `Alerter` from the provided sinks and URLs.
     ///
     /// Returns `Ok(Alerter { sinks: [], .. })` when no sinks are configured —
@@ -327,6 +462,13 @@ impl Alerter {
             self.maybe_fire_alert(ctx, state, lag).await;
         } else {
             self.maybe_resolve(ctx, state, lag).await;
+        }
+
+        // Check for RPC all-degraded condition
+        if ctx.rpc_all_degraded {
+            self.maybe_fire_rpc_degraded(ctx, state).await;
+        } else {
+            self.maybe_resolve_rpc_degraded(ctx, state).await;
         }
     }
 
@@ -425,6 +567,93 @@ impl Alerter {
             tracing::info!(lag, network = %ctx.network, "Recovery webhook fired");
         }
     }
+
+    /// Fire an RPC all-degraded alert if outside the cooldown window.
+    async fn maybe_fire_rpc_degraded(&self, ctx: &AlertContext, state: &mut AlertState) {
+        let now = Utc::now();
+
+        // Cooldown check: suppress if we fired recently.
+        if let Some(last) = state.rpc_degraded_last_alert_at {
+            let elapsed = (now - last).to_std().unwrap_or(Duration::ZERO);
+            if elapsed < self.cooldown {
+                tracing::debug!(
+                    cooldown_remaining_secs = (self.cooldown - elapsed).as_secs(),
+                    "RPC degraded alert suppressed by cooldown"
+                );
+                return;
+            }
+        }
+
+        let timestamp = now.to_rfc3339();
+        let message = format!(
+            "All RPC endpoints are critically degraded (health score < 20) on {}. The indexer may be unable to fetch events.",
+            ctx.network
+        );
+
+        let payload = RpcDegradedPayload {
+            alert: "rpc_all_degraded",
+            severity: "critical".to_string(),
+            indexer: "trident-indexer",
+            network: ctx.network.clone(),
+            timestamp: timestamp.clone(),
+            message: message.clone(),
+            text: message,
+        };
+
+        let mut posted_any = false;
+        for (sink, url) in self.sinks.iter().zip(self.urls.iter()) {
+            let client = match &self.http {
+                Some(c) => c,
+                None => return,
+            };
+            if sink.post_rpc_degraded(client, url, &payload).await {
+                posted_any = true;
+            }
+        }
+
+        if posted_any {
+            state.rpc_degraded_last_alert_at = Some(now);
+            state.rpc_degraded_fired = true;
+            tracing::info!(network = %ctx.network, "RPC all-degraded alert webhook fired");
+        }
+    }
+
+    /// Send an RPC degraded recovery webhook if we previously fired an alert.
+    async fn maybe_resolve_rpc_degraded(&self, ctx: &AlertContext, state: &mut AlertState) {
+        if !state.rpc_degraded_fired {
+            return;
+        }
+
+        let timestamp = Utc::now().to_rfc3339();
+        let message = format!("RPC endpoints have recovered on {}. At least one endpoint now has a health score >= 20.", ctx.network);
+
+        let payload = RpcDegradedPayload {
+            alert: "rpc_all_degraded_resolved",
+            severity: "info".to_string(),
+            indexer: "trident-indexer",
+            network: ctx.network.clone(),
+            timestamp,
+            message: message.clone(),
+            text: message,
+        };
+
+        let mut posted_any = false;
+        for (sink, url) in self.sinks.iter().zip(self.urls.iter()) {
+            let client = match &self.http {
+                Some(c) => c,
+                None => return,
+            };
+            if sink.post_rpc_degraded(client, url, &payload).await {
+                posted_any = true;
+            }
+        }
+
+        if posted_any {
+            state.rpc_degraded_fired = false;
+            state.rpc_degraded_last_alert_at = None;
+            tracing::info!(network = %ctx.network, "RPC degraded recovery webhook fired");
+        }
+    }
 }
 
 /// POST a JSON payload to the webhook URL.
@@ -474,7 +703,7 @@ mod tests {
     use chrono::Duration as CDuration;
 
     fn make_alerter(url: Option<&str>, threshold: u64, cooldown_minutes: u64) -> Alerter {
-        let sinks = if let Some(u) = url {
+        let sinks = if let Some(_u) = url {
             vec![Box::new(GenericWebhook) as Box<dyn AlertSink>]
         } else {
             vec![]
@@ -489,6 +718,7 @@ mod tests {
             chain_tip_ledger: chain_tip,
             lag_threshold: threshold,
             network: "testnet".to_string(),
+            rpc_all_degraded: false,
         }
     }
 
@@ -533,6 +763,8 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: Some(Utc::now() - CDuration::minutes(5)),
             alert_fired: true,
+            rpc_degraded_fired: false,
+            rpc_degraded_last_alert_at: None,
         };
 
         // With a disabled alerter evaluate is a no-op; the guard is tested
@@ -552,6 +784,8 @@ mod tests {
             // last alert was 31 minutes ago — cooldown expired
             last_alert_at: Some(Utc::now() - CDuration::minutes(31)),
             alert_fired: true,
+            rpc_degraded_fired: false,
+            rpc_degraded_last_alert_at: None,
         };
 
         // Disabled alerter: no HTTP call, but cooldown check would pass.
@@ -568,6 +802,8 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: None,
             alert_fired: false,
+            rpc_degraded_fired: false,
+            rpc_degraded_last_alert_at: None,
         };
 
         a.evaluate(&ctx, &mut state).await;
@@ -626,6 +862,8 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: Some(Utc::now() - CDuration::minutes(35)),
             alert_fired: true, // a previous alert was fired
+            rpc_degraded_fired: false,
+            rpc_degraded_last_alert_at: None,
         };
 
         alerter.evaluate(&ctx, &mut state).await;
@@ -684,6 +922,8 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: Some(Utc::now() - CDuration::minutes(5)),
             alert_fired: true,
+            rpc_degraded_fired: false,
+            rpc_degraded_last_alert_at: None,
         };
 
         alerter.evaluate(&ctx, &mut state).await;

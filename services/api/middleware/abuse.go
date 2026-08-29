@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -156,6 +157,7 @@ func PerIPRateLimit(cfg PerIPRateLimitConfig) func(http.Handler) http.Handler {
 
 			if !allowed {
 				perIPRejected.Add(1)
+				metrics.RateLimitRejectionsTotal.WithLabelValues("per_ip").Inc()
 				retryAfter := int64(window.Seconds())
 				if retryAfter < 1 {
 					retryAfter = 1
@@ -221,6 +223,7 @@ func GlobalConcurrencyLimit(maxInFlight int) func(http.Handler) http.Handler {
 
 			if n > limit {
 				globalRejected.Add(1)
+				metrics.RateLimitRejectionsTotal.WithLabelValues("global_concurrency").Inc()
 				w.Header().Set("Retry-After", "1")
 				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "server is shedding load; try again shortly")
 				return

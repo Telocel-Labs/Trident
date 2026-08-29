@@ -4,21 +4,26 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trident-indexer"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python client SDK for the Trident Soroban event indexer"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
+authors = [{ name = "Depo-dev" }]
 keywords = ["stellar", "soroban", "blockchain", "indexer", "events"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet",
     "Typing :: Typed",
 ]
 dependencies = [
@@ -32,14 +37,56 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "mypy>=1.8",
+    "types-requests>=2.28",
 ]
 
 [project.urls]
-Homepage = "https://github.com/Telocel-Labs/Trident"
-Repository = "https://github.com/Telocel-Labs/Trident"
+Homepage = "https://github.com/Depo-dev/trident"
+Repository = "https://github.com/Depo-dev/trident"
+Issues = "https://github.com/Depo-dev/trident/issues"
+Documentation = "https://github.com/Depo-dev/trident/blob/main/sdk/python/README.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trident_indexer"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/trident_indexer",
+    "tests",
+    "README.md",
+    "LICENSE",
+]
+
+[tool.mypy]
+python_version = "3.9"
+packages = ["trident_indexer"]
+mypy_path = "src"
+strict = true
+warn_unused_configs = true
+show_error_codes = true
+
+# websocket-client ships no py.typed marker / stub package (unlike aiohttp and
+# websockets, which are inline-typed, and requests, covered by types-requests
+# in the dev extra) — without this override `mypy --strict` fails on the
+# `import websocket` in client.py before it ever reaches our own code.
+[[tool.mypy.overrides]]
+module = ["websocket.*"]
+ignore_missing_imports = true
+
+# openapi_models_gen is generated from api/openapi.yaml by
+# scripts/generate_sdk_models.py and is overwritten on every regeneration, so
+# it cannot carry hand-written annotations. The generator emits untyped
+# `from_*` coercion helpers and bare `dict` returns, which trip
+# no-untyped-call / type-arg under --strict. Relaxing those four checks for
+# this module only keeps --strict enforced everywhere a human writes code;
+# the models it exports are still fully typed at their public boundary.
+[[tool.mypy.overrides]]
+module = ["trident_indexer.openapi_models_gen"]
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+disallow_any_generics = false
+warn_return_any = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

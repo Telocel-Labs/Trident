@@ -1,0 +1,72 @@
+---
+title: "Event Message Format"
+description: "The JSON shape of event messages delivered over a Trident WebSocket connection."
+---
+
+## Event message
+
+When an event matching your subscription arrives, the server sends a message of type `"event"`:
+
+```json
+{
+  "type": "event",
+  "event": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    "ledgerSequence": 12345678,
+    "ledgerTimestamp": "2025-01-15T10:30:00Z",
+    "transactionHash": "3389e9f0f1a65f19935ef8b398905b88e74e9b0bb72a13dea36dc0cfd4ab2bd1",
+    "eventIndex": 0,
+    "eventType": "contract",
+    "topics": [
+      "AAAADQAAAAh0cmFuc2Zlcg==",
+      "AAAAE..."
+    ],
+    "data": null,
+    "createdAt": "2025-01-15T10:30:01Z"
+  }
+}
+```
+
+### Message schema
+
+| Field          | Type     | Description                                                              |
+|----------------|----------|--------------------------------------------------------------------------|
+| `type`         | `string` | Always `"event"` for event messages.                                     |
+| `event`        | `object` | The `SorobanEvent` record — same schema as the REST API responses.      |
+
+### SorobanEvent fields
+
+| Field             | Type       | Description                                                    |
+|-------------------|------------|----------------------------------------------------------------|
+| `id`              | `string`   | UUID v4 assigned by the indexer.                              |
+| `contractId`      | `string`   | Stellar contract address (C… strkey).                        |
+| `ledgerSequence`  | `number`   | Ledger sequence number when the event occurred.               |
+| `ledgerTimestamp` | `string`   | ISO-8601 timestamp of the ledger close.                       |
+| `transactionHash` | `string`   | Transaction hash (hex).                                       |
+| `eventIndex`      | `number`   | Zero-based index of this event within the transaction.        |
+| `eventType`       | `string`   | One of: `contract`, `system`, `diagnostic`.                  |
+| `topics`          | `string[]` | XDR-encoded topic values (base64 strings).                   |
+| `data`            | `unknown`  | Decoded event data payload.                                   |
+| `createdAt`       | `string`   | ISO-8601 timestamp when the record was written to the index.  |
+
+---
+
+## Ordering guarantee
+
+Events are delivered in **ledger sequence order**. Within a ledger, events are delivered in `eventIndex` order. Events are never delivered out of order, and no event is delivered twice on the same connection.
+
+---
+
+## Other message types
+
+In addition to `"event"` messages, the server may send:
+
+| `type`        | When it's sent                                           |
+|---------------|----------------------------------------------------------|
+| `subscribed`  | Acknowledges a successful `subscribe` frame.            |
+| `unsubscribed`| Acknowledges a successful `unsubscribe` frame.          |
+| `error`       | Sent when a frame the client sent was invalid.          |
+| `ping`        | Sent every 30 seconds to keep the connection alive.     |
+
+Respond to `"ping"` messages with a `"pong"` frame (the SDK handles this automatically).

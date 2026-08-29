@@ -1,7 +1,8 @@
 pub mod endpoints;
+pub mod health;
 
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
@@ -11,7 +12,33 @@ pub mod filters;
 pub use filters::{EventFilter, FilterPlan};
 
 use crate::metrics;
-use endpoints::EndpointPool;
+use health::RpcHealthScorer;
+
+/// Deserialize a field that the RPC may send as either a JSON string or a
+/// JSON number, normalising both to `String`.
+///
+/// `getEvents` is inconsistent across Soroban RPC versions: older releases
+/// quote `ledger` (`"7"`), current ones send a bare integer (`7`). Typing the
+/// field as `String` therefore failed the whole page with
+/// `invalid type: integer 7, expected a string`, so no events were ever
+/// ingested against a modern RPC (issue #388). Accepting both keeps the
+/// existing `String` contract for callers while tolerating either wire shape.
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u64),
+    }
+
+    Ok(match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => s,
+        StringOrNumber::Number(n) => n.to_string(),
+    })
+}
 
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
@@ -19,23 +46,52 @@ use endpoints::EndpointPool;
 pub struct RawEvent {
     #[serde(rename = "type")]
     pub event_type: String,
-    /// Ledger sequence number as a numeric string.
+    /// Ledger sequence number. Kept as a string because the RPC has sent it
+    /// both quoted and unquoted across versions; see [`string_or_number`].
+    #[serde(deserialize_with = "string_or_number")]
     pub ledger: String,
     #[serde(rename = "ledgerClosedAt")]
     pub ledger_closed_at: String,
     #[serde(rename = "contractId")]
     pub contract_id: Option<String>,
     pub id: String,
-    #[serde(rename = "pagingToken")]
-    pub paging_token: String,
+    /// Removed from the RPC response in stellar-rpc v22 (stellar-rpc#382):
+    /// `id` identifies an individual event and the top-level `cursor` drives
+    /// pagination. Older servers still send it, so it stays optional rather
+    /// than failing the whole page on a modern one. Prefer
+    /// [`RawEvent::page_cursor`] over reading this directly.
+    #[serde(rename = "pagingToken", default)]
+    pub paging_token: Option<String>,
     #[serde(rename = "txHash")]
     pub tx_hash: String,
+    /// Operation index within the transaction, added in stellar-rpc#383.
+    /// Absent on older servers, where the index was encoded in `id` instead.
+    #[serde(rename = "operationIndex", default)]
+    pub operation_index: Option<u32>,
     /// Ordered list of base64 XDR-encoded ScVal topic values.
     pub topic: Vec<String>,
     /// Base64 XDR-encoded ScVal event body.
     pub value: String,
-    #[serde(rename = "inSuccessfulContractCall")]
+    /// Deprecated upstream and slated for removal (stellar-rpc#4590), so a
+    /// missing value must not fail the page. Absent means the event was not
+    /// filtered out, hence the `true` default.
+    #[serde(rename = "inSuccessfulContractCall", default = "default_true")]
     pub in_successful_contract_call: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl RawEvent {
+    /// The token to resume paging from after this event.
+    ///
+    /// Uses `pagingToken` when the server still sends it and falls back to
+    /// `id`, which stellar-rpc#382 designates as its replacement. Both are
+    /// accepted by the `cursor` request parameter.
+    pub fn page_cursor(&self) -> String {
+        self.paging_token.clone().unwrap_or_else(|| self.id.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -83,6 +139,20 @@ struct LedgerPagination {
 #[derive(Deserialize)]
 struct GetLedgersResult {
     ledgers: Vec<LedgerSummary>,
+}
+
+/// `getLatestLedger` takes no parameters, but the JSON-RPC envelope this client
+/// builds always serialises a `params` member.
+///
+/// Test-gated alongside [`RpcClient::get_latest_ledger`], its only caller.
+#[cfg(test)]
+#[derive(Serialize)]
+struct EmptyParams {}
+
+#[cfg(test)]
+#[derive(Deserialize)]
+struct GetLatestLedgerResult {
+    sequence: u64,
 }
 
 #[derive(Deserialize)]
@@ -238,16 +308,32 @@ impl RpcHttpSettings {
 fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentError {
     if err.is_timeout() {
         metrics::record_rpc_timeout();
+        metrics::record_rpc_error(context, "timeout");
         return TridentError::rpc(anyhow::Error::new(err).context(format!("{context} timed out")));
     }
+    metrics::record_rpc_error(context, "transport");
     TridentError::rpc(anyhow::Error::new(err).context(context))
+}
+
+/// Coarse error-type label for a non-2xx RPC HTTP response (issue #294).
+fn classify_http_status(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        429 => "rate_limited",
+        400..=499 => "http_4xx",
+        500..=599 => "http_5xx",
+        _ => "other",
+    }
 }
 
 pub struct RpcClient {
     http: reqwest::Client,
-    /// Prioritised endpoint pool; a single-endpoint deployment is just a pool
-    /// of length one (issue #213).
-    pool: Mutex<EndpointPool>,
+    /// Health scorer for multi-RPC failover with dynamic scoring.
+    scorer: Arc<RpcHealthScorer>,
+    /// Configured endpoints in priority order. The scorer keys endpoints by
+    /// URL in a HashMap, which has no stable ordering, so this list is what
+    /// gives each endpoint the positional index used to label per-endpoint
+    /// latency metrics (issue #294).
+    endpoints: Vec<String>,
 }
 
 impl RpcClient {
@@ -255,67 +341,61 @@ impl RpcClient {
     /// timeouts and connection-pool settings (issue #214).
     #[cfg(test)]
     pub fn with_settings(url: String, settings: &RpcHttpSettings) -> Result<Self, TridentError> {
-        Self::with_endpoints(vec![url], settings, 3, Duration::from_secs(30))
+        Self::with_endpoints(vec![url], settings)
     }
 
     /// Build a client over a prioritised endpoint list with health-based
-    /// failover (issue #213).
+    /// failover using dynamic scoring (multi-RPC failover).
     pub fn with_endpoints(
         urls: Vec<String>,
         settings: &RpcHttpSettings,
-        failover_threshold: u32,
-        endpoint_cooldown: Duration,
     ) -> Result<Self, TridentError> {
-        let pool = EndpointPool::new(urls, failover_threshold, endpoint_cooldown)?;
-        metrics::set_rpc_active_endpoint(pool.active_index());
+        let scorer = Arc::new(RpcHealthScorer::new(urls.clone())?);
 
         Ok(Self {
             http: settings.build_client()?,
-            pool: Mutex::new(pool),
+            scorer,
+            endpoints: urls,
         })
     }
 
-    /// Index of the endpoint currently serving traffic (0 = primary).
-    #[cfg(test)]
-    pub fn active_endpoint_index(&self) -> usize {
-        self.pool
-            .lock()
-            .expect("endpoint pool mutex poisoned")
-            .active_index()
+    /// Get the health scorer for testing and monitoring purposes.
+    pub fn health_scorer(&self) -> &Arc<RpcHealthScorer> {
+        &self.scorer
     }
 
-    /// Endpoint to use for the next request, after any pending recovery back to
-    /// a higher-priority endpoint.
-    fn select_endpoint(&self) -> String {
-        let mut pool = self.pool.lock().expect("endpoint pool mutex poisoned");
-        let (url, changed) = pool.select();
-        if changed {
-            metrics::set_rpc_active_endpoint(pool.active_index());
-            tracing::info!(endpoint = %url, "Recovered to higher-priority RPC endpoint");
-        }
-        url
+    /// Select the healthiest endpoint for the next request. Also returns the
+    /// endpoint's position in the configured list, used to label per-endpoint
+    /// latency metrics (issue #294).
+    fn select_endpoint(&self) -> (String, usize) {
+        let url = self.scorer.select_best_endpoint();
+        let index = self
+            .endpoints
+            .iter()
+            .position(|candidate| candidate == &url)
+            .unwrap_or(0);
+        metrics::set_rpc_active_endpoint(index);
+        (url, index)
     }
 
-    /// Clear the failure streak for the active endpoint after a good response.
-    fn record_success(&self) {
-        self.pool
-            .lock()
-            .expect("endpoint pool mutex poisoned")
-            .record_success();
+    /// Record a successful response from the given endpoint.
+    fn record_success(&self, url: &str, ledger: Option<u64>) {
+        self.scorer.record_success(url, ledger);
     }
 
-    /// Record a failed call; fails over to the next healthy endpoint once the
-    /// configured threshold is reached.
-    fn record_failure(&self) {
-        let mut pool = self.pool.lock().expect("endpoint pool mutex poisoned");
-        if pool.record_failure() {
-            metrics::record_rpc_failover();
-            metrics::set_rpc_active_endpoint(pool.active_index());
-            tracing::warn!(
-                endpoint = %pool.active_url(),
-                "RPC endpoint failed repeatedly, failing over"
-            );
-        }
+    /// Record a timeout error from the given endpoint.
+    fn record_timeout(&self, url: &str) {
+        self.scorer.record_timeout(url);
+    }
+
+    /// Record a non-200 HTTP response from the given endpoint.
+    fn record_non_200(&self, url: &str) {
+        self.scorer.record_non_200(url);
+    }
+
+    /// Record a JSON-RPC error from the given endpoint.
+    fn record_rpc_error(&self, url: &str) {
+        self.scorer.record_rpc_error(url);
     }
 
     /// Run one JSON-RPC call against the active endpoint, updating endpoint
@@ -331,7 +411,7 @@ impl RpcClient {
         P: Serialize,
         R: serde::de::DeserializeOwned,
     {
-        let url = self.select_endpoint();
+        let (url, endpoint_index) = self.select_endpoint();
         let req = JsonRpcRequest {
             jsonrpc: "2.0",
             id,
@@ -339,12 +419,37 @@ impl RpcClient {
             params,
         };
 
+        // Timed regardless of outcome: a provider that's getting slower but
+        // not yet erroring is exactly what this metric exists to catch
+        // (issue #294).
+        let started = Instant::now();
         let result = self.execute(&url, &req, context).await;
+        metrics::record_rpc_call_duration(context, endpoint_index, started.elapsed().as_secs_f64());
+
         match &result {
-            Ok(_) => self.record_success(),
-            Err(_) => self.record_failure(),
+            Ok(_) => self.record_success(&url, None),
+            Err(e) => self.record_error(&url, e),
         }
         result
+    }
+
+    /// Record an error based on its type.
+    fn record_error(&self, url: &str, error: &TridentError) {
+        let error_str = error.to_string();
+        if error_str.contains("timed out") {
+            self.record_timeout(url);
+        } else if error_str.contains("HTTP 4") || error_str.contains("HTTP 5") {
+            self.record_non_200(url);
+        } else if error_str.contains("RPC error") {
+            self.record_rpc_error(url);
+        } else if error_str.contains("connection refused") {
+            self.record_connection_refused(url);
+        }
+    }
+
+    /// Record a connection refused error from the given endpoint.
+    fn record_connection_refused(&self, url: &str) {
+        self.scorer.record_connection_refused(url);
     }
 
     async fn execute<P, R>(
@@ -368,9 +473,11 @@ impl RpcClient {
         // A non-2xx response (rate limit, 5xx) is an endpoint failure, not a
         // decode failure — surface it as such so failover can react.
         if !resp.status().is_success() {
+            let status = resp.status();
+            metrics::record_rpc_error(context, classify_http_status(status));
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "{context}: endpoint {url} returned HTTP {}",
-                resp.status()
+                status
             )));
         }
 
@@ -380,6 +487,15 @@ impl RpcClient {
             .map_err(|e| rpc_transport_error(e, context))?;
 
         if let Some(err) = body.error {
+            // The RPC has no dedicated error code for an out-of-range cursor
+            // (issue #294 asks it be distinguishable from other JSON-RPC
+            // errors); its message is the only signal available.
+            let error_type = if err.message.to_lowercase().contains("cursor") {
+                "invalid_cursor"
+            } else {
+                "rpc_error"
+            };
+            metrics::record_rpc_error(context, error_type);
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "{context}: RPC error {}: {}",
                 err.code,
@@ -387,8 +503,30 @@ impl RpcClient {
             )));
         }
 
-        body.result
-            .ok_or_else(|| TridentError::rpc(anyhow::anyhow!("{context}: empty result")))
+        body.result.ok_or_else(|| {
+            metrics::record_rpc_error(context, "empty_result");
+            TridentError::rpc(anyhow::anyhow!("{context}: empty result"))
+        })
+    }
+
+    /// Fetch the current chain tip via `getLatestLedger`.
+    ///
+    /// `getEvents` also reports `latestLedger`, but only on a request that
+    /// already carries a valid in-range `startLedger` — which is precisely what
+    /// a caller who does not yet know the tip cannot supply. This method has no
+    /// such precondition.
+    ///
+    /// Test-gated: the poll loop learns the tip from the `getEvents` responses
+    /// it already makes, so the running indexer has no reason to spend an extra
+    /// round trip on it. Only the testnet correctness suite (issue #419), which
+    /// must choose a ledger window before it can request anything, needs it.
+    /// Remove the gate if a production caller ever appears.
+    #[cfg(test)]
+    pub async fn get_latest_ledger(&self) -> Result<u64, TridentError> {
+        let result: GetLatestLedgerResult = self
+            .call("getLatestLedger", 3, EmptyParams {}, "getLatestLedger")
+            .await?;
+        Ok(result.sequence)
     }
 
     /// Fetch the ledger hash for a given sequence number via `getLedgers`.
@@ -422,14 +560,32 @@ impl RpcClient {
         limit: u32,
         filters: &[EventFilter],
     ) -> Result<EventsPage, TridentError> {
+        let (url, _endpoint_index) = self.select_endpoint();
         let params = GetEventsParams {
             start_ledger,
             filters,
             pagination: Pagination { limit, cursor },
         };
 
-        let result: GetEventsResult = self.call("getEvents", 1, params, "getEvents").await?;
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getEvents",
+            params: &params,
+        };
 
+        let result: Result<GetEventsResult, TridentError> =
+            self.execute(&url, &req, "getEvents").await;
+        match &result {
+            Ok(r) => {
+                self.record_success(&url, Some(r.latest_ledger));
+                // Check for stale ledger
+                self.scorer.check_and_record_stale(&url);
+            }
+            Err(e) => self.record_error(&url, e),
+        }
+
+        let result = result?;
         Ok(EventsPage {
             events: result.events,
             latest_ledger: result.latest_ledger,
@@ -443,6 +599,26 @@ impl RpcClient {
     pub async fn get_transaction(&self, hash: &str) -> Result<GetTransactionResult, TridentError> {
         let params = GetTransactionParams { hash };
         self.call("getTransaction", 3, params, "getTransaction")
+            .await
+    }
+
+    /// Run a read-only host function call through `simulateTransaction`
+    /// (issue #263), used by `crate::token_metadata` to read SEP-41 token
+    /// metadata without ever signing or submitting a transaction.
+    ///
+    /// A simulation that the node rejects (e.g. the contract exposes no such
+    /// function) comes back as `Ok` with `error` set and `results` empty — that
+    /// is a normal "not a token" answer, not a transport failure, so it is left
+    /// for the caller to interpret. Only genuine RPC/transport failures are
+    /// returned as `Err`.
+    pub async fn simulate_transaction(
+        &self,
+        envelope_xdr: &str,
+    ) -> Result<SimulateTransactionResult, TridentError> {
+        let params = SimulateTransactionParams {
+            transaction: envelope_xdr,
+        };
+        self.call("simulateTransaction", 6, params, "simulateTransaction")
             .await
     }
 
@@ -542,6 +718,75 @@ mod tests {
         assert!(RpcHttpSettings::default().build_client().is_ok());
     }
 
+    fn raw_event_json(ledger: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "contract",
+            "ledger": ledger,
+            "ledgerClosedAt": "2026-08-09T18:59:36Z",
+            "contractId": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            // Deliberately different so tests can prove which one is used.
+            "id": "0000000000000000007-0000000001",
+            "pagingToken": "0000000000000000000-0000000000",
+            "txHash": "aabb",
+            "topic": ["AAAADwAAAARtaW50"],
+            "value": "AAAACgAAAAAAAAAAAAAAAAAAAGQ=",
+            "inSuccessfulContractCall": true
+        })
+    }
+
+    #[test]
+    fn raw_event_accepts_an_unquoted_ledger_number() {
+        // Regression (#388): current Soroban RPC sends `"ledger": 7` as a bare
+        // integer. Typing the field as String failed the entire page with
+        // `invalid type: integer 7, expected a string`, so nothing was indexed.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!(7)))
+            .expect("unquoted ledger must deserialize");
+        assert_eq!(ev.ledger, "7");
+    }
+
+    #[test]
+    fn raw_event_still_accepts_a_quoted_ledger_string() {
+        // Older RPC releases quote it; both shapes must keep working.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!("7")))
+            .expect("quoted ledger must deserialize");
+        assert_eq!(ev.ledger, "7");
+    }
+
+    #[test]
+    fn raw_event_parses_without_paging_token_and_falls_back_to_id() {
+        // Regression (#388): stellar-rpc#382 removed pagingToken in favour of
+        // `id`. Requiring it failed the whole page against a current server.
+        let mut json = raw_event_json(serde_json::json!(7));
+        json.as_object_mut().unwrap().remove("pagingToken");
+        let ev: RawEvent =
+            serde_json::from_value(json).expect("missing pagingToken must deserialize");
+        assert_eq!(ev.paging_token, None);
+        assert_eq!(ev.page_cursor(), ev.id, "paging must fall back to id");
+    }
+
+    #[test]
+    fn raw_event_prefers_paging_token_when_the_server_sends_one() {
+        // Older servers still send it; it must win over id so paging behaviour
+        // against them is unchanged.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!(7)))
+            .expect("event must deserialize");
+        assert_eq!(ev.page_cursor(), "0000000000000000000-0000000000");
+        assert_ne!(ev.page_cursor(), ev.id);
+    }
+
+    #[test]
+    fn raw_event_defaults_in_successful_contract_call_when_absent() {
+        // Deprecated upstream (stellar-rpc#4590) and due for removal, so its
+        // absence must not fail the page or silently drop the event.
+        let mut json = raw_event_json(serde_json::json!(7));
+        json.as_object_mut()
+            .unwrap()
+            .remove("inSuccessfulContractCall");
+        let ev: RawEvent = serde_json::from_value(json)
+            .expect("missing inSuccessfulContractCall must deserialize");
+        assert!(ev.in_successful_contract_call);
+    }
+
     /// Mount an endpoint that always answers `getEvents` with an empty page.
     async fn mount_healthy(server: &MockServer) {
         Mock::given(method("POST"))
@@ -570,15 +815,18 @@ mod tests {
         let client = RpcClient::with_endpoints(
             vec![primary.uri(), secondary.uri()],
             &fast_timeout_settings(),
-            2,
-            Duration::from_millis(200),
         )
         .unwrap();
 
-        // Two failures on the primary trip the failover threshold.
+        // One 503 costs the primary 15 points (100 -> 85), which is already
+        // enough to put the untouched secondary ahead. Scoring fails over on
+        // the first failure, unlike the consecutive-failure threshold the
+        // superseded endpoint pool used.
         assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
-        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
-        assert_eq!(client.active_endpoint_index(), 1);
+
+        // The health scorer should now prefer the secondary endpoint.
+        let best_endpoint = client.health_scorer().select_best_endpoint();
+        assert_eq!(best_endpoint, secondary.uri());
 
         // The secondary now serves traffic successfully.
         let page = client
@@ -586,15 +834,6 @@ mod tests {
             .await
             .expect("secondary must serve the request");
         assert_eq!(page.latest_ledger, 100);
-
-        // Once the primary's cooldown elapses it is selected again.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
-        assert_eq!(
-            client.active_endpoint_index(),
-            0,
-            "primary should be probed again after cooldown"
-        );
     }
 
     /// A single healthy endpoint never fails over, and non-2xx responses from
@@ -612,7 +851,6 @@ mod tests {
 
         assert!(err.to_string().contains("429"), "got: {err}");
         assert_eq!(err.severity(), Severity::Retryable);
-        assert_eq!(client.active_endpoint_index(), 0);
     }
 
     /// Requests are served by the primary while it is healthy.
@@ -626,15 +864,15 @@ mod tests {
         let client = RpcClient::with_endpoints(
             vec![primary.uri(), secondary.uri()],
             &fast_timeout_settings(),
-            2,
-            Duration::from_millis(200),
         )
         .unwrap();
 
         for _ in 0..3 {
             client.get_events(Some(1), None, 10, &[]).await.unwrap();
         }
-        assert_eq!(client.active_endpoint_index(), 0);
+        // Primary should still be preferred (both at 100, primary was first)
+        let best_endpoint = client.health_scorer().select_best_endpoint();
+        assert_eq!(best_endpoint, primary.uri());
         assert_eq!(secondary.received_requests().await.unwrap().len(), 0);
     }
 

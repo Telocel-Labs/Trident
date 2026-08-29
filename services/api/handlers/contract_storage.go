@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -9,6 +10,11 @@ import (
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 )
+
+// contractStorageQueryTimeout bounds the DB calls in ContractStorageLatest/
+// ContractStorageHistory so a runaway query can't hold a pool connection for
+// the request's full budget (issue #238).
+const contractStorageQueryTimeout = 5 * time.Second
 
 // ContractStorageValue is one contract-storage key's value at a given ledger
 // (issue #270).
@@ -42,8 +48,11 @@ func ContractStorageLatest(db SchemaRegistryDB) http.HandlerFunc {
 			return
 		}
 
+		ctx, cancel := context.WithTimeout(r.Context(), contractStorageQueryTimeout)
+		defer cancel()
+
 		network := middleware.NetworkFromContext(r.Context())
-		rows, err := db.Query(r.Context(), `
+		rows, err := db.Query(ctx, `
             SELECT DISTINCT ON (storage_key)
                 storage_key, key_json, value_json, ledger_sequence, created_at
             FROM contract_storage_snapshots
@@ -102,8 +111,11 @@ func ContractStorageHistory(db SchemaRegistryDB) http.HandlerFunc {
 			return
 		}
 
+		ctx, cancel := context.WithTimeout(r.Context(), contractStorageQueryTimeout)
+		defer cancel()
+
 		network := middleware.NetworkFromContext(r.Context())
-		rows, err := db.Query(r.Context(), `
+		rows, err := db.Query(ctx, `
             SELECT storage_key, key_json, value_json, ledger_sequence, created_at
             FROM contract_storage_snapshots
             WHERE contract_id = $1 AND network = $2 AND storage_key = $3

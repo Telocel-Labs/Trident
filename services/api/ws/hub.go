@@ -5,6 +5,8 @@ package ws
 import (
 	"log/slog"
 	"sync"
+
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 )
 
 // maxConsecutiveDrops is the fill policy threshold (issue #224): a subscriber
@@ -76,6 +78,8 @@ func (h *Hub) register(s subscriber) {
 	h.mu.Lock()
 	h.clients[s] = struct{}{}
 	h.mu.Unlock()
+	metrics.WSActiveConnections.Inc()
+	metrics.WSConnectsTotal.Inc()
 	slog.Debug("ws: client registered", "contractId", s.getContractID())
 }
 
@@ -83,12 +87,17 @@ func (h *Hub) register(s subscriber) {
 // can exit cleanly.
 func (h *Hub) unregister(s subscriber) {
 	h.mu.Lock()
-	if _, ok := h.clients[s]; ok {
+	_, ok := h.clients[s]
+	if ok {
 		delete(h.clients, s)
 		delete(h.dropStreak, s)
 		s.shutdown()
 	}
 	h.mu.Unlock()
+	if ok {
+		metrics.WSActiveConnections.Dec()
+		metrics.WSDisconnectsTotal.Inc()
+	}
 	slog.Debug("ws: client unregistered", "contractId", s.getContractID())
 }
 
@@ -111,10 +120,12 @@ func (h *Hub) Broadcast(contractID string, msg []byte) {
 		}
 		if s.trySend(msg) {
 			h.dropStreak[s] = 0
+			metrics.WSMessagesTotal.WithLabelValues("sent").Inc()
 			continue
 		}
 
 		metricMessagesDropped.Add(1)
+		metrics.WSMessagesTotal.WithLabelValues("dropped").Inc()
 		h.dropStreak[s]++
 		slog.Warn("ws: dropping message for slow client", "contractId", contractID, "streak", h.dropStreak[s])
 

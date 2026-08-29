@@ -1,0 +1,131 @@
+---
+title: "TridentError"
+description: "Error class thrown by all TridentClient methods, with error codes and handling patterns."
+---
+
+## Overview
+
+All `TridentClient` methods throw `TridentError` on failure. `TridentError` extends the standard `Error` class and adds a `code` property for programmatic error handling.
+
+```typescript
+import { TridentError } from "@trident-indexer/sdk";
+
+try {
+  const event = await client.getEventById({ id: "..." });
+} catch (err) {
+  if (err instanceof TridentError) {
+    console.error(err.code, err.message);
+  }
+}
+```
+
+---
+
+## Properties
+
+| Property              | Type                | Description                                         |
+|-----------------------|---------------------|-----------------------------------------------------|
+| `code`                | `TridentErrorCode`  | Machine-readable error identifier.                 |
+| `message`             | `string`            | Human-readable description of the error.            |
+| `httpStatus`          | `number \| undefined` | HTTP status code, if the error came from a response.|
+| `retryAfterSeconds`   | `number \| undefined` | Set on `RATE_LIMITED` — seconds to wait before retrying. |
+
+---
+
+## Error codes
+
+| Code               | HTTP Status  | When it's thrown                                                            |
+|--------------------|--------------|-----------------------------------------------------------------------------|
+| `NOT_FOUND`        | 404          | The requested event or resource does not exist in the index.               |
+| `UNAUTHORIZED`     | 401          | `X-API-Key` header is missing or the key value is not recognised.          |
+| `FORBIDDEN`        | 403          | API key is valid but does not have permission for this endpoint or tier.   |
+| `RATE_LIMITED`     | 429          | Too many requests in the sliding window. Check `retryAfterSeconds`.        |
+| `INVALID_ARGUMENT` | 400          | A parameter failed validation (e.g. malformed UUID, out-of-range limit).   |
+| `UNAVAILABLE`      | 503          | The API or indexer is temporarily unavailable.                              |
+| `ITERATION_LIMIT`  | —            | `iterEvents` hit its `maxPages` cap before `hasMore` became false.         |
+| `INTERNAL`         | 5xx / network| Unexpected server error, network failure, or unrecognised response format. |
+
+---
+
+## Handling all codes
+
+```typescript
+import { TridentClient, TridentError } from "@trident-indexer/sdk";
+import type { TridentErrorCode } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+async function fetchEvent(id: string) {
+  try {
+    return await client.getEventById({ id });
+  } catch (err) {
+    if (!(err instanceof TridentError)) throw err;
+
+    const code: TridentErrorCode = err.code;
+
+    switch (code) {
+      case "NOT_FOUND":
+        console.warn("Event not found:", id);
+        return null;
+
+      case "UNAUTHORIZED":
+        throw new Error("Check your TRIDENT_API_KEY environment variable");
+
+      case "FORBIDDEN":
+        throw new Error("Your API key tier cannot access this resource");
+
+      case "RATE_LIMITED": {
+        const waitMs = (err.retryAfterSeconds ?? 1) * 1000;
+        console.warn(`Rate limited — retrying in ${waitMs}ms`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        return fetchEvent(id); // retry
+      }
+
+      case "INVALID_ARGUMENT":
+        throw new Error(`Invalid event ID format: ${id}`);
+
+      case "UNAVAILABLE":
+        throw new Error("Trident API is temporarily unavailable — try again shortly");
+
+      case "INTERNAL":
+      default:
+        throw new Error(`Unexpected error: ${err.message}`);
+    }
+  }
+}
+```
+
+---
+
+## Iteration limit
+
+`ITERATION_LIMIT` is thrown by `iterEvents` when the page cap is reached:
+
+```typescript
+import { TridentClient, TridentError } from "@trident-indexer/sdk";
+
+const client = new TridentClient({
+  apiUrl: "https://api.trident.telocel.com",
+  apiKey: process.env.TRIDENT_API_KEY!,
+  network: "testnet",
+});
+
+try {
+  for await (const event of client.iterEvents(
+    { contractId: "CAAA...AD2KM" },
+    { maxPages: 10 } // cap at 10 pages (500 events at default limit)
+  )) {
+    console.log(event.id);
+  }
+} catch (err) {
+  if (err instanceof TridentError && err.code === "ITERATION_LIMIT") {
+    console.warn("Reached page limit — increase maxPages for full backfill");
+  } else {
+    throw err;
+  }
+}
+```
