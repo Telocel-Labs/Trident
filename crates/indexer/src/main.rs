@@ -74,6 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     });
 
+    // Log the effective configuration once at boot, with credentials redacted
+    // (issue #215), so a misconfigured deploy is diagnosable from the first
+    // few log lines rather than by reasoning backwards from later symptoms.
+    tracing::info!(config = %cfg.redacted_summary(), "Effective configuration");
+
     metrics::install(cfg.metrics_port)?;
 
     // Set statement_timeout and idle_in_transaction_session_timeout on every

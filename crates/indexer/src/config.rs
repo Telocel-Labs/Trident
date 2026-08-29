@@ -351,6 +351,64 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Render the effective configuration for startup logging, with
+    /// credentials redacted (issue #215).
+    ///
+    /// `DATABASE_URL` and `REDIS_URL` can carry a password in their userinfo
+    /// section (`scheme://user:pass@host/...`); logging them verbatim would
+    /// leak that password into every log aggregator downstream of stdout.
+    /// Everything else here is operational, not secret, and is exactly what
+    /// an operator needs to confirm a deploy picked up the config they
+    /// intended.
+    pub fn redacted_summary(&self) -> String {
+        format!(
+            "database_url={} redis_url={} stellar_rpc_urls={:?} network={} \
+             poll_interval_ms={} poll_interval_floor_ms={} poll_interval_ceiling_ms={} \
+             max_events_per_poll={} db_batch_size={} db_pool_size={} \
+             redis_stream_maxlen={} metrics_port={} health_port={} \
+             alert_lag_threshold={} alert_cooldown_minutes={} statement_timeout_ms={} \
+             idle_in_transaction_timeout_ms={} token_metadata_refresh_interval_secs={} \
+             index_diagnostic={} topic_filters_count={} tracked_sac_assets_count={}",
+            redact_url(&self.database_url),
+            redact_url(&self.redis_url),
+            self.stellar_rpc_urls,
+            self.network,
+            self.poll_interval.as_millis(),
+            self.poll_interval_floor.as_millis(),
+            self.poll_interval_ceiling.as_millis(),
+            self.max_events_per_poll,
+            self.db_batch_size,
+            self.db_pool_size,
+            self.redis_stream_maxlen,
+            self.metrics_port,
+            self.health_port,
+            self.alert_lag_threshold,
+            self.alert_cooldown_minutes,
+            self.statement_timeout_ms,
+            self.idle_in_transaction_timeout_ms,
+            self.token_metadata_refresh_interval.as_secs(),
+            self.index_diagnostic,
+            self.topic_filters.len(),
+            self.tracked_sac_assets.len(),
+        )
+    }
+}
+
+/// Redact any embedded userinfo credentials from a connection URL (issue
+/// #215), keeping the scheme/host/path visible for diagnostics. Turns
+/// `scheme://user:pass@host/path` into `scheme://***@host/path`; a URL with
+/// no userinfo section is returned unchanged.
+fn redact_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('@') {
+            Some((_userinfo, host_and_path)) => format!("{scheme}://***@{host_and_path}"),
+            None => format!("{scheme}://{rest}"),
+        },
+        None => "***".to_string(),
+    }
+}
+
 /// Well-known Stellar network passphrases (issue #262). Any network name
 /// other than these two must set `NETWORK_PASSPHRASE` explicitly — guessing
 /// would silently derive wrong SAC contract ids.
@@ -980,5 +1038,60 @@ mod tests {
         std::env::set_var("TEST_POOL_BAD", "abc");
         assert!(parse_pool_size("TEST_POOL_BAD", 3).is_err());
         std::env::remove_var("TEST_POOL_BAD");
+    }
+
+    // -----------------------------------------------------------------------
+    // Redacted startup logging (issue #215)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redact_url_hides_userinfo_credentials() {
+        assert_eq!(
+            redact_url("postgres://user:hunter2@localhost:5432/db"),
+            "postgres://***@localhost:5432/db"
+        );
+    }
+
+    #[test]
+    fn redact_url_without_credentials_is_unchanged() {
+        assert_eq!(
+            redact_url("redis://localhost:6379"),
+            "redis://localhost:6379"
+        );
+    }
+
+    #[test]
+    fn redact_url_without_scheme_is_fully_redacted() {
+        assert_eq!(redact_url("not-a-url"), "***");
+    }
+
+    #[test]
+    fn redacted_summary_never_contains_the_password() {
+        let mut vars = required_vars();
+        vars.push((
+            "DATABASE_URL",
+            "postgres://trident:s3cr3t-pw@db.internal:5432/trident",
+        ));
+        vars.push(("REDIS_URL", "redis://:another-secret@cache.internal:6379"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            let summary = cfg.redacted_summary();
+            assert!(!summary.contains("s3cr3t-pw"));
+            assert!(!summary.contains("another-secret"));
+            assert!(summary.contains("db.internal:5432/trident"));
+            assert!(summary.contains("cache.internal:6379"));
+        });
+    }
+
+    #[test]
+    fn redacted_summary_includes_operational_settings() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            let summary = cfg.redacted_summary();
+            assert!(summary.contains("network=testnet"));
+            assert!(summary.contains("max_events_per_poll=200"));
+            assert!(summary.contains("db_pool_size="));
+        });
     }
 }

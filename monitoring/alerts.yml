@@ -127,6 +127,32 @@ groups:
           runbook_url: "docs/runbooks/alerts.md#tridentindexerparseerrorratehigh"
 
   # ---------------------------------------------------------------------------
+  # Insert dead-letter — well-formed events that exhausted their bounded
+  # insert retries and were written to failed_events instead of
+  # soroban_events (issue #208). Distinct from parse_errors above: those
+  # events never decoded; these decoded fine but could not be persisted.
+  # Alerts at any occurrence rather than a rate threshold — unlike parse
+  # errors, there is no expected baseline trickle of insert failures.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.insert_dead_letter
+    rules:
+      - alert: TridentIndexerInsertDeadLetterNonZero
+        expr: increase(trident_indexer_insert_dead_lettered_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer dead-lettered {{ $value }} well-formed event(s) in 15m"
+          description: >
+            A well-formed event exhausted its bounded insert retries and was
+            written to failed_events instead of soroban_events. Unlike a
+            parse error (malformed chain data), this usually means a real
+            problem in the storage layer — a schema/constraint mismatch or a
+            sustained DB outage — not a chain-data edge case.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerinsertdeadletternonzero"
+
+  # ---------------------------------------------------------------------------
   # Stellar RPC health (#297).
   # ---------------------------------------------------------------------------
   - name: trident.indexer.rpc

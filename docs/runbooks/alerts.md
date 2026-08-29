@@ -112,6 +112,31 @@ malformed events.
 3. If it's a new, valid event shape, this is a parser bug — file/fix rather
    than treating it as transient.
 
+## TridentIndexerInsertDeadLetterNonZero
+
+**Means:** a well-formed event exhausted its bounded insert retries and was
+written to `failed_events` instead of `soroban_events` (issue #208).
+
+**Why this threshold:** fires on any occurrence in a 15-minute window, not a
+rate. Unlike `TridentIndexerParseErrorRateHigh` above — which tolerates a
+small baseline trickle of malformed chain data — there is no expected
+baseline here: the event already decoded successfully, so a failure to
+persist it points at the storage layer itself (a schema/constraint mismatch,
+a sustained DB outage, or a genuine bug), not chain-data noise.
+
+**First steps:**
+1. Query `failed_events` for the most recent rows and inspect `error_message`
+   / `payload` for a common pattern.
+2. If `error_message` names a constraint or type error, this is a
+   schema/decoder mismatch — a fix needs to land before affected events can
+   be replayed.
+3. If it coincides with a Postgres outage or connection exhaustion
+   (`trident_indexer_db_pool_size`/`_idle_connections`), the underlying
+   incident is the priority; the dead-lettered rows can be replayed once the
+   database is healthy again by re-driving them through the normal insert
+   path (no automatic replay tooling exists yet — issue #208 scoped that
+   out).
+
 ## TridentIndexerRPCErrorRateHigh
 
 **Means:** over 5% of Stellar RPC calls (`getEvents`/`getLedgers`) errored in

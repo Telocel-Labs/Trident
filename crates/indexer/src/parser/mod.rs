@@ -315,7 +315,31 @@ pub fn scval_to_string(val: &ScVal) -> String {
         // deliberately: the variant carries a code whose meaning is
         // contract-defined, so there is no stable scalar to project it to.
         ScVal::Error(e) => format!("{e:?}"),
-        // For complex types in topic position, fall back to debug representation
+        // Recursive types in topic position: reuse the fully-recursive JSON
+        // projection and stringify it, rather than Rust's Debug format, so a
+        // struct/map/vec topic still comes back as valid, documented JSON
+        // text instead of "ScVec([...])" (issue #209).
+        ScVal::Vec(_) | ScVal::Map(_) => {
+            serde_json::to_string(&scval_to_json(val)).unwrap_or_else(|_| format!("{val:?}"))
+        }
+        // ContractInstance carries a contract's executable + storage map;
+        // LedgerKeyContractInstance/LedgerKeyNonce are ledger-key
+        // discriminators with no associated value. None of the three are
+        // values a contract can publish in an event body — the Soroban host
+        // does not expose them to `env.events().publish(...)` — so they get
+        // an explicit arm (Debug-rendered, like ScVal::Error above) instead
+        // of falling into the generic catch-all. That keeps
+        // `unhandled_scvariant` meaningful: it only fires for XDR types this
+        // decoder genuinely doesn't recognise, not ones deliberately left
+        // unprojected (issue #209).
+        ScVal::ContractInstance(v) => format!("{v:?}"),
+        ScVal::LedgerKeyContractInstance => "LedgerKeyContractInstance".to_string(),
+        ScVal::LedgerKeyNonce(n) => format!("{n:?}"),
+        // Defensive: stellar-xdr has added ScVal variants across major
+        // versions before (see scaddress_to_string's ScAddress match), so a
+        // future bump could add one this decoder has never seen. Anything
+        // landing here is a genuine gap, hence the metric.
+        #[allow(unreachable_patterns)]
         other => {
             crate::metrics::record_unhandled_scvariant();
             format!("{other:?}")
@@ -381,6 +405,12 @@ pub fn scval_to_json(val: &ScVal) -> Json {
             Json::Object(obj)
         }
         ScVal::Map(None) => Json::Object(serde_json::Map::new()),
+        // See the matching arm in `scval_to_string` for why these three are
+        // explicit rather than falling into the catch-all (issue #209).
+        ScVal::ContractInstance(v) => Json::String(format!("{v:?}")),
+        ScVal::LedgerKeyContractInstance => Json::String("LedgerKeyContractInstance".to_string()),
+        ScVal::LedgerKeyNonce(n) => Json::String(format!("{n:?}")),
+        #[allow(unreachable_patterns)]
         other => {
             crate::metrics::record_unhandled_scvariant();
             Json::String(format!("{other:?}"))
@@ -1156,7 +1186,10 @@ mod tests {
 
     #[test]
     fn scval_to_string_vec_none() {
-        assert_eq!(scval_to_string(&ScVal::Vec(None)), "Vec(None)");
+        // Was "Vec(None)" via the Debug catch-all; now recursively projected
+        // through scval_to_json, matching ScVal::Vec(None)'s JSON shape of an
+        // empty array (issue #209).
+        assert_eq!(scval_to_string(&ScVal::Vec(None)), "[]");
     }
 
     #[test]
@@ -1223,6 +1256,91 @@ mod tests {
     #[test]
     fn scval_to_json_void() {
         assert_eq!(scval_to_json(&ScVal::Void), Json::Null);
+    }
+
+    #[test]
+    fn scval_to_string_vec_renders_recursive_json_not_debug() {
+        // Before this arm, a Vec/Map in topic position fell to the Debug
+        // catch-all ("ScVec([...])"). It must now render as valid JSON text
+        // (issue #209).
+        let items = VecM::try_from(vec![ScVal::U32(1), ScVal::U32(2)]).unwrap();
+        let val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(items)));
+        let s = scval_to_string(&val);
+        assert_eq!(s, "[1,2]");
+    }
+
+    #[test]
+    fn scval_to_string_map_renders_recursive_json_not_debug() {
+        let entries: Vec<ScMapEntry> = vec![ScMapEntry {
+            key: sym("k"),
+            val: ScVal::U32(7),
+        }];
+        let val = ScVal::Map(Some(ScMap(VecM::try_from(entries).unwrap())));
+        let s = scval_to_string(&val);
+        assert_eq!(s, r#"{"k":7}"#);
+    }
+
+    #[test]
+    fn scval_to_string_nested_vec_of_maps() {
+        // Recursive coverage: a Vec containing a Map (issue #209).
+        let inner_map = ScVal::Map(Some(ScMap(
+            VecM::try_from(vec![ScMapEntry {
+                key: sym("amount"),
+                val: ScVal::I128(Int128Parts { hi: 0, lo: 42 }),
+            }])
+            .unwrap(),
+        )));
+        let val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            VecM::try_from(vec![inner_map]).unwrap(),
+        )));
+        assert_eq!(scval_to_string(&val), r#"[{"amount":42}]"#);
+    }
+
+    #[test]
+    fn contract_instance_does_not_count_as_unhandled_variant() {
+        // A deliberately-unprojected-but-recognised type must not trip the
+        // metric meant for genuinely unexpected XDR (issue #209).
+        let val = ScVal::ContractInstance(stellar_xdr::curr::ScContractInstance {
+            executable: stellar_xdr::curr::ContractExecutable::StellarAsset,
+            storage: None,
+        });
+        let rendered = scval_to_string(&val);
+        assert!(rendered.contains("StellarAsset"));
+    }
+
+    #[test]
+    fn ledger_key_contract_instance_renders_a_stable_label() {
+        assert_eq!(
+            scval_to_string(&ScVal::LedgerKeyContractInstance),
+            "LedgerKeyContractInstance"
+        );
+        assert_eq!(
+            scval_to_json(&ScVal::LedgerKeyContractInstance),
+            Json::String("LedgerKeyContractInstance".to_string())
+        );
+    }
+
+    #[test]
+    fn ledger_key_nonce_is_rendered_not_debug_catchall_metric() {
+        let val = ScVal::LedgerKeyNonce(stellar_xdr::curr::ScNonceKey { nonce: 99 });
+        let rendered = scval_to_string(&val);
+        assert!(rendered.contains('9'));
+    }
+
+    #[test]
+    fn scval_to_json_vec_of_maps_round_trips_through_serde() {
+        let inner_map = ScVal::Map(Some(ScMap(
+            VecM::try_from(vec![ScMapEntry {
+                key: sym("x"),
+                val: ScVal::U32(5),
+            }])
+            .unwrap(),
+        )));
+        let val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            VecM::try_from(vec![inner_map]).unwrap(),
+        )));
+        let json = scval_to_json(&val);
+        assert_eq!(json, serde_json::json!([{"x": 5}]));
     }
 
     #[test]
@@ -1386,8 +1504,170 @@ mod tests {
         })
     }
 
+    /// Number of proptest cases for the fuzz suites below, configurable at
+    /// runtime via `PROPTEST_CASES` (issue #219).
+    ///
+    /// `ProptestConfig::with_cases` bakes the count in at compile-ish time —
+    /// nothing here previously read the environment, so CI's `PROPTEST_CASES`
+    /// override (crates/indexer/../.github/workflows/ci.yml, "Fuzz the XDR
+    /// parser" step) silently had no effect and every run — local or CI —
+    /// used the same fixed 2000 cases regardless of the env var set around
+    /// it. Reading it here is what makes CI's larger, time-boxed budget (and
+    /// an even larger one for a local campaign) actually take effect:
+    ///
+    /// ```sh
+    /// PROPTEST_CASES=1000000 cargo test -p trident-indexer --bin trident-indexer parser::tests::
+    /// ```
+    ///
+    /// Any input that trips a panic is written by proptest to
+    /// `crates/indexer/proptest-regressions/` — commit that file so the case
+    /// becomes a permanent regression test.
+    fn fuzz_config(default_cases: u32) -> ProptestConfig {
+        let cases = std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_cases);
+        ProptestConfig {
+            cases,
+            ..ProptestConfig::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Seed corpus from real testnet events (issue #219)
+    //
+    // The fixtures under fixtures/token_events/ are real SEP-41/SAC event
+    // payloads (topics + data, base64 XDR) captured from testnet activity,
+    // already used as golden decode tests elsewhere in this file. Reusing
+    // them here as fuzz seeds means every mutated input starts from bytes a
+    // real contract actually emitted, rather than from uniformly random
+    // noise that is overwhelmingly likely to fail base64 decoding before it
+    // ever reaches the XDR reader.
+    // -----------------------------------------------------------------------
+
+    /// Every topic/data base64 XDR blob across the real event fixtures, used
+    /// as mutation seeds.
+    fn real_event_seed_b64() -> Vec<String> {
+        const FIXTURES: &[&str] = &[
+            include_str!("../../fixtures/token_events/transfer.json"),
+            include_str!("../../fixtures/token_events/mint.json"),
+            include_str!("../../fixtures/token_events/burn.json"),
+            include_str!("../../fixtures/token_events/approve.json"),
+            include_str!("../../fixtures/token_events/clawback.json"),
+            include_str!("../../fixtures/token_events/sac_transfer.json"),
+            include_str!("../../fixtures/token_events/sac_transfer_untracked.json"),
+        ];
+
+        let mut seeds = Vec::new();
+        for raw in FIXTURES {
+            let fixture: serde_json::Value =
+                serde_json::from_str(raw).expect("fixture must be valid JSON");
+            if let Some(topics) = fixture["topics"].as_array() {
+                for t in topics {
+                    if let Some(s) = t.as_str() {
+                        seeds.push(s.to_string());
+                    }
+                }
+            }
+            if let Some(d) = fixture["data"].as_str() {
+                seeds.push(d.to_string());
+            }
+        }
+        assert!(!seeds.is_empty(), "seed corpus must not be empty");
+        seeds
+    }
+
+    /// Apply bounded byte-level mutations to a base64 seed: decode it, flip
+    /// bytes at the given (position, replacement) pairs — positions wrap
+    /// modulo length so any generated index is valid — and re-encode.
+    /// A seed that somehow isn't valid base64 is returned unmodified rather
+    /// than panicking the generator itself.
+    fn mutate_b64_seed(seed: &str, mutations: &[(usize, u8)]) -> String {
+        let mut bytes = match STANDARD.decode(seed) {
+            Ok(b) if !b.is_empty() => b,
+            _ => return seed.to_string(),
+        };
+        for &(pos, byte) in mutations {
+            let i = pos % bytes.len();
+            bytes[i] = byte;
+        }
+        STANDARD.encode(bytes)
+    }
+
+    /// Strategy: pick a real-event seed and apply 0-6 random byte mutations.
+    /// Mutation count 0 exercises the unmodified real payload; higher counts
+    /// progressively corrupt it, covering everything from "still valid XDR"
+    /// to "garbage that must be rejected cleanly".
+    fn arb_mutated_seed_b64() -> impl Strategy<Value = String> {
+        let seeds = real_event_seed_b64();
+        (
+            prop::sample::select(seeds),
+            proptest::collection::vec((any::<usize>(), any::<u8>()), 0..6),
+        )
+            .prop_map(|(seed, mutations)| mutate_b64_seed(&seed, &mutations))
+    }
+
+    /// Strategy: a full `RawEvent`, mixing real-seed-derived (possibly
+    /// mutated) topic/value payloads with randomised structural fields, so
+    /// the fuzz target is `Parser::parse_event_with_projection` itself —
+    /// the actual parser entry point the streamer calls — and not just the
+    /// lower-level `decode_scval` helper.
+    fn arb_mutated_raw_event() -> impl Strategy<Value = RawEvent> {
+        let event_type = prop_oneof![
+            Just("contract".to_string()),
+            Just("system".to_string()),
+            Just("diagnostic".to_string()),
+            Just("".to_string()),
+            "\\PC*",
+        ];
+        let ledger = prop_oneof![
+            (0u64..10_000_000).prop_map(|n| n.to_string()),
+            Just("not-a-number".to_string()),
+            Just("".to_string()),
+        ];
+        let contract_id = prop::option::of("\\PC{0,80}");
+        let topics = proptest::collection::vec(arb_mutated_seed_b64(), 0..5);
+
+        (
+            event_type,
+            ledger,
+            contract_id,
+            "\\PC{0,40}",
+            "\\PC{0,40}",
+            proptest::option::of(any::<u32>()),
+            topics,
+            arb_mutated_seed_b64(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    event_type,
+                    ledger,
+                    contract_id,
+                    id,
+                    tx_hash,
+                    operation_index,
+                    topic,
+                    value,
+                    in_successful_contract_call,
+                )| RawEvent {
+                    event_type,
+                    ledger,
+                    ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
+                    contract_id,
+                    id,
+                    paging_token: None,
+                    tx_hash,
+                    operation_index,
+                    topic,
+                    value,
+                    in_successful_contract_call,
+                },
+            )
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2000))]
+        #![proptest_config(fuzz_config(2000))]
 
         #[test]
         fn decode_scval_never_panics_on_arbitrary_xdr(b64 in arb_scval_b64()) {
@@ -1424,6 +1704,33 @@ mod tests {
                     assert!(!s.is_empty(), "scval_to_string must not return empty for non-Void");
                 }
             }
+        }
+    }
+
+    // A separate `proptest!` block (rather than folding into the one above)
+    // so these two, seed-derived suites get their own independently
+    // env-configurable case count and don't dilute the purely-random suite's
+    // coverage budget.
+    proptest! {
+        #![proptest_config(fuzz_config(2000))]
+
+        /// Mutated real testnet payloads must never panic `decode_scval`,
+        /// whether the mutation left them valid XDR or not (issue #219).
+        #[test]
+        fn decode_scval_never_panics_on_mutated_real_seeds(b64 in arb_mutated_seed_b64()) {
+            let _ = decode_scval(&b64);
+        }
+
+        /// The actual parser entry point — `Parser::parse_event_with_projection`,
+        /// what the streamer calls on every RPC page — must for any input
+        /// return `Ok(Some(_))`, `Ok(None)` (skipped), or an `Err` the
+        /// streamer can dead-letter; it must never panic. Covers mutated
+        /// real-event XDR embedded in an otherwise-randomised `RawEvent`
+        /// (issue #219).
+        #[test]
+        fn parser_entry_point_never_panics_on_mutated_events(raw in arb_mutated_raw_event()) {
+            let parser = Parser::new(true); // true: also exercise diagnostic-event handling
+            let _ = parser.parse_event_with_projection(&raw);
         }
     }
 }

@@ -30,6 +30,7 @@ description is accurate. Keep this file honest by hand.
 | `TEST_DATABASE_URL` | Optional (test-only) | — | Rust integration tests | Real Postgres used by `#[ignore]`d integration tests; also gates `REQUIRE_TEST_SERVICES`. |
 | `TEST_REDIS_URL` | Optional (test-only) | — | Rust integration tests | Real Redis used by `#[ignore]`d integration tests. |
 | `REQUIRE_TEST_SERVICES` | Optional (test-only) | unset | Rust integration tests | When set, a missing `TEST_DATABASE_URL`/`TEST_REDIS_URL` is a hard test failure instead of a silent skip. |
+| `PROPTEST_CASES` | Optional (test-only) | 2000 | `crates/indexer` parser fuzz suite | Overrides the number of proptest cases run per fuzz target (issue #219). CI's "Fuzz the XDR parser" step sets this to a larger, time-boxed budget; set it much higher for a local campaign. |
 | `TESTNET_RPC_URL` | Optional (test-only) | — | Testnet correctness suite | Stellar RPC endpoint for the scheduled ingest-correctness suite (issue #419). Unset skips the suite. The public `https://soroban-testnet.stellar.org` needs no credentials. |
 | `TESTNET_CONTRACT_ID` | Optional (test-only) | unset | Testnet correctness suite | Scopes the correctness proof to one known contract. Unset verifies every event in the range, which is the stronger check. |
 | `TESTNET_LEDGER_SPAN` | Optional (test-only) | `400` | Testnet correctness suite | Ledger span to verify. Public testnet retains only a rolling window (~120k ledgers), so a very large span fails as out-of-range. |

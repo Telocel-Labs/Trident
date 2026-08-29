@@ -18,6 +18,7 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_events_total` | counter | — | events | Cumulative events indexed since process start. |
 | `trident_indexer_events_skipped_total` | counter | — | events | Events skipped: diagnostic/failed-call events, or filtered by the contract allowlist. |
 | `trident_indexer_parse_errors_total` | counter | — | events | Events that failed XDR decoding and were written to `parse_errors` instead of `soroban_events`. |
+| `trident_indexer_insert_dead_lettered_total` | counter | — | events | Well-formed events that exhausted bounded insert retries and were written to `failed_events` instead of `soroban_events` (issue #208). Alert on any nonzero value — see `TridentIndexerInsertDeadLetterNonZero`. |
 | `trident_indexer_poll_duration_seconds` | histogram | — | seconds | Wall-clock time of one `poll_once` cycle (may span multiple RPC pages). |
 | `trident_indexer_poll_errors_total` | counter | — | cycles | Poll cycles that returned an error (logged, cursor unaffected, retried next interval). |
 | `trident_indexer_rpc_retries_total` | counter | — | retries | Retries triggered by transient `getEvents` failures (exponential backoff). |

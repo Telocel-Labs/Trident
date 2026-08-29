@@ -33,6 +33,15 @@ pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
 /// including ones that later succeed on retry: this counter only moves when an
 /// event is actually abandoned, which is what an alert should fire on.
 pub const DEAD_LETTERED_TOTAL: &str = "trident_indexer_dead_lettered_total";
+
+/// Incremented when a well-formed event exhausts its bounded insert retries
+/// and is written to `failed_events` instead of `soroban_events` (issue
+/// #208). Distinct from [`DEAD_LETTERED_TOTAL`], which counts events that
+/// never decoded at all — this counts events that decoded fine but could not
+/// be persisted. Alert on this going non-zero: unlike a parse failure (bad
+/// input from the chain), an insert failure usually points at a real bug or
+/// outage in the storage layer.
+pub const INSERT_DEAD_LETTERED_TOTAL: &str = "trident_indexer_insert_dead_lettered_total";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
@@ -110,6 +119,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Events skipped (diagnostic, failed call, or contract filter)"
     );
     describe_counter!(PARSE_ERRORS_TOTAL, "Total events that failed XDR decoding");
+    describe_counter!(
+        INSERT_DEAD_LETTERED_TOTAL,
+        "Well-formed events that exhausted insert retries and were written to failed_events (issue #208)"
+    );
     describe_histogram!(
         POLL_DURATION_SECONDS,
         "Time per poll_once cycle, in seconds"
@@ -189,6 +202,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(EVENTS_TOTAL).increment(0);
     counter!(EVENTS_SKIPPED_TOTAL).increment(0);
     counter!(PARSE_ERRORS_TOTAL).increment(0);
+    counter!(INSERT_DEAD_LETTERED_TOTAL).increment(0);
     counter!(POLL_ERRORS_TOTAL).increment(0);
     counter!(RPC_RETRIES_TOTAL).increment(0);
     counter!(RPC_TIMEOUTS_TOTAL).increment(0);
@@ -312,6 +326,12 @@ pub fn record_parse_error() {
 
 pub fn record_dead_lettered() {
     counter!(DEAD_LETTERED_TOTAL).increment(1);
+}
+
+/// Count a well-formed event that exhausted its insert retries and was
+/// written to `failed_events` (issue #208).
+pub fn record_insert_dead_lettered() {
+    counter!(INSERT_DEAD_LETTERED_TOTAL).increment(1);
 }
 
 pub fn record_unhandled_scvariant() {

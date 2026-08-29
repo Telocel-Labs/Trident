@@ -88,8 +88,11 @@ pub struct PageCommit<'a> {
     /// Empty unless a tracked contract was detected as a SEP-41 token and one
     /// of its holders moved funds in this page.
     pub storage_snapshots: &'a [StorageSnapshotRow<'a>],
-    /// Network these storage snapshots belong to (empty string when
-    /// `storage_snapshots` is empty).
+    /// Network these storage snapshots belong to (empty string tolerated
+    /// when `storage_snapshots` is empty). Also stamped on any event
+    /// dead-lettered to `failed_events` (issue #208) — real callers should
+    /// always pass the actual network regardless of whether
+    /// `storage_snapshots` is populated.
     pub network: &'a str,
     /// New cursor value, when the page advanced it.
     pub cursor: Option<u64>,
@@ -195,6 +198,13 @@ impl EventColumns {
 /// cannot write a duplicate row, it is simply dropped rather than raised. The
 /// natural-key constraint remains as the enforcement point, and 0025's
 /// pre-flight duplicate check still runs against existing data.
+///
+/// `commit_page` no longer calls this directly — it goes through
+/// [`insert_events_with_dead_letter`], which wraps the same statement with
+/// bounded-retry-then-dead-letter fallback (issue #208). This is kept public
+/// and exercised directly by the integration tests below, which validate the
+/// batch-insert conflict/idempotency semantics independent of that fallback.
+#[allow(dead_code)]
 pub async fn insert_events_batch<'e, E>(
     executor: E,
     events: &[SorobanEvent],
@@ -202,11 +212,88 @@ pub async fn insert_events_batch<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
+    insert_events_batch_inner(executor, events)
+        .await
+        .map_err(|e| e.into_trident("insert_events_batch"))
+}
+
+/// A batch-insert failure, still carrying the underlying `sqlx::Error` (or
+/// the column-encoding failure that preceded it) so the dead-letter path
+/// (issue #208) can classify transient vs permanent before deciding whether
+/// to retry. `insert_events_batch` collapses this into a `TridentError` for
+/// every other caller.
+enum InsertBatchError {
+    /// Failed while building the columns to bind (e.g. an unparseable
+    /// `ledger_timestamp`). Never transient — the same input reproduces the
+    /// same failure every time.
+    Encode(TridentError),
+    Db(sqlx::Error),
+    /// Failure managing the SAVEPOINT itself (issue #208) — SAVEPOINT,
+    /// ROLLBACK TO, or RELEASE failed, which means the transaction's state
+    /// is no longer trustworthy for further per-row attempts. Callers must
+    /// propagate this immediately rather than falling back to dead-lettering,
+    /// since dead-lettering itself needs a working transaction to write into.
+    Fatal(TridentError),
+}
+
+impl InsertBatchError {
+    fn into_trident(self, context: &str) -> TridentError {
+        match self {
+            InsertBatchError::Encode(e) => e,
+            InsertBatchError::Fatal(e) => e,
+            InsertBatchError::Db(e) => {
+                TridentError::storage(anyhow::Error::new(e).context(context.to_string()))
+            }
+        }
+    }
+
+    /// Whether retrying the exact same insert has a chance of succeeding
+    /// (issue #208). Connection-level failures and the two well-known
+    /// Postgres SQLSTATE codes for a conflicting concurrent transaction are
+    /// transient; everything else — constraint violations, data exceptions,
+    /// and column-encoding failures — reproduces identically on retry.
+    fn is_transient(&self) -> bool {
+        match self {
+            InsertBatchError::Encode(_) | InsertBatchError::Fatal(_) => false,
+            InsertBatchError::Db(e) => is_transient_db_error(e),
+        }
+    }
+}
+
+/// Classify a `sqlx::Error` from an insert as transient (worth retrying) or
+/// permanent (issue #208). `sqlx::Error::Database` carries the real Postgres
+/// SQLSTATE via `.code()`: `40001` is a serialization failure and `40P01` is
+/// a detected deadlock — both mean "some other transaction won a race, retry
+/// against the now-settled state", not "this row is malformed". Every other
+/// database error (constraint violations, data/type errors) is permanent:
+/// retrying binds the identical values and gets the identical error.
+/// Non-`Database` variants (`Io`, pool exhaustion/closure, a crashed worker)
+/// are connection-level and always worth a retry.
+fn is_transient_db_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            matches!(db_err.code().as_deref(), Some("40001") | Some("40P01"))
+        }
+        sqlx::Error::Io(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        _ => false,
+    }
+}
+
+async fn insert_events_batch_inner<'e, E>(
+    executor: E,
+    events: &[SorobanEvent],
+) -> Result<(), InsertBatchError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     if events.is_empty() {
         return Ok(());
     }
 
-    let cols = EventColumns::build(events)?;
+    let cols = EventColumns::build(events).map_err(InsertBatchError::Encode)?;
 
     sqlx::query(
         r#"
@@ -231,7 +318,199 @@ where
     .bind(&cols.data)
     .execute(executor)
     .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_events_batch")))?;
+    .map_err(InsertBatchError::Db)?;
+
+    Ok(())
+}
+
+/// Bounded retry attempts for a chunk (or, in fallback, a single row) insert
+/// before it is treated as exhausted (issue #208). Three attempts with
+/// 100/200/400ms backoff ride out a brief connection blip or serialization
+/// conflict without stalling the poll loop for long.
+const INSERT_DEAD_LETTER_RETRIES: u32 = 3;
+
+async fn savepoint(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op: &str,
+) -> Result<(), TridentError> {
+    sqlx::query("SAVEPOINT trident_dead_letter")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context(op.to_string())))?;
+    Ok(())
+}
+
+async fn release_savepoint(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op: &str,
+) -> Result<(), TridentError> {
+    sqlx::query("RELEASE SAVEPOINT trident_dead_letter")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context(op.to_string())))?;
+    Ok(())
+}
+
+async fn rollback_to_savepoint(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op: &str,
+) -> Result<(), TridentError> {
+    sqlx::query("ROLLBACK TO SAVEPOINT trident_dead_letter")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context(op.to_string())))?;
+    Ok(())
+}
+
+/// Try `insert_events_batch_inner` up to [`INSERT_DEAD_LETTER_RETRIES`] times,
+/// wrapping each attempt in its own SAVEPOINT so a failed attempt does not
+/// poison the rest of the caller's transaction. Retries only continue while
+/// the failure is classified transient; a permanent failure returns after the
+/// first attempt. Returns the last error on exhaustion.
+async fn try_insert_with_retries(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    events: &[SorobanEvent],
+    op: &str,
+) -> Result<(), InsertBatchError> {
+    let mut last_err = None;
+    for attempt in 0..INSERT_DEAD_LETTER_RETRIES {
+        if attempt > 0 {
+            if let Some(err) = &last_err {
+                if !InsertBatchError::is_transient(err) {
+                    break;
+                }
+            }
+        }
+
+        savepoint(tx, op).await.map_err(InsertBatchError::Fatal)?;
+
+        match insert_events_batch_inner(&mut **tx, events).await {
+            Ok(()) => {
+                release_savepoint(tx, op)
+                    .await
+                    .map_err(InsertBatchError::Fatal)?;
+                return Ok(());
+            }
+            Err(e) => {
+                rollback_to_savepoint(tx, op)
+                    .await
+                    .map_err(InsertBatchError::Fatal)?;
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop always runs at least once"))
+}
+
+/// Insert one page's events with bounded-retry-then-dead-letter fallback
+/// (issue #208).
+///
+/// `insert_events_batch`'s `UNNEST` statement is all-or-nothing: one poison
+/// row anywhere in `events` fails the whole chunk alongside it. Before this,
+/// that failure propagated straight out of [`commit_page`] via `?`, aborting
+/// the entire poll cycle — and since nothing about the poison row changes
+/// between polls, the next poll hit the identical failure on the identical
+/// event, wedging the cursor forever.
+///
+/// This retries the whole chunk first (useful only for a transient failure —
+/// a connection blip or serialization conflict). If the chunk still fails
+/// after retries — or the failure was permanent from the start — it falls
+/// back to inserting one row at a time, each in its own bounded retry. A row
+/// that still fails is written to `failed_events` and skipped; every other
+/// row in the chunk still commits, and the caller can advance the cursor
+/// past the page.
+///
+/// Returns the ids of any events that were dead-lettered, so the caller can
+/// exclude them from dependent projections (token_events) that would
+/// otherwise reference a `soroban_events` row that was never written.
+async fn insert_events_with_dead_letter(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    network: &str,
+    events: &[SorobanEvent],
+) -> Result<HashSet<Uuid>, TridentError> {
+    if events.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    match try_insert_with_retries(tx, events, "insert_events_with_dead_letter chunk").await {
+        Ok(()) => return Ok(HashSet::new()),
+        // The SAVEPOINT machinery itself is broken — the transaction can no
+        // longer be trusted for a per-row fallback (which also needs
+        // SAVEPOINTs), so this must propagate like any other fatal failure
+        // did before this feature existed.
+        Err(InsertBatchError::Fatal(e)) => return Err(e),
+        Err(_) => {} // chunk-level insert exhausted its retries; fall through.
+    }
+
+    // The chunk did not succeed as a unit: fall back to per-row isolation so
+    // the poison row(s) cannot block their siblings.
+    let mut dead_lettered = HashSet::new();
+    for event in events {
+        let one = std::slice::from_ref(event);
+        match try_insert_with_retries(tx, one, "insert_events_with_dead_letter row").await {
+            Ok(()) => {}
+            Err(InsertBatchError::Fatal(e)) => return Err(e),
+            Err(err) => {
+                let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
+                let trident_err = err.into_trident("insert_events_with_dead_letter row");
+                insert_failed_event(&mut **tx, network, id, event, &trident_err).await?;
+                crate::metrics::record_insert_dead_lettered();
+                dead_lettered.insert(id);
+            }
+        }
+    }
+    Ok(dead_lettered)
+}
+
+/// Write an event that exhausted its insert retries to `failed_events`
+/// (issue #208), for operator inspection and manual replay. Keyed by the
+/// same deterministic event id as `soroban_events`, so a repeat failure on a
+/// later poll (the event has not yet been fixed/replayed) updates the
+/// attempt count and latest error instead of accumulating duplicate rows.
+async fn insert_failed_event<'e, E>(
+    executor: E,
+    network: &str,
+    event_id: Uuid,
+    event: &SorobanEvent,
+    error: &TridentError,
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let payload = serde_json::json!({
+        "contract_id": event.contract_id,
+        "topics": event.topics,
+        "data": event.data,
+        "ledger_sequence": event.ledger_sequence,
+        "ledger_timestamp": event.ledger_timestamp,
+        "transaction_hash": event.transaction_hash,
+        "event_index": event.event_index,
+    });
+
+    sqlx::query(
+        r#"
+        INSERT INTO failed_events
+            (event_id, contract_id, network, ledger_sequence, transaction_hash,
+             event_index, payload, error_message, attempts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+        ON CONFLICT (event_id) DO UPDATE SET
+            attempts = failed_events.attempts + 1,
+            error_message = EXCLUDED.error_message,
+            payload = EXCLUDED.payload,
+            last_seen_at = NOW()
+        "#,
+    )
+    .bind(event_id)
+    .bind(&event.contract_id)
+    .bind(network)
+    .bind(event.ledger_sequence as i64)
+    .bind(&event.transaction_hash)
+    .bind(event.event_index as i32)
+    .bind(payload)
+    .bind(error.to_string())
+    .execute(executor)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_failed_event")))?;
 
     Ok(())
 }
@@ -602,7 +881,10 @@ where
 ///
 /// Events are chunked to `batch_size` so a very large page cannot produce an
 /// unbounded statement, but every chunk shares the one transaction: either the
-/// whole page and its cursor advance land, or none of it does.
+/// whole page and its cursor advance land, or none of it does — with one
+/// deliberate exception (issue #208): an individual event that exhausts its
+/// bounded insert retries is dead-lettered into `failed_events` rather than
+/// failing the whole page, so a single poison row cannot wedge the cursor.
 pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), TridentError> {
     let batch_size = commit.batch_size.max(1);
 
@@ -611,12 +893,36 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
         .await
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page begin")))?;
 
+    // Events insert with bounded-retry-then-dead-letter fallback (issue
+    // #208): a poison row that survives retries is written to
+    // `failed_events` instead of aborting the whole page, and its id is
+    // collected so the projections below can skip it.
+    let mut dead_lettered: HashSet<Uuid> = HashSet::new();
     for chunk in commit.events.chunks(batch_size) {
-        insert_events_batch(&mut *tx, chunk).await?;
+        let chunk_dead = insert_events_with_dead_letter(&mut tx, commit.network, chunk).await?;
         // Outbox rows ride the same transaction as the events they deliver
         // (issue #200): either both land or neither does, so a committed event
         // can never exist without a delivery record for the relay to pick up.
-        insert_outbox_batch(&mut *tx, chunk).await?;
+        // A dead-lettered event has no soroban_events row, so it must not get
+        // an outbox row either — that would let the relay publish a payload
+        // the DB never actually has.
+        if chunk_dead.is_empty() {
+            insert_outbox_batch(&mut *tx, chunk).await?;
+        } else {
+            let landed: Vec<SorobanEvent> = chunk
+                .iter()
+                .filter(|e| {
+                    !chunk_dead.contains(&event_uuid(
+                        &e.contract_id,
+                        e.ledger_sequence,
+                        e.event_index,
+                    ))
+                })
+                .cloned()
+                .collect();
+            insert_outbox_batch(&mut *tx, &landed).await?;
+        }
+        dead_lettered.extend(chunk_dead);
     }
 
     // token_events.event_id logically references soroban_events(id) (the DB-level
@@ -624,8 +930,31 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     // single-column UNIQUE (id) can't be enforced globally). Referential
     // integrity is instead upheld here: projection rows must follow the event
     // insert inside the same transaction, so a token_events row can never exist
-    // without its corresponding soroban_events row already committed.
-    for chunk in commit.token_events.chunks(batch_size) {
+    // without its corresponding soroban_events row already committed. A
+    // dead-lettered event (issue #208) never got that soroban_events row, so
+    // its projection is excluded here too.
+    let token_events_owned;
+    let token_events: &[TokenProjection<'_>] = if dead_lettered.is_empty() {
+        commit.token_events
+    } else {
+        token_events_owned = commit
+            .token_events
+            .iter()
+            .filter(|p| {
+                !dead_lettered.contains(&event_uuid(
+                    &p.event.contract_id,
+                    p.event.ledger_sequence,
+                    p.event.event_index,
+                ))
+            })
+            .map(|p| TokenProjection {
+                event: p.event,
+                token: p.token,
+            })
+            .collect::<Vec<_>>();
+        &token_events_owned
+    };
+    for chunk in token_events.chunks(batch_size) {
         insert_token_events_batch(&mut *tx, chunk).await?;
     }
 
@@ -957,6 +1286,32 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    // -----------------------------------------------------------------------
+    // Insert-failure classification (issue #208)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn connection_level_failures_are_transient() {
+        assert!(is_transient_db_error(&sqlx::Error::PoolClosed));
+        assert!(is_transient_db_error(&sqlx::Error::PoolTimedOut));
+        assert!(is_transient_db_error(&sqlx::Error::WorkerCrashed));
+    }
+
+    #[test]
+    fn non_database_non_connection_errors_are_not_transient() {
+        // RowNotFound is neither a connection-level failure nor a
+        // sqlx::Error::Database — it must not be retried.
+        assert!(!is_transient_db_error(&sqlx::Error::RowNotFound));
+    }
+
+    #[test]
+    fn encode_failures_are_never_transient() {
+        // A column-encoding failure (e.g. an unparseable ledger_timestamp)
+        // reproduces identically on every retry — retrying is pointless.
+        let err = InsertBatchError::Encode(TridentError::storage(anyhow::anyhow!("bad input")));
+        assert!(!err.is_transient());
+    }
+
     /// Committing the same event twice must not error and the row count in
     /// `soroban_events` must remain 1.
     ///
@@ -1088,6 +1443,125 @@ mod tests {
         assert_eq!(recount.0, 25, "replaying a page must insert nothing new");
 
         sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// A page containing one poison event — one with a `ledger_timestamp`
+    /// that can never parse — must not abort the whole page. The poison
+    /// event is dead-lettered into `failed_events`; its well-formed siblings
+    /// still land in `soroban_events`; and the cursor still advances past
+    /// the page (issue #208). Before this feature, `commit_page` propagated
+    /// the very first `EventColumns::build` failure via `?`, failing the
+    /// entire batch — including the four good events alongside it — and the
+    /// next poll would hit the identical failure on the identical event,
+    /// wedging the cursor forever.
+    #[tokio::test]
+    async fn poison_event_is_dead_lettered_and_siblings_still_commit() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CDEADLETTER_{}", Uuid::new_v4());
+        // The cursor row in `system_state` is shared, monotonic, global state
+        // across this whole test module — other tests in the suite may have
+        // already advanced it well past any hardcoded ledger sequence. Base
+        // this test's sequence on the current cursor so the "cursor
+        // advanced" assertion below is meaningful regardless of test order.
+        let ledger_sequence = get_cursor(&pool).await.unwrap() + 1_000;
+        let mut events: Vec<SorobanEvent> = (0..5)
+            .map(|i| make_event(&contract_id, ledger_sequence, i))
+            .collect();
+        // A permanent failure: no bounded retry count makes an invalid
+        // timestamp string parse, so this must go straight to the
+        // per-row-fallback path within its chunk.
+        events[2].ledger_timestamp = "not-a-timestamp".to_string();
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let commit = PageCommit {
+            events: &events,
+            token_events: &[],
+            invocation_metrics: &[],
+            storage_snapshots: &[],
+            network: "testnet",
+            cursor: Some(ledger_sequence),
+            ledger: Some(LedgerMeta {
+                sequence: ledger_sequence,
+                hash: "hash_deadletter",
+                timestamp: "2024-01-01T00:00:00Z",
+                event_count: events.len() as i32,
+            }),
+            batch_size: 10,
+        };
+
+        commit_page(&pool, commit)
+            .await
+            .expect("commit_page must not fail because of one poison event");
+
+        let good_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            good_count.0, 4,
+            "the four well-formed events must still be inserted"
+        );
+
+        let failed_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(failed_count.0, 1, "the poison event must be dead-lettered");
+
+        let (error_message, network): (String, String) = sqlx::query_as(
+            "SELECT error_message, network FROM failed_events WHERE contract_id = $1",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            error_message.contains("timestamp"),
+            "error_message should mention the timestamp parse failure: {error_message:?}"
+        );
+        assert_eq!(network, "testnet");
+
+        assert_eq!(
+            get_cursor(&pool).await.unwrap(),
+            ledger_sequence,
+            "cursor must advance past the page despite the poison event"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
             .bind(&contract_id)
             .execute(&pool)
             .await

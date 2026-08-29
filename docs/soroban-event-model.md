@@ -46,6 +46,9 @@ Trident decodes all `ScVal` types to their natural JSON equivalents:
 | `ScvTimepoint` / `ScvDuration` | **decimal string** (u64; see below) |
 | `ScvVoid` | `null` |
 | `ScvError` | string (debug form, e.g. `Contract(ScErrorCode(1))`) |
+| `ScvContractInstance` | string (debug form) — see below |
+| `ScvLedgerKeyContractInstance` | string (`"LedgerKeyContractInstance"`) — see below |
+| `ScvLedgerKeyNonce` | string (debug form) — see below |
 
 ### Big-integer encoding
 
@@ -70,6 +73,19 @@ promise; the debug form preserves the code without inventing one.
 ```json
 "amount": "1000000000000"
 ```
+
+### Types that are decoded but never expected in an event
+
+`ScvContractInstance`, `ScvLedgerKeyContractInstance`, and `ScvLedgerKeyNonce`
+complete the `ScVal` union (22 variants total, per `ScVal::VARIANTS`), but none
+of the three can appear in a contract-emitted event in practice: the Soroban
+host does not let `env.events().publish(...)` carry a contract's own
+executable/storage instance, and the latter two exist only as ledger-key
+discriminators, never as emitted values. They are decoded and given an
+explicit, Debug-rendered projection rather than falling through to the
+generic catch-all, so that `trident_indexer_unhandled_scvariant_total`
+(issue #415) stays a signal for XDR types this decoder has genuinely never
+seen — not ones it recognises but has deliberately left unprojected.
 
 ### Spec-aware vs positional decoding
 
