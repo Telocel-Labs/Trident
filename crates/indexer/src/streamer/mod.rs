@@ -16,7 +16,11 @@
 //!   #200). Redis delivery is owned by `redis_stream::relay`, so a crash
 //!   between the commit and the publish cannot drop an event.
 
+mod circuit_breaker;
+
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
@@ -34,9 +38,59 @@ use crate::{
     rpc::{filters::build_event_filters, FilterPlan, RpcClient, RpcHttpSettings},
     token_metadata,
 };
+pub use circuit_breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, Outcome};
+
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
 const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
+
+/// Applies full jitter to a backoff duration (issue #197): without it,
+/// multiple indexer replicas (or a restart storm) computing the same
+/// `ExponentialBackoff` schedule retry in lockstep against the same RPC
+/// endpoint, turning a transient blip into a synchronised thundering herd.
+///
+/// Deliberately dependency-free rather than pulling in `rand`: seeds a small
+/// xorshift generator from process-local sources that vary call to call
+/// (the current instant relative to an epoch fixed at first use, a memory
+/// address, and the duration being jittered), which is enough entropy to
+/// decorrelate concurrent processes without adding a crate whose only other
+/// use in this binary would be here. Scales the input duration by a factor
+/// drawn uniformly from [0.5, 1.0] — "full jitter" per the AWS
+/// backoff-jitter algorithms writeup, which caps the added randomness at the
+/// base delay itself rather than compounding it past `max_delay`.
+fn jitter(duration: Duration) -> Duration {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let epoch = *EPOCH.get_or_init(Instant::now);
+
+    let mut hasher = DefaultHasher::new();
+    Instant::now().duration_since(epoch).hash(&mut hasher);
+    // A monotonic per-process counter guarantees the seed changes even if two
+    // calls land on the same clock tick (coarse timer resolution on some
+    // platforms) or the same stack address (tail-call/inlining).
+    CALL_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .hash(&mut hasher);
+    // A stack address is effectively unpredictable ASLR noise and differs
+    // across concurrent tasks/processes even when called at the same instant.
+    let stack_marker = &hasher as *const _ as usize;
+    stack_marker.hash(&mut hasher);
+    duration.hash(&mut hasher);
+    let seed = hasher.finish();
+
+    // xorshift64* — fast, deterministic given a seed, good enough dispersion
+    // for jitter (this is not security-sensitive).
+    let mut x = seed | 1; // must be non-zero
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    let unit = (x >> 11) as f64 / (1u64 << 53) as f64; // in [0, 1)
+
+    let factor = 0.5 + unit * 0.5; // in [0.5, 1.0)
+    duration.mul_f64(factor)
+}
 
 pub struct Streamer {
     config: Config,
@@ -72,6 +126,9 @@ pub struct Streamer {
     /// #269) — what bounds storage-snapshot fetching (issue #270) to
     /// contracts we actually know how to read a balance from.
     token_contracts: HashSet<String>,
+    /// Trips after sustained RPC failures so the run loop stops attempting
+    /// polls during an outage instead of retrying every interval (issue #197).
+    rpc_breaker: CircuitBreaker,
 }
 
 /// One contract-storage snapshot change observed during a poll cycle,
@@ -127,6 +184,10 @@ impl Streamer {
             high_watermark: config.lag_high_watermark,
             hysteresis_ledgers: config.poll_hysteresis_ledgers,
         });
+        let rpc_breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: config.rpc_breaker_failure_threshold,
+            cooldown: config.rpc_breaker_cooldown,
+        });
 
         Ok(Self {
             config,
@@ -142,6 +203,7 @@ impl Streamer {
             spec_cache: crate::spec::SpecCache::new(),
             known_code_hashes: std::collections::HashMap::new(),
             token_contracts: HashSet::new(),
+            rpc_breaker,
         })
     }
 
@@ -296,56 +358,81 @@ impl Streamer {
                 self.sync_contract_specs().await;
             }
 
-            let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
-            match self.poll_once(&mut cursor).instrument(poll_span).await {
-                Ok(events_processed) => {
-                    if events_processed > 0 {
-                        tracing::info!(events_processed, cursor, "Batch processed");
-                    } else {
-                        tracing::debug!(cursor, "No new events");
-                    }
-                }
-                Err(e) => {
-                    metrics::record_poll_error();
-                    // Branch on the structured classification: transient failures
-                    // are retried on the next interval (the cursor is safe), poison
-                    // input is skipped, and fatal errors halt the streamer.
-                    match e.severity() {
-                        Severity::Fatal => {
-                            tracing::error!(error = %e, "Fatal error, halting streamer");
-                            return Err(e);
+            // Circuit breaker (issue #197): while Open, skip the poll body
+            // entirely and let the loop fall through to the sleep below,
+            // rather than spending an RPC round-trip (and its 5-attempt
+            // retry budget) on an endpoint that has already told us it is
+            // down. should_allow() flips Open -> HalfOpen once the cooldown
+            // has elapsed, letting exactly one probe cycle through.
+            metrics::set_rpc_breaker_state(self.rpc_breaker.state());
+            metrics::set_rpc_breaker_consecutive_failures(self.rpc_breaker.consecutive_failures());
+            if !self.rpc_breaker.should_allow() {
+                tracing::warn!(
+                    consecutive_failures = self.rpc_breaker.consecutive_failures(),
+                    "RPC circuit breaker open; skipping poll cycle"
+                );
+            } else {
+                let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
+                match self.poll_once(&mut cursor).instrument(poll_span).await {
+                    Ok(events_processed) => {
+                        self.rpc_breaker.record(Outcome::Success);
+                        if events_processed > 0 {
+                            tracing::info!(events_processed, cursor, "Batch processed");
+                        } else {
+                            tracing::debug!(cursor, "No new events");
                         }
-                        Severity::Retryable => {
-                            // A fresh index anchors at ledger 1, but the RPC
-                            // prunes old ledgers, so on a network whose retained
-                            // window has moved past 1 every poll is rejected
-                            // identically and the cursor never advances —
-                            // retrying alone can never clear it (issue #388).
-                            // Adopt the floor the error reports so the next poll
-                            // starts inside the retained window.
-                            match parse_retained_floor(&e.to_string()) {
-                                Some(floor) if cursor < floor.saturating_sub(1) => {
-                                    // page_request_params sends `cursor + 1`, so
-                                    // store floor - 1 to make the next request
-                                    // anchor exactly at the oldest retained ledger.
-                                    cursor = floor.saturating_sub(1);
-                                    tracing::warn!(
-                                        error = %e,
-                                        retained_floor = floor,
-                                        cursor,
-                                        "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
-                                    );
-                                }
-                                _ => {
-                                    tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                    }
+                    Err(e) => {
+                        metrics::record_poll_error();
+                        self.rpc_breaker.record(if e.is_rpc() {
+                            Outcome::RpcFailure
+                        } else {
+                            Outcome::Success
+                        });
+                        // Branch on the structured classification: transient failures
+                        // are retried on the next interval (the cursor is safe), poison
+                        // input is skipped, and fatal errors halt the streamer.
+                        match e.severity() {
+                            Severity::Fatal => {
+                                tracing::error!(error = %e, "Fatal error, halting streamer");
+                                return Err(e);
+                            }
+                            Severity::Retryable => {
+                                // A fresh index anchors at ledger 1, but the RPC
+                                // prunes old ledgers, so on a network whose retained
+                                // window has moved past 1 every poll is rejected
+                                // identically and the cursor never advances —
+                                // retrying alone can never clear it (issue #388).
+                                // Adopt the floor the error reports so the next poll
+                                // starts inside the retained window.
+                                match parse_retained_floor(&e.to_string()) {
+                                    Some(floor) if cursor < floor.saturating_sub(1) => {
+                                        // page_request_params sends `cursor + 1`, so
+                                        // store floor - 1 to make the next request
+                                        // anchor exactly at the oldest retained ledger.
+                                        cursor = floor.saturating_sub(1);
+                                        tracing::warn!(
+                                            error = %e,
+                                            retained_floor = floor,
+                                            cursor,
+                                            "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                                    }
                                 }
                             }
-                        }
-                        Severity::Skip => {
-                            tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
+                            Severity::Skip => {
+                                tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
+                            }
                         }
                     }
                 }
+                metrics::set_rpc_breaker_state(self.rpc_breaker.state());
+                metrics::set_rpc_breaker_consecutive_failures(
+                    self.rpc_breaker.consecutive_failures(),
+                );
             }
 
             // Derive the next poll interval from the current chain-tip lag:
@@ -536,8 +623,12 @@ impl Streamer {
                 )));
             }
         };
+        // Full jitter (issue #197): without it, every indexer replica computes
+        // the identical backoff schedule and retries in lockstep against the
+        // same RPC endpoint on a shared outage.
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
+            .map(jitter)
             .take(5);
 
         // The first page of a poll anchors by ledger (startLedger); every later
@@ -1402,6 +1493,37 @@ mod tests {
         assert_eq!(page_request_params(floor - 1, None), (Some(7), None));
     }
 
+    // Pure unit tests for jitter (issue #197) — no services required.
+    #[test]
+    fn jitter_stays_within_full_jitter_bounds() {
+        let base = Duration::from_millis(1000);
+        for _ in 0..1000 {
+            let jittered = jitter(base);
+            assert!(
+                jittered >= base.mul_f64(0.5) && jittered <= base,
+                "jittered duration {jittered:?} must stay within [50%, 100%] of {base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_of_zero_is_zero() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_varies_across_calls() {
+        // Not a statistical test — just confirms this isn't a no-op that
+        // always returns the same fraction of the input.
+        let base = Duration::from_millis(1000);
+        let samples: std::collections::HashSet<Duration> =
+            (0..50).map(|_| jitter(base)).collect();
+        assert!(
+            samples.len() > 1,
+            "expected multiple distinct jittered values, got {samples:?}"
+        );
+    }
+
     fn sym_xdr(s: &str) -> String {
         let val = ScVal::Symbol(ScSymbol::try_from(s.to_string()).unwrap());
         let mut buf = vec![];
@@ -1480,6 +1602,8 @@ mod tests {
             stellar_rpc_urls: vec![rpc_url],
             rpc_failover_threshold: 3,
             rpc_endpoint_cooldown: Duration::from_secs(30),
+            rpc_breaker_failure_threshold: 5,
+            rpc_breaker_cooldown: Duration::from_secs(30),
             rpc_connect_timeout: Duration::from_secs(5),
             rpc_request_timeout: Duration::from_secs(30),
             rpc_pool_idle_timeout: Duration::from_secs(90),
@@ -1551,6 +1675,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 3, "expected 3 events in soroban_events");
+    }
+
+    /// A sustained RPC outage (repeated 5xx) must trip the circuit breaker
+    /// after `rpc_breaker_failure_threshold` consecutive failures, and once
+    /// Open, the run loop must stop calling the RPC at all rather than
+    /// retrying every poll interval (issue #197). This drives the same
+    /// should_allow/poll_once/record sequence `run()` uses, since `run()`
+    /// itself loops forever and is not directly testable.
+    #[tokio::test]
+    async fn sustained_rpc_outage_trips_breaker_and_stops_polling() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        // Deterministic threshold/cooldown for this test, independent of the
+        // Config default baked into make_streamer.
+        s.rpc_breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 3,
+            cooldown: Duration::from_secs(3600), // long enough not to elapse mid-test
+        });
+
+        let mut cursor = db::get_cursor(&s.db).await.unwrap();
+
+        for _ in 0..3 {
+            assert!(s.rpc_breaker.should_allow());
+            let result = s.poll_once(&mut cursor).await;
+            let err = result.expect_err("mocked 500 response must surface as an error");
+            assert!(err.is_rpc(), "a getEvents 5xx must classify as RpcError");
+            s.rpc_breaker.record(Outcome::RpcFailure);
+        }
+
+        assert_eq!(s.rpc_breaker.state(), BreakerState::Open);
+        assert_eq!(s.rpc_breaker.consecutive_failures(), 3);
+
+        let hits_at_open = server
+            .received_requests()
+            .await
+            .expect("request recording must be enabled by default")
+            .len();
+        assert!(
+            hits_at_open > 0,
+            "sanity check: the mock must have actually been hit while closed"
+        );
+        assert!(!s.rpc_breaker.should_allow(), "must stay open before cooldown elapses");
+
+        // Simulate several more loop iterations the way run() would: since
+        // should_allow() is false, poll_once must never be called, so the
+        // mock's hit count must not grow.
+        for _ in 0..3 {
+            if s.rpc_breaker.should_allow() {
+                let _ = s.poll_once(&mut cursor).await;
+            }
+        }
+        let hits_after = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            hits_after, hits_at_open,
+            "an open breaker must not issue any further RPC calls"
+        );
     }
 
     /// A single event with an unparseable `ledgerClosedAt` poisons the whole

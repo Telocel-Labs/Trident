@@ -18,6 +18,12 @@ pub struct Config {
     /// How long a failed endpoint is parked before it is probed again (issue #213).
     #[allow(dead_code)]
     pub rpc_endpoint_cooldown: Duration,
+    /// Consecutive RPC-layer poll failures before the circuit breaker opens
+    /// and the run loop stops attempting polls (issue #197).
+    pub rpc_breaker_failure_threshold: u32,
+    /// How long the breaker stays Open before allowing a single probe poll
+    /// through (issue #197).
+    pub rpc_breaker_cooldown: Duration,
     pub network: String,
     pub poll_interval: Duration,
     /// Shortest adaptive poll interval, applied when lag >= `lag_high_watermark`.
@@ -172,6 +178,15 @@ impl Config {
         let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100);
         let rpc_endpoint_cooldown_ms =
             parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
+        // Circuit breaker for sustained RPC outages (issue #197). Distinct
+        // from RPC_FAILOVER_THRESHOLD above: failover picks a different
+        // endpoint from the configured pool, while the breaker stops polling
+        // altogether once the (possibly single) endpoint has failed enough
+        // consecutive times in a row.
+        let rpc_breaker_failure_threshold =
+            parse_bounded_u64("RPC_BREAKER_FAILURE_THRESHOLD", 5, 1, 1_000);
+        let rpc_breaker_cooldown_ms =
+            parse_bounded_u64("RPC_BREAKER_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
         let outbox_poll_interval_ms = parse_bounded_u64("OUTBOX_POLL_INTERVAL_MS", 100, 10, 60_000);
         let outbox_batch_size = parse_bounded_u64("OUTBOX_BATCH_SIZE", 500, 1, 10_000);
         let outbox_backlog_alert_threshold =
@@ -228,6 +243,11 @@ impl Config {
                 "RPC_ENDPOINT_COOLDOWN_MS",
                 rpc_endpoint_cooldown_ms.as_ref(),
             ),
+            (
+                "RPC_BREAKER_FAILURE_THRESHOLD",
+                rpc_breaker_failure_threshold.as_ref(),
+            ),
+            ("RPC_BREAKER_COOLDOWN_MS", rpc_breaker_cooldown_ms.as_ref()),
             ("OUTBOX_POLL_INTERVAL_MS", outbox_poll_interval_ms.as_ref()),
             ("OUTBOX_BATCH_SIZE", outbox_batch_size.as_ref()),
             (
@@ -320,6 +340,8 @@ impl Config {
         let rpc_tcp_keepalive_ms = rpc_tcp_keepalive_ms.unwrap();
         let rpc_failover_threshold = rpc_failover_threshold.unwrap() as u32;
         let rpc_endpoint_cooldown_ms = rpc_endpoint_cooldown_ms.unwrap();
+        let rpc_breaker_failure_threshold = rpc_breaker_failure_threshold.unwrap() as u32;
+        let rpc_breaker_cooldown_ms = rpc_breaker_cooldown_ms.unwrap();
         let outbox_poll_interval_ms = outbox_poll_interval_ms.unwrap();
         let outbox_batch_size = outbox_batch_size.unwrap() as i64;
         let outbox_backlog_alert_threshold = outbox_backlog_alert_threshold.unwrap() as i64;
@@ -338,6 +360,8 @@ impl Config {
             stellar_rpc_urls,
             rpc_failover_threshold,
             rpc_endpoint_cooldown: Duration::from_millis(rpc_endpoint_cooldown_ms),
+            rpc_breaker_failure_threshold,
+            rpc_breaker_cooldown: Duration::from_millis(rpc_breaker_cooldown_ms),
             network,
             poll_interval: Duration::from_millis(poll_interval_ms),
             poll_interval_floor: Duration::from_millis(poll_interval_floor_ms),
@@ -403,6 +427,8 @@ impl Config {
             tracked_sac_assets_count = self.tracked_sac_assets.len(),
             statement_timeout_ms = self.statement_timeout_ms,
             idle_in_transaction_timeout_ms = self.idle_in_transaction_timeout_ms,
+            rpc_breaker_failure_threshold = self.rpc_breaker_failure_threshold,
+            rpc_breaker_cooldown_ms = self.rpc_breaker_cooldown.as_millis() as u64,
             "Effective configuration"
         );
     }
@@ -898,6 +924,40 @@ mod tests {
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.rpc_failover_threshold, 3);
             assert_eq!(cfg.rpc_endpoint_cooldown.as_millis(), 30_000);
+        });
+    }
+
+    #[test]
+    fn breaker_knobs_have_defaults() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("RPC_BREAKER_FAILURE_THRESHOLD");
+            env::remove_var("RPC_BREAKER_COOLDOWN_MS");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_breaker_failure_threshold, 5);
+            assert_eq!(cfg.rpc_breaker_cooldown.as_millis(), 30_000);
+        });
+    }
+
+    #[test]
+    fn breaker_knobs_read_custom_values() {
+        let mut vars = required_vars();
+        vars.push(("RPC_BREAKER_FAILURE_THRESHOLD", "10"));
+        vars.push(("RPC_BREAKER_COOLDOWN_MS", "60000"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_breaker_failure_threshold, 10);
+            assert_eq!(cfg.rpc_breaker_cooldown.as_millis(), 60_000);
+        });
+    }
+
+    #[test]
+    fn breaker_failure_threshold_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("RPC_BREAKER_FAILURE_THRESHOLD", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("RPC_BREAKER_FAILURE_THRESHOLD"));
         });
     }
 
