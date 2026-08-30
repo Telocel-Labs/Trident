@@ -265,7 +265,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ProgressStyle::with_template("{msg} {bar:40.cyan/blue} {pos}/{len} ({percent}%) {eta}")?
             .progress_chars("=> "),
     );
-    pb.set_message(format!("Backfilling ledgers {}–{}:", from_ledger, to_ledger));
+    pb.set_message(format!(
+        "Backfilling ledgers {}–{}:",
+        from_ledger, to_ledger
+    ));
 
     let (tx, rx) = mpsc::channel::<(u64, u64)>(args.workers * 2);
 

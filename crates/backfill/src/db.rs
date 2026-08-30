@@ -25,10 +25,9 @@ pub struct BackfillJob {
 /// workers run concurrently against the same table without two workers
 /// claiming the same job or blocking on each other's row lock.
 pub async fn claim_next_job(pool: &PgPool) -> Result<Option<BackfillJob>, TridentError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("claim_next_job begin")))?;
+    let mut tx = pool.begin().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("claim_next_job begin"))
+    })?;
 
     let row: Option<(Uuid, i64, i64, String)> = sqlx::query_as(
         r#"
@@ -57,9 +56,9 @@ pub async fn claim_next_job(pool: &PgPool) -> Result<Option<BackfillJob>, Triden
             TridentError::storage(anyhow::Error::new(e).context("claim_next_job update"))
         })?;
 
-    tx.commit()
-        .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("claim_next_job commit")))?;
+    tx.commit().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("claim_next_job commit"))
+    })?;
 
     Ok(Some(BackfillJob {
         id,
@@ -82,7 +81,7 @@ pub async fn complete_job(pool: &PgPool, id: Uuid) -> Result<(), TridentError> {
 /// Mark a claimed job `failed` with a reason (issue #216). Left for an
 /// operator to inspect and re-enqueue rather than auto-retried: a partially
 /// applied range is not necessarily safe to blindly re-run (see the
-/// `idx_backfill_jobs_stale` comment in migration 0029).
+/// `idx_backfill_jobs_stale` comment in migration 0031).
 pub async fn fail_job(pool: &PgPool, id: Uuid, error: &str) -> Result<(), TridentError> {
     sqlx::query(
         "UPDATE backfill_jobs SET status = 'failed', completed_at = NOW(), error = $2 WHERE id = $1",
@@ -199,12 +198,11 @@ mod tests {
         assert_eq!(job.to_ledger, 1_010);
         assert_eq!(job.network, network);
 
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM backfill_jobs WHERE id = $1")
-                .bind(job.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM backfill_jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(status, "running");
 
         // The same job must not be claimable again while running.

@@ -139,7 +139,22 @@ impl Config {
         };
 
         // ── Network ─────────────────────────────────────────────────────────
-        let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into());
+        // NETWORK is written into every row this process indexes (soroban_events,
+        // ledger_metadata, token_events, ...), so a typo here silently creates an
+        // invisible data partition rather than failing loudly. Validated against
+        // the same allowed set the database CHECK constraints enforce (migration
+        // 0029) and the API layer validates (services/api/validation/events.go,
+        // validNetworks) — issue #252. 'pubnet' is accepted as an alias for
+        // 'mainnet', matching default_network_passphrase below.
+        let network =
+            match normalize_network(&std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into()))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    errors.push(e);
+                    String::new() // placeholder; won't be used if errors is non-empty
+                }
+            };
 
         // Network passphrase for SAC contract id derivation (issue #262).
         let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {
@@ -481,6 +496,21 @@ fn redact_url(url: &str) -> String {
     match authority.rfind('@') {
         Some(at) => format!("{scheme}***@{}{tail}", &authority[at + 1..]),
         None => url.to_string(),
+    }
+}
+
+/// Validates `NETWORK` against the allowed set and normalises the `pubnet`
+/// alias to `mainnet` (issue #252). Rejecting unknown values here — rather
+/// than only when a DB write later trips the CHECK constraint — surfaces a
+/// typo like `tesnet` at startup instead of after it has already been used
+/// to derive a passphrase, filter contracts, and tag every indexed row.
+fn normalize_network(network: &str) -> Result<String, String> {
+    match network {
+        "mainnet" | "pubnet" => Ok("mainnet".to_string()),
+        "testnet" => Ok("testnet".to_string()),
+        other => Err(format!(
+            "[trident-indexer] NETWORK={other:?} is not a recognised network; expected one of: mainnet, testnet, pubnet"
+        )),
     }
 }
 
@@ -1321,5 +1351,64 @@ mod tests {
             redact_url("postgres://user:secret@localhost:5432/db?opt=x@y"),
             "postgres://***@localhost:5432/db?opt=x@y"
         );
+    }
+
+    #[test]
+    fn normalize_network_accepts_known_values() {
+        assert_eq!(normalize_network("mainnet").unwrap(), "mainnet");
+        assert_eq!(normalize_network("testnet").unwrap(), "testnet");
+    }
+
+    #[test]
+    fn normalize_network_rejects_futurenet() {
+        // Not yet a supported backend value: no write path (this API or the
+        // indexer) accepts it today, only the SDK's client-side Network enum.
+        let err = normalize_network("futurenet").unwrap_err();
+        assert!(err.contains("futurenet"));
+    }
+
+    #[test]
+    fn normalize_network_maps_pubnet_alias_to_mainnet() {
+        assert_eq!(normalize_network("pubnet").unwrap(), "mainnet");
+    }
+
+    #[test]
+    fn normalize_network_rejects_unknown_value() {
+        let err = normalize_network("tesnet").unwrap_err();
+        assert!(
+            err.contains("tesnet"),
+            "error should name the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_unknown_network() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "tesnet"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("NETWORK"));
+            assert!(err.to_string().contains("tesnet"));
+        });
+    }
+
+    #[test]
+    fn from_env_normalizes_pubnet_to_mainnet() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "pubnet"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.network, "mainnet");
+        });
+    }
+
+    #[test]
+    fn from_env_defaults_network_to_testnet() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("NETWORK");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.network, "testnet");
+        });
     }
 }
