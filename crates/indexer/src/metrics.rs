@@ -40,6 +40,12 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+/// Circuit breaker state (issue #197): 0 = Closed, 1 = Open, 2 = HalfOpen.
+/// See `streamer::circuit_breaker` for the state machine.
+pub const RPC_BREAKER_STATE: &str = "trident_indexer_rpc_breaker_state";
+/// Consecutive RPC-layer poll failures since the last success (issue #197).
+/// Resets to 0 on any successful poll; feeds the breaker's own threshold.
+pub const RPC_CONSECUTIVE_FAILURES: &str = "trident_indexer_rpc_consecutive_failures";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
@@ -146,6 +152,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Times the indexer failed over to another RPC endpoint (issue #213)"
     );
     describe_gauge!(
+        RPC_BREAKER_STATE,
+        "RPC circuit breaker state: 0=Closed, 1=Open, 2=HalfOpen (issue #197)"
+    );
+    describe_gauge!(
+        RPC_CONSECUTIVE_FAILURES,
+        "Consecutive RPC-layer poll failures since the last success (issue #197)"
+    );
+    describe_gauge!(
         OUTBOX_BACKLOG,
         "Committed events not yet published to the Redis stream (issue #200)"
     );
@@ -206,6 +220,8 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
+    gauge!(RPC_BREAKER_STATE).set(0.0);
+    gauge!(RPC_CONSECUTIVE_FAILURES).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
     gauge!(LEDGER_LAG_SECONDS_ESTIMATED).set(0.0);
@@ -350,6 +366,16 @@ pub fn record_rpc_timeout() {
 /// (0 = primary), so a silent, sustained failover is visible (issue #213).
 pub fn set_rpc_active_endpoint(index: usize) {
     gauge!(RPC_ACTIVE_ENDPOINT).set(index as f64);
+}
+
+/// Publish the RPC circuit breaker's current state (issue #197).
+pub fn set_rpc_breaker_state(state: crate::streamer::BreakerState) {
+    gauge!(RPC_BREAKER_STATE).set(state.as_metric_value());
+}
+
+/// Publish the breaker's consecutive-RPC-failure count (issue #197).
+pub fn set_rpc_breaker_consecutive_failures(count: u32) {
+    gauge!(RPC_CONSECUTIVE_FAILURES).set(count as f64);
 }
 
 /// Count a switch to a different RPC endpoint (issue #213).

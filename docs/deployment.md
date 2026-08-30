@@ -70,6 +70,8 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `RPC_TCP_KEEPALIVE_MS` | TCP keep-alive probe interval (default: `60000`) |
 | `RPC_FAILOVER_THRESHOLD` | Consecutive failures before the active endpoint is parked (default: `3`) |
 | `RPC_ENDPOINT_COOLDOWN_MS` | How long a parked endpoint waits before it is tried again (default: `30000`) |
+| `RPC_BREAKER_FAILURE_THRESHOLD` | Consecutive RPC-layer poll failures before the circuit breaker opens (default: `5`) |
+| `RPC_BREAKER_COOLDOWN_MS` | How long the breaker stays open before allowing a probe poll (default: `30000`) |
 
 Without an explicit request timeout a stalled RPC connection blocks a poll
 indefinitely: the retry wrapper only reacts to returned errors, never to a call
