@@ -903,6 +903,154 @@ pub async fn rewind_for_reorg(pool: &PgPool, from_sequence: u64) -> Result<(), T
     Ok(())
 }
 
+/// A contiguous run of missing ledger sequences in `ledger_metadata`
+/// (issue #216): every ledger in `[from_ledger, to_ledger]` (inclusive) is
+/// absent, while the sequences immediately outside that range are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerGap {
+    pub from_ledger: u64,
+    pub to_ledger: u64,
+}
+
+/// Scan `ledger_metadata` for holes in the processed range (issue #216).
+///
+/// A transient skip — an aborted poll before the transactional commit_page
+/// fix, or a bounded reorg rewind edge (#196) racing a crash — can leave a
+/// sequence permanently missing with no code path that would ever notice.
+/// This finds every contiguous run of missing sequences strictly between the
+/// lowest and highest processed ledger (a hole before the first or after the
+/// last processed ledger is not a gap — it is unprocessed history, which is
+/// what the normal poll loop / an initial backfill handles, not this scan).
+///
+/// `max_gaps` bounds how many gap rows a single call returns, so a
+/// pathologically gappy table cannot make one scan unboundedly expensive —
+/// the caller (a periodic, rate-limited task) picks up whatever it missed on
+/// the next run.
+pub async fn scan_ledger_gaps(
+    pool: &PgPool,
+    max_gaps: i64,
+) -> Result<Vec<LedgerGap>, TridentError> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        r#"
+        WITH ordered AS (
+            SELECT
+                ledger_sequence,
+                LAG(ledger_sequence) OVER (ORDER BY ledger_sequence) AS prev_sequence
+            FROM ledger_metadata
+        )
+        SELECT prev_sequence + 1 AS gap_start, ledger_sequence - 1 AS gap_end
+        FROM ordered
+        WHERE prev_sequence IS NOT NULL
+          AND ledger_sequence - prev_sequence > 1
+        ORDER BY gap_start
+        LIMIT $1
+        "#,
+    )
+    .bind(max_gaps)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("scan_ledger_gaps")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(from_ledger, to_ledger)| LedgerGap {
+            from_ledger: from_ledger as u64,
+            to_ledger: to_ledger as u64,
+        })
+        .collect())
+}
+
+/// Enqueue a `backfill_jobs` row for one gap, so `crates/backfill
+/// --from-queue` picks it up and re-fetches the missing range (issue #216).
+///
+/// Idempotent: `uq_backfill_jobs_pending_range` (migration 0029) makes this a
+/// no-op when an identical pending/running job already exists, so a scan
+/// that re-finds the same still-unrepaired gap on its next run does not pile
+/// up duplicate jobs.
+pub async fn enqueue_backfill_job(
+    pool: &PgPool,
+    gap: LedgerGap,
+    network: &str,
+) -> Result<(), TridentError> {
+    sqlx::query(
+        r#"
+        INSERT INTO backfill_jobs (from_ledger, to_ledger, network)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(gap.from_ledger as i64)
+    .bind(gap.to_ledger as i64)
+    .bind(network)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("enqueue_backfill_job")))?;
+
+    Ok(())
+}
+
+/// Mark `pending`/`running` `backfill_jobs` rows as `done` when their exact
+/// range no longer appears among `current_gaps` (issue #216) — i.e. a scan
+/// confirms the range has since been filled, whether by the backfill worker
+/// or by the live poll loop catching back up over it. Returns the number of
+/// rows closed, for `metrics::record_ledger_gaps_closed`.
+///
+/// Compares on the exact `(from_ledger, to_ledger)` pair rather than range
+/// overlap: `scan_ledger_gaps` always reports the maximal contiguous run of
+/// missing sequences, so a job whose range is only partially filled would
+/// show up in `current_gaps` as a *different*, smaller range — not an exact
+/// match — and is correctly left open rather than closed prematurely.
+pub async fn close_filled_backfill_jobs(
+    pool: &PgPool,
+    network: &str,
+    current_gaps: &[LedgerGap],
+) -> Result<u64, TridentError> {
+    if current_gaps.is_empty() {
+        // Every open job's range is, by definition, no longer a gap.
+        let result = sqlx::query(
+            r#"
+            UPDATE backfill_jobs
+            SET status = 'done', completed_at = NOW()
+            WHERE network = $1 AND status IN ('pending', 'running')
+            "#,
+        )
+        .bind(network)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("close_filled_backfill_jobs"))
+        })?;
+        return Ok(result.rows_affected());
+    }
+
+    let from_ledgers: Vec<i64> = current_gaps.iter().map(|g| g.from_ledger as i64).collect();
+    let to_ledgers: Vec<i64> = current_gaps.iter().map(|g| g.to_ledger as i64).collect();
+
+    let result = sqlx::query(
+        r#"
+        UPDATE backfill_jobs
+        SET status = 'done', completed_at = NOW()
+        WHERE network = $1
+          AND status IN ('pending', 'running')
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest($2::bigint[], $3::bigint[]) AS gap(from_ledger, to_ledger)
+              WHERE gap.from_ledger = backfill_jobs.from_ledger
+                AND gap.to_ledger = backfill_jobs.to_ledger
+          )
+        "#,
+    )
+    .bind(network)
+    .bind(&from_ledgers)
+    .bind(&to_ledgers)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("close_filled_backfill_jobs"))
+    })?;
+
+    Ok(result.rows_affected())
+}
+
 /// Read the latest processed ledger cursor from system_state.
 pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
     let row: (String,) =
@@ -1767,6 +1915,183 @@ mod tests {
             .unwrap();
         sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence = $1")
             .bind(base as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// scan_ledger_gaps must find every contiguous hole strictly between the
+    /// lowest and highest processed ledger, and must not report anything
+    /// before the first or after the last processed sequence (issue #216).
+    #[tokio::test]
+    async fn scan_ledger_gaps_finds_holes_but_not_the_edges() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Distinct range for this test: 7_500_000..7_500_020 with two holes,
+        // one 1-ledger and one 3-ledger.
+        let base = 7_500_000u64;
+        // Present: base, base+1 | gap: base+2 | present: base+3..=base+5 |
+        // gap: base+6..=base+8 | present: base+9.
+        let present: &[u64] = &[base, base + 1, base + 3, base + 4, base + 5, base + 9];
+        for &seq in present {
+            sqlx::query(
+                "INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp) \
+                 VALUES ($1, $2, NOW()) ON CONFLICT (ledger_sequence) DO NOTHING",
+            )
+            .bind(seq as i64)
+            .bind(format!("hash-{seq}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let gaps = scan_ledger_gaps(&pool, 100).await.unwrap();
+        let found: Vec<LedgerGap> = gaps
+            .into_iter()
+            .filter(|g| g.from_ledger >= base && g.to_ledger <= base + 9)
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![
+                LedgerGap {
+                    from_ledger: base + 2,
+                    to_ledger: base + 2
+                },
+                LedgerGap {
+                    from_ledger: base + 6,
+                    to_ledger: base + 8
+                },
+            ],
+            "must find exactly the two holes, ordered by start, and nothing at the edges"
+        );
+
+        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
+            .bind(base as i64)
+            .bind((base + 9) as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// enqueue_backfill_job must be idempotent for the same pending range
+    /// (issue #216): a repeat scan finding the same unrepaired gap must not
+    /// create a duplicate job.
+    #[tokio::test]
+    async fn enqueue_backfill_job_is_idempotent_for_pending_jobs() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let network = format!("gaptest-{}", Uuid::new_v4());
+        let gap = LedgerGap {
+            from_ledger: 8_100_000,
+            to_ledger: 8_100_010,
+        };
+
+        enqueue_backfill_job(&pool, gap, &network).await.unwrap();
+        enqueue_backfill_job(&pool, gap, &network).await.unwrap();
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count.0, 1,
+            "the same pending range must not be enqueued twice"
+        );
+
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// close_filled_backfill_jobs must mark a job done once its exact range
+    /// is no longer among the current gaps, and must leave a job whose range
+    /// is still (even partially) a gap alone (issue #216).
+    #[tokio::test]
+    async fn close_filled_backfill_jobs_closes_exact_matches_only() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let network = format!("gaptest-{}", Uuid::new_v4());
+        let filled_gap = LedgerGap {
+            from_ledger: 8_200_000,
+            to_ledger: 8_200_010,
+        };
+        let still_open_gap = LedgerGap {
+            from_ledger: 8_300_000,
+            to_ledger: 8_300_010,
+        };
+        enqueue_backfill_job(&pool, filled_gap, &network)
+            .await
+            .unwrap();
+        enqueue_backfill_job(&pool, still_open_gap, &network)
+            .await
+            .unwrap();
+
+        // Only still_open_gap is reported as a current gap: filled_gap has
+        // since been backfilled.
+        let closed = close_filled_backfill_jobs(&pool, &network, &[still_open_gap])
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+
+        let filled_status: String = sqlx::query_scalar(
+            "SELECT status FROM backfill_jobs WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&network)
+        .bind(filled_gap.from_ledger as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(filled_status, "done");
+
+        let open_status: String = sqlx::query_scalar(
+            "SELECT status FROM backfill_jobs WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&network)
+        .bind(still_open_gap.from_ledger as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            open_status, "pending",
+            "a job still reported as a gap must not be closed"
+        );
+
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
             .execute(&pool)
             .await
             .unwrap();

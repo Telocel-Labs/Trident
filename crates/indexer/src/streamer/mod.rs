@@ -91,6 +91,13 @@ fn jitter(duration: Duration) -> Duration {
     let factor = 0.5 + unit * 0.5; // in [0.5, 1.0)
     duration.mul_f64(factor)
 }
+/// How often (in poll loop iterations) the gap scan runs (issue #216). Much
+/// less frequent than the filter refresh above: a gap scan reads the whole
+/// `ledger_metadata` table's sequence column via a window function, and a
+/// gap that has existed for one poll interval will still be there in ten
+/// minutes, so there is no correctness reason to run it more often than
+/// this. At the default 5s poll interval this is ~10 minutes.
+const GAP_SCAN_EVERY_N_POLLS: u32 = 120;
 
 pub struct Streamer {
     config: Config,
@@ -315,6 +322,66 @@ impl Streamer {
         }
     }
 
+    /// Scan `ledger_metadata` for gaps in the processed range and enqueue a
+    /// `backfill_jobs` row for each, so `crates/backfill --from-queue` can
+    /// re-fetch the missing ledgers (issue #216).
+    ///
+    /// Also reconciles the other direction: any previously-enqueued job whose
+    /// range no longer shows up as a gap has been filled (by the backfill
+    /// worker, or by the poll loop itself catching back up over it) and is
+    /// marked `done`.
+    ///
+    /// Best-effort: a DB failure here is logged and the scan is skipped this
+    /// cycle rather than propagated — this is a periodic maintenance task,
+    /// not part of the ingest path, and the next scheduled scan will retry
+    /// (issue #216 explicitly asks that the scan not compete with or block
+    /// live polling).
+    async fn scan_and_enqueue_gaps(&mut self) {
+        let gaps = match db::scan_ledger_gaps(&self.db, self.config.gap_scan_max_per_run).await {
+            Ok(gaps) => gaps,
+            Err(e) => {
+                tracing::warn!(error = %e, "Gap scan failed; will retry on the next scheduled scan");
+                return;
+            }
+        };
+
+        match db::close_filled_backfill_jobs(&self.db, &self.config.network, &gaps).await {
+            Ok(closed) if closed > 0 => {
+                metrics::record_ledger_gaps_closed(closed);
+                tracing::info!(
+                    closed,
+                    "Gap scan: previously-enqueued backfill jobs confirmed filled"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to reconcile completed backfill jobs");
+            }
+        }
+
+        if gaps.is_empty() {
+            return;
+        }
+
+        metrics::record_ledger_gaps_detected(gaps.len() as u64);
+        tracing::warn!(
+            gap_count = gaps.len(),
+            first_gap = ?gaps.first(),
+            "Gap scan: found holes in the processed ledger range; enqueuing backfill jobs"
+        );
+
+        for gap in &gaps {
+            if let Err(e) = db::enqueue_backfill_job(&self.db, *gap, &self.config.network).await {
+                tracing::warn!(
+                    from_ledger = gap.from_ledger,
+                    to_ledger = gap.to_ledger,
+                    error = %e,
+                    "Failed to enqueue backfill job for a detected gap"
+                );
+            }
+        }
+    }
+
     /// Start the polling loop. Runs until `shutdown` is cancelled, always
     /// finishing the current `poll_once` before stopping (never mid-batch).
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
@@ -356,6 +423,17 @@ impl Streamer {
             if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 self.refresh_contract_filter().await?;
                 self.sync_contract_specs().await;
+            }
+
+            // Periodically scan for gaps in the processed ledger range and
+            // enqueue backfill jobs to close them (issue #216). Runs far less
+            // often than every cycle (see GAP_SCAN_EVERY_N_POLLS) so it never
+            // competes with live ingest for DB time; failures are logged and
+            // skipped rather than propagated, since a missed scan is not a
+            // reason to halt or retry the whole poll cycle — the next
+            // scheduled scan will pick the gap up.
+            if self.poll_count.is_multiple_of(GAP_SCAN_EVERY_N_POLLS) {
+                self.scan_and_enqueue_gaps().await;
             }
 
             // Circuit breaker (issue #197): while Open, skip the poll body
@@ -1829,6 +1907,7 @@ mod tests {
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
             max_reorg_rewind_depth: 50,
+            gap_scan_max_per_run: 100,
             stellar_rpc_urls: vec![rpc_url],
             rpc_failover_threshold: 3,
             rpc_endpoint_cooldown: Duration::from_secs(30),
@@ -2133,6 +2212,88 @@ mod tests {
         sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
             .bind(base as i64)
             .bind((base + 2) as i64)
+            .execute(&s.db)
+            .await
+            .unwrap();
+    }
+
+    /// scan_and_enqueue_gaps must enqueue a backfill_jobs row for a hole in
+    /// ledger_metadata, and a later run — once the hole is filled — must
+    /// close that job rather than leaving it pending forever (issue #216).
+    #[tokio::test]
+    async fn scan_and_enqueue_gaps_enqueues_then_closes() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let base = 7_600_000u64;
+        // A single-ledger hole at base+1: base and base+2 are present.
+        for &seq in &[base, base + 2] {
+            sqlx::query(
+                "INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp) \
+                 VALUES ($1, $2, NOW()) ON CONFLICT (ledger_sequence) DO NOTHING",
+            )
+            .bind(seq as i64)
+            .bind(format!("hash-{seq}"))
+            .execute(&s.db)
+            .await
+            .unwrap();
+        }
+
+        s.scan_and_enqueue_gaps().await;
+
+        let job: (i64, i64, String) = sqlx::query_as(
+            "SELECT from_ledger, to_ledger, status FROM backfill_jobs \
+             WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&s.config.network)
+        .bind((base + 1) as i64)
+        .fetch_one(&s.db)
+        .await
+        .expect("a job for the detected gap must have been enqueued");
+        assert_eq!(
+            job,
+            ((base + 1) as i64, (base + 1) as i64, "pending".to_string())
+        );
+
+        // Fill the hole, as if a backfill worker or the poll loop had caught
+        // it, and re-scan: the job must now be closed.
+        sqlx::query(
+            "INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp) \
+             VALUES ($1, $2, NOW()) ON CONFLICT (ledger_sequence) DO NOTHING",
+        )
+        .bind((base + 1) as i64)
+        .bind("hash-filled")
+        .execute(&s.db)
+        .await
+        .unwrap();
+
+        s.scan_and_enqueue_gaps().await;
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM backfill_jobs WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&s.config.network)
+        .bind((base + 1) as i64)
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "done",
+            "the job must be closed once the gap is filled"
+        );
+
+        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
+            .bind(base as i64)
+            .bind((base + 2) as i64)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1 AND from_ledger = $2")
+            .bind(&s.config.network)
+            .bind((base + 1) as i64)
             .execute(&s.db)
             .await
             .unwrap();
