@@ -28,6 +28,11 @@ pub struct Config {
     pub lag_high_watermark: u64,
     /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
     pub poll_hysteresis_ledgers: u64,
+    /// Maximum gaps enqueued as backfill jobs per gap-scan run (issue #216).
+    /// Bounds one scan's cost and DB write volume when the table is
+    /// pathologically gappy; any gaps beyond this are picked up by the next
+    /// scheduled scan.
+    pub gap_scan_max_per_run: i64,
     /// TCP connect timeout for RPC HTTP requests (issue #214).
     pub rpc_connect_timeout: Duration,
     /// Overall request timeout (connect, headers and body) for RPC calls (issue #214).
@@ -159,6 +164,7 @@ impl Config {
         let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000);
         let poll_hysteresis_ledgers =
             parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000);
+        let gap_scan_max_per_run = parse_bounded_u64("GAP_SCAN_MAX_PER_RUN", 100, 1, 10_000);
         let rpc_connect_timeout_ms =
             parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000);
         let rpc_request_timeout_ms =
@@ -212,6 +218,7 @@ impl Config {
             ),
             ("LAG_HIGH_WATERMARK", lag_high_watermark.as_ref()),
             ("POLL_HYSTERESIS_LEDGERS", poll_hysteresis_ledgers.as_ref()),
+            ("GAP_SCAN_MAX_PER_RUN", gap_scan_max_per_run.as_ref()),
             ("RPC_CONNECT_TIMEOUT_MS", rpc_connect_timeout_ms.as_ref()),
             ("RPC_REQUEST_TIMEOUT_MS", rpc_request_timeout_ms.as_ref()),
             (
@@ -313,6 +320,7 @@ impl Config {
         let poll_interval_ceiling_ms = poll_interval_ceiling_ms.unwrap();
         let lag_high_watermark = lag_high_watermark.unwrap();
         let poll_hysteresis_ledgers = poll_hysteresis_ledgers.unwrap();
+        let gap_scan_max_per_run = gap_scan_max_per_run.unwrap() as i64;
         let rpc_connect_timeout_ms = rpc_connect_timeout_ms.unwrap();
         let rpc_request_timeout_ms = rpc_request_timeout_ms.unwrap();
         let rpc_pool_idle_timeout_ms = rpc_pool_idle_timeout_ms.unwrap();
@@ -344,6 +352,7 @@ impl Config {
             poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
             lag_high_watermark,
             poll_hysteresis_ledgers,
+            gap_scan_max_per_run,
             rpc_connect_timeout: Duration::from_millis(rpc_connect_timeout_ms),
             rpc_request_timeout: Duration::from_millis(rpc_request_timeout_ms),
             rpc_pool_idle_timeout: Duration::from_millis(rpc_pool_idle_timeout_ms),
@@ -389,6 +398,7 @@ impl Config {
             poll_interval_floor_ms = self.poll_interval_floor.as_millis() as u64,
             poll_interval_ceiling_ms = self.poll_interval_ceiling.as_millis() as u64,
             lag_high_watermark = self.lag_high_watermark,
+            gap_scan_max_per_run = self.gap_scan_max_per_run,
             max_events_per_poll = self.max_events_per_poll,
             db_batch_size = self.db_batch_size,
             db_pool_size = self.db_pool_size,
@@ -966,6 +976,26 @@ mod tests {
         with_env(&vars, || {
             let err = Config::from_env().unwrap_err();
             assert!(err.to_string().contains("OUTBOX_BATCH_SIZE"));
+        });
+    }
+
+    #[test]
+    fn gap_scan_max_per_run_defaults_to_100() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("GAP_SCAN_MAX_PER_RUN");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.gap_scan_max_per_run, 100);
+        });
+    }
+
+    #[test]
+    fn gap_scan_max_per_run_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("GAP_SCAN_MAX_PER_RUN", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("GAP_SCAN_MAX_PER_RUN"));
         });
     }
 

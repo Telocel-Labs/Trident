@@ -51,6 +51,7 @@ description is accurate. Keep this file honest by hand.
 | `POLL_INTERVAL_CEILING_MS` | Optional | `5000` (min `100`, max `600000`) | Adaptive-poll ceiling: slowest interval, used when caught up. |
 | `LAG_HIGH_WATERMARK` | Optional | `100` (min `1`, max `100000000`) | Ledger lag at/above which the floor interval applies. |
 | `POLL_HYSTERESIS_LEDGERS` | Optional | `10` (min `0`, max `1000000`) | Hysteresis deadband to prevent oscillation around the watermark. |
+| `GAP_SCAN_MAX_PER_RUN` | Optional | `100` (min `1`, max `10000`) | Maximum gaps enqueued as `backfill_jobs` rows per periodic `ledger_metadata` gap scan (issue #216). |
 | `MAX_EVENTS_PER_POLL` | Optional | `200` (min `1`, max `10000`) | Max events fetched per `getEvents` RPC call. |
 | `DB_BATCH_SIZE` | Optional | `1000` (min `1`, max `10000`) | Max rows per batched INSERT when a page commits. |
 | `INDEXER_DB_POOL_SIZE` | Optional | `3` | Indexer's own Postgres pool size. |

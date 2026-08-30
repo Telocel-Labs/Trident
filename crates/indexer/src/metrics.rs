@@ -93,6 +93,19 @@ pub const CATCHUP_EVENTS_PER_SECOND: &str = "trident_indexer_catchup_events_per_
 ///   - warning  (TridentPartitionExhaustionWarning): < 5_000_000 ledgers (~289 days)
 ///   - critical (TridentPartitionExhausted):          <= 0        ledgers (already past)
 pub const PARTITION_LOOKAHEAD_LEDGERS: &str = "trident_indexer_partition_lookahead_ledgers";
+/// Gaps found in the processed ledger range by the periodic scan of
+/// `ledger_metadata` (issue #216). Each gap is one contiguous run of missing
+/// sequences, regardless of how many ledgers it spans. A gap still open on a
+/// later scan increments this again — the counter reflects scan findings,
+/// not distinct gaps, so a persistently-gappy table shows a climbing rate
+/// rather than going silent after the first detection.
+pub const LEDGER_GAPS_DETECTED_TOTAL: &str = "trident_indexer_ledger_gaps_detected_total";
+/// Previously-enqueued backfill jobs the scan confirmed are no longer gaps
+/// (issue #216): on each run, any pending/running `backfill_jobs` row whose
+/// range no longer appears in the freshly-scanned gap list has been filled
+/// (by the backfill worker, or by the live poll loop catching back up), and
+/// is marked `done` here.
+pub const LEDGER_GAPS_CLOSED_TOTAL: &str = "trident_indexer_ledger_gaps_closed_total";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -193,6 +206,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         PARTITION_LOOKAHEAD_LEDGERS,
         "Ledgers remaining before the ingest cursor reaches the last named soroban_events partition boundary (issue #525)"
     );
+    describe_counter!(
+        LEDGER_GAPS_DETECTED_TOTAL,
+        "Gaps found in the processed ledger range by the periodic ledger_metadata scan (issue #216)"
+    );
+    describe_counter!(
+        LEDGER_GAPS_CLOSED_TOTAL,
+        "Previously-enqueued backfill jobs confirmed filled by a later gap scan (issue #216)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -205,6 +226,8 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    counter!(LEDGER_GAPS_DETECTED_TOTAL).increment(0);
+    counter!(LEDGER_GAPS_CLOSED_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -339,6 +362,20 @@ pub fn record_poll_error() {
 
 pub fn record_rpc_retry() {
     counter!(RPC_RETRIES_TOTAL).increment(1);
+}
+
+/// Count gaps found by one gap-scan run (issue #216).
+pub fn record_ledger_gaps_detected(count: u64) {
+    if count > 0 {
+        counter!(LEDGER_GAPS_DETECTED_TOTAL).increment(count);
+    }
+}
+
+/// Count previously-enqueued jobs a scan confirmed are now filled (issue #216).
+pub fn record_ledger_gaps_closed(count: u64) {
+    if count > 0 {
+        counter!(LEDGER_GAPS_CLOSED_TOTAL).increment(count);
+    }
 }
 
 /// Count an RPC call that hit the connect or overall request timeout (issue #214).

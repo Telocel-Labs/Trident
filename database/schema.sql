@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0028) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0029) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -538,3 +538,32 @@ CREATE TABLE IF NOT EXISTS failed_events (
 
 CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_at) WHERE replayed_at IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- backfill_jobs  (migration 0029)
+-- Queue of ledger-range backfills enqueued by the indexer's gap scan and
+-- executed by `crates/backfill --from-queue` (issue #216).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_ledger      BIGINT      NOT NULL,
+    to_ledger        BIGINT      NOT NULL,
+    network          TEXT        NOT NULL,
+    status           TEXT        NOT NULL DEFAULT 'pending'
+                                  CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    claimed_at       TIMESTAMPTZ,
+    completed_at     TIMESTAMPTZ,
+    error            TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_backfill_jobs_range CHECK (to_ledger >= from_ledger)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_backfill_jobs_pending_range
+    ON backfill_jobs (network, from_ledger, to_ledger)
+    WHERE status IN ('pending', 'running');
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_pending
+    ON backfill_jobs (created_at)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_stale
+    ON backfill_jobs (claimed_at)
+    WHERE status = 'running';

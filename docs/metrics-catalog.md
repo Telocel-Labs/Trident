@@ -23,6 +23,8 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_rpc_retries_total` | counter | — | retries | Retries triggered by transient `getEvents` failures (exponential backoff). |
 | `trident_indexer_rpc_call_duration_seconds` | histogram | `method` (`getEvents`\|`getLedgers`) | seconds | Stellar RPC call latency, per method. |
 | `trident_indexer_rpc_errors_total` | counter | `method` | calls | Stellar RPC calls that returned an error, per method. |
+| `trident_indexer_ledger_gaps_detected_total` | counter | — | gaps | Gaps found in the processed ledger range by the periodic `ledger_metadata` scan (issue #216). Increments on every scan that still finds an unrepaired gap, not just the first time. |
+| `trident_indexer_ledger_gaps_closed_total` | counter | — | gaps | Previously-enqueued `backfill_jobs` rows confirmed filled by a later scan (issue #216). |
 | `trident_indexer_last_poll_timestamp_seconds` | gauge | — | unix seconds | Set once per poll-loop iteration regardless of outcome — the dead-man's-switch (#218). Stale means the loop is hung, not just slow. |
 | `trident_indexer_db_pool_size` | gauge | — | connections | Current size of the indexer's own Postgres pool. |
 | `trident_indexer_db_pool_idle_connections` | gauge | — | connections | Idle connections in the indexer's own Postgres pool. |
