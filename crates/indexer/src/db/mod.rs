@@ -1139,6 +1139,85 @@ mod tests {
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
     }
 
+    /// The `chk_soroban_events_network` CHECK constraint (migration 0029,
+    /// issue #252) must reject a row whose network is neither 'mainnet' nor
+    /// 'testnet' — the failure mode this exists to close is a typo like
+    /// 'tesnet' silently creating an invisible data partition.
+    #[tokio::test]
+    async fn soroban_events_rejects_unknown_network() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CNETCHK_{}", Uuid::new_v4());
+        let result = sqlx::query(
+            "INSERT INTO soroban_events \
+             (contract_id, ledger_sequence, ledger_timestamp, transaction_hash, \
+              event_index, event_type, network) \
+             VALUES ($1, 1, NOW(), 'txhash_netchk', 0, 'contract', 'tesnet')",
+        )
+        .bind(&contract_id)
+        .execute(&pool)
+        .await;
+
+        assert!(
+            result.is_err(),
+            "insert with network='tesnet' must violate chk_soroban_events_network"
+        );
+
+        // Belt and braces: confirm nothing landed despite the driver error.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count query failed");
+        assert_eq!(count.0, 0);
+    }
+
+    /// A known network value must still be accepted (the constraint is not
+    /// over-broad).
+    #[tokio::test]
+    async fn soroban_events_accepts_known_network() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CNETOK_{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO soroban_events \
+             (contract_id, ledger_sequence, ledger_timestamp, transaction_hash, \
+              event_index, event_type, network) \
+             VALUES ($1, 1, NOW(), 'txhash_netok', 0, 'contract', 'testnet')",
+        )
+        .bind(&contract_id)
+        .execute(&pool)
+        .await
+        .expect("insert with a known network must succeed");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+    }
+
     /// An empty batch must be a no-op rather than an invalid statement.
     #[tokio::test]
     async fn empty_batch_is_a_noop() {
