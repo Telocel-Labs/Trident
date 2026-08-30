@@ -93,6 +93,10 @@ pub const CATCHUP_EVENTS_PER_SECOND: &str = "trident_indexer_catchup_events_per_
 ///   - warning  (TridentPartitionExhaustionWarning): < 5_000_000 ledgers (~289 days)
 ///   - critical (TridentPartitionExhausted):          <= 0        ledgers (already past)
 pub const PARTITION_LOOKAHEAD_LEDGERS: &str = "trident_indexer_partition_lookahead_ledgers";
+/// Ledger reorganisations detected and repaired (issue #196): a divergence
+/// between the RPC's current history and what was already persisted,
+/// resolved by deleting the affected rows and rewinding the cursor.
+pub const REORGS_TOTAL: &str = "trident_indexer_reorgs_total";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -193,6 +197,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         PARTITION_LOOKAHEAD_LEDGERS,
         "Ledgers remaining before the ingest cursor reaches the last named soroban_events partition boundary (issue #525)"
     );
+    describe_counter!(
+        REORGS_TOTAL,
+        "Ledger reorganisations detected and repaired (issue #196)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -201,6 +209,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(PARSE_ERRORS_TOTAL).increment(0);
     counter!(POLL_ERRORS_TOTAL).increment(0);
     counter!(RPC_RETRIES_TOTAL).increment(0);
+    counter!(REORGS_TOTAL).increment(0);
     counter!(RPC_TIMEOUTS_TOTAL).increment(0);
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
@@ -339,6 +348,11 @@ pub fn record_poll_error() {
 
 pub fn record_rpc_retry() {
     counter!(RPC_RETRIES_TOTAL).increment(1);
+}
+
+/// Count a detected-and-repaired ledger reorg (issue #196).
+pub fn record_reorg() {
+    counter!(REORGS_TOTAL).increment(1);
 }
 
 /// Count an RPC call that hit the connect or overall request timeout (issue #214).

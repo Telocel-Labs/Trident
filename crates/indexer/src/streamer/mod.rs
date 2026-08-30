@@ -498,6 +498,154 @@ impl Streamer {
         }
     }
 
+    /// Detect a Stellar ledger reorg by comparing recently-stored ledger
+    /// hashes against what the RPC currently reports for those sequences, and
+    /// repair it if found (issue #196).
+    ///
+    /// A reorg is defined, per the issue, as either:
+    ///   - `latestLedger` (the RPC's own chain tip) regressing below `cursor`, or
+    ///   - a stored `ledger_metadata.ledger_hash` no longer matching the hash
+    ///     `getLedgers` now reports for that sequence.
+    ///
+    /// The first is cheap (it only needs `self.last_chain_tip`, already
+    /// refreshed by the previous cycle's pages) and is checked first. The
+    /// second walks backward from `cursor` through up to
+    /// `max_reorg_rewind_depth` stored sequences, stopping at the first one
+    /// whose hash still matches — that is the divergence point everything at
+    /// or above it gets deleted and re-indexed from.
+    ///
+    /// Returns `Ok(Some(new_cursor))` if a reorg was found and repaired (the
+    /// caller must resume from `new_cursor`), `Ok(None)` if the chain is
+    /// consistent, or `Err` if the rewind would exceed the configured depth
+    /// bound — a Fatal error, so the streamer halts for an operator rather
+    /// than deleting an unbounded amount of history.
+    async fn detect_and_repair_reorg(
+        &mut self,
+        cursor: u64,
+    ) -> Result<Option<u64>, TridentError> {
+        if cursor == 0 {
+            // Nothing persisted yet; nothing to diverge from.
+            return Ok(None);
+        }
+
+        // Signal 1: the RPC's own chain tip regressed below our cursor. This
+        // can only be known from a value already observed this process's
+        // lifetime (getEvents responses refresh last_chain_tip every cycle),
+        // so a cold start correctly skips this check on its very first cycle.
+        if self.last_chain_tip > 0 && self.last_chain_tip < cursor {
+            tracing::warn!(
+                cursor,
+                latest_ledger = self.last_chain_tip,
+                "RPC latestLedger regressed below cursor; treating as a reorg"
+            );
+            return self.repair_reorg_from(self.last_chain_tip.saturating_add(1)).await;
+        }
+
+        // Signal 2: check only the single most-recently-stored ledger's hash
+        // every cycle — one extra RPC call per poll, not `depth` of them.
+        // This is enough to catch a reorg the moment the tip diverges, which
+        // is the common case; the full backward walk below only runs once
+        // this cheap check has actually found a mismatch, to locate how deep
+        // the divergence goes.
+        let (top_seq, top_hash) = match db::recent_ledger_hashes(&self.db, 1).await?.pop() {
+            Some(row) => row,
+            None => return Ok(None), // nothing stored yet
+        };
+        let top_seq = top_seq as u64;
+        match self.rpc.get_ledger(top_seq).await {
+            Ok(Some(rpc_hash)) if rpc_hash == top_hash => return Ok(None),
+            Ok(_) => {
+                tracing::warn!(
+                    seq = top_seq,
+                    "Stored ledger hash no longer matches the RPC; checking divergence depth"
+                );
+            }
+            Err(e) => {
+                // Can't confirm either way this cycle; do not treat a
+                // transient RPC failure as a reorg. The next poll retries.
+                tracing::warn!(seq = top_seq, error = %e, "getLedgers failed while checking for a reorg; skipping this cycle's check");
+                return Ok(None);
+            }
+        }
+
+        // The cheap check found a mismatch: walk backward through stored
+        // (sequence, hash) pairs, newest first, to find how far back the
+        // divergence goes. Fetch one row beyond the allowed depth: if that
+        // extra row is the first one checked whose hash still matches, the
+        // true divergence point is deeper than max_reorg_rewind_depth allows
+        // and this must halt rather than guess where to stop.
+        let depth = self.config.max_reorg_rewind_depth;
+        let stored = db::recent_ledger_hashes(&self.db, depth as i64 + 1).await?;
+
+        let mut divergence: Option<u64> = None;
+        for (position, (seq, stored_hash)) in stored.iter().enumerate() {
+            let seq = *seq as u64;
+            let rpc_hash = match self.rpc.get_ledger(seq).await {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    // The RPC no longer has this sequence at all — treat that
+                    // the same as a mismatch rather than assuming consistency.
+                    tracing::warn!(seq, "getLedgers returned no ledger for a sequence we have stored");
+                    if position as u64 >= depth {
+                        return Err(Self::reorg_depth_exceeded_error(depth));
+                    }
+                    divergence = Some(seq);
+                    continue;
+                }
+                Err(e) => {
+                    // Can't confirm either way this cycle; do not treat a
+                    // transient RPC failure as a reorg. The next poll retries.
+                    tracing::warn!(seq, error = %e, "getLedgers failed while checking for a reorg; skipping this cycle's check");
+                    return Ok(None);
+                }
+            };
+
+            if &rpc_hash == stored_hash {
+                if position as u64 >= depth {
+                    // The match was only found in the extra lookahead row —
+                    // every sequence within the allowed depth mismatched.
+                    return Err(Self::reorg_depth_exceeded_error(depth));
+                }
+                // First match walking backward from the tip: everything above
+                // this sequence (already checked, all mismatched) is the
+                // affected range. Nothing further back needs checking.
+                break;
+            }
+            if position as u64 >= depth {
+                return Err(Self::reorg_depth_exceeded_error(depth));
+            }
+            divergence = Some(seq);
+        }
+
+        match divergence {
+            None => Ok(None),
+            Some(seq) => self.repair_reorg_from(seq).await,
+        }
+    }
+
+    fn reorg_depth_exceeded_error(depth: u64) -> TridentError {
+        TridentError::config(anyhow::anyhow!(
+            "reorg divergence exceeds MAX_REORG_REWIND_DEPTH ({depth}): no matching ledger \
+             hash found within the last {depth} stored ledgers; halting rather than \
+             auto-deleting an unbounded range (issue #196)"
+        ))
+    }
+
+    /// Delete every row for ledgers `>= from_sequence` and rewind the cursor,
+    /// recording the reorg metric/log (issue #196). Shared by both detection
+    /// paths in `detect_and_repair_reorg`.
+    async fn repair_reorg_from(&mut self, from_sequence: u64) -> Result<Option<u64>, TridentError> {
+        db::rewind_for_reorg(&self.db, from_sequence).await?;
+        metrics::record_reorg();
+        let new_cursor = from_sequence.saturating_sub(1);
+        tracing::warn!(
+            from_sequence,
+            new_cursor,
+            "Ledger reorg detected: deleted affected rows and rewound cursor"
+        );
+        Ok(Some(new_cursor))
+    }
+
     /// Execute a single poll cycle. Fetches all available pages from the RPC
     /// starting at `cursor`, persists each event, and advances the cursor.
     /// Returns the total number of events processed in this cycle.
@@ -509,6 +657,14 @@ impl Streamer {
         // refreshes it, but the deficit we were working against is this one.
         let cursor_at_start = *cursor;
         let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
+
+        // Reorg check (issue #196): before fetching anything new, confirm the
+        // ledgers we already persisted still match what the RPC reports for
+        // those sequences. Run before the partition-ranges query too, since a
+        // reorg can change which range the cursor should resume from.
+        if let Some(new_cursor) = self.detect_and_repair_reorg(*cursor).await? {
+            *cursor = new_cursor;
+        }
 
         // Query the named partition ranges once per poll cycle so every insert
         // in this cycle can check whether it would fall outside them and land
@@ -1477,6 +1633,7 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
+            max_reorg_rewind_depth: 50,
             stellar_rpc_urls: vec![rpc_url],
             rpc_failover_threshold: 3,
             rpc_endpoint_cooldown: Duration::from_secs(30),
@@ -1551,6 +1708,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 3, "expected 3 events in soroban_events");
+    }
+
+    /// Minimal `SorobanEvent` for tests that go straight through
+    /// `db::commit_page` rather than a mocked RPC page.
+    fn make_event(contract_id: &str, ledger_sequence: u64, event_index: u32) -> trident_common::SorobanEvent {
+        trident_common::SorobanEvent {
+            contract_id: contract_id.to_string(),
+            ledger_sequence,
+            ledger_timestamp: "2024-01-01T00:00:00Z".to_string(),
+            transaction_hash: "txhash_reorg_test".to_string(),
+            event_index,
+            event_type: trident_common::EventType::Contract,
+            topics: vec![],
+            data: serde_json::json!({}),
+        }
+    }
+
+    /// A getLedgers mock that returns a fixed hash for one specific sequence
+    /// and 404s (empty ledgers) for every other — lets a reorg test assert
+    /// exactly which sequence the streamer checked.
+    fn mock_ledger_hash(seq: u64, hash: &str) -> Mock {
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getLedgers",
+                "params": { "startLedger": seq }
+            })))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [{ "hash": hash }] }
+            })))
+    }
+
+    /// End-to-end reorg detection and repair (issue #196): indexes ledgers
+    /// N..N+2 normally, then the RPC starts reporting a different hash for
+    /// N+2 (a divergent history) — asserting the stale row for N+2 is
+    /// deleted, the cursor rewinds to N+1, and a subsequent poll re-indexes
+    /// N+2 under its new (post-reorg) data.
+    #[tokio::test]
+    async fn reorg_detected_and_repaired_end_to_end() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let base = 7_400_000u64;
+        let contract_id = format!("CREORGE2E_{}", uuid::Uuid::new_v4());
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        fn commit(events: &[trident_common::SorobanEvent], seq: u64, hash: &str) -> PageCommit<'_> {
+            PageCommit {
+                events,
+                token_events: &[],
+                invocation_metrics: &[],
+                storage_snapshots: &[],
+                network: "testnet",
+                cursor: Some(seq),
+                ledger: Some(db::LedgerMeta {
+                    sequence: seq,
+                    hash,
+                    timestamp: "2024-01-01T00:00:00Z",
+                    event_count: 1,
+                }),
+                batch_size: 10,
+            }
+        }
+
+        for i in 0..3u64 {
+            let seq = base + i;
+            let event = make_event(&contract_id, seq, 0);
+            db::commit_page(&s.db, commit(&[event], seq, &format!("old-hash-{seq}")))
+                .await
+                .expect("seed commit failed");
+        }
+        assert_eq!(db::get_cursor(&s.db).await.unwrap(), base + 2);
+        // Prime last_chain_tip so signal 1 (latestLedger regression) does not
+        // fire and mask the hash-comparison path (signal 2) this test targets.
+        s.last_chain_tip = base + 2;
+
+        // The RPC now reports the SAME hash for base and base+1 (unaffected),
+        // but a DIFFERENT hash for base+2 (the reorged ledger) — matching the
+        // "serves a mutated history for N+3"-shaped scenario from the issue,
+        // adapted to a 3-ledger window (N..N+2).
+        mock_ledger_hash(base, &format!("old-hash-{base}"))
+            .mount(&server)
+            .await;
+        mock_ledger_hash(base + 1, &format!("old-hash-{}", base + 1))
+            .mount(&server)
+            .await;
+        mock_ledger_hash(base + 2, "new-hash-after-reorg")
+            .mount(&server)
+            .await;
+
+        let mut cursor = db::get_cursor(&s.db).await.unwrap();
+        let repaired = s
+            .detect_and_repair_reorg(cursor)
+            .await
+            .expect("reorg detection must not error within the configured depth");
+        assert!(repaired.is_some(), "a hash mismatch at the tip must be detected as a reorg");
+        cursor = repaired.unwrap();
+
+        assert_eq!(
+            cursor,
+            base + 1,
+            "cursor must rewind to just below the divergent ledger"
+        );
+        assert_eq!(db::get_cursor(&s.db).await.unwrap(), base + 1);
+
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            "SELECT ledger_sequence FROM soroban_events WHERE contract_id = $1 ORDER BY ledger_sequence",
+        )
+        .bind(&contract_id)
+        .fetch_all(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining,
+            vec![base as i64, (base + 1) as i64],
+            "only the unaffected ledgers below the divergence point may remain"
+        );
+
+        let remaining_meta: Vec<i64> = sqlx::query_scalar(
+            "SELECT ledger_sequence FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2 ORDER BY ledger_sequence",
+        )
+        .bind(base as i64)
+        .bind((base + 2) as i64)
+        .fetch_all(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining_meta,
+            vec![base as i64, (base + 1) as i64],
+            "ledger_metadata for the reorged ledger must be gone"
+        );
+
+        // A subsequent detection pass, now that the divergent row is gone and
+        // the mocks agree with what's stored, must find no reorg.
+        let clean = s.detect_and_repair_reorg(cursor).await.unwrap();
+        assert!(clean.is_none(), "must not re-detect a reorg once repaired");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
+            .bind(base as i64)
+            .bind((base + 2) as i64)
+            .execute(&s.db)
+            .await
+            .unwrap();
     }
 
     /// A single event with an unparseable `ledgerClosedAt` poisons the whole

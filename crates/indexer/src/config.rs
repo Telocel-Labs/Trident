@@ -28,6 +28,11 @@ pub struct Config {
     pub lag_high_watermark: u64,
     /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
     pub poll_hysteresis_ledgers: u64,
+    /// Maximum ledgers a detected reorg is allowed to rewind before the
+    /// streamer halts instead of auto-recovering (issue #196). A deeper
+    /// divergence than this is treated as something an operator should look
+    /// at, not something to silently delete and re-index.
+    pub max_reorg_rewind_depth: u64,
     /// TCP connect timeout for RPC HTTP requests (issue #214).
     pub rpc_connect_timeout: Duration,
     /// Overall request timeout (connect, headers and body) for RPC calls (issue #214).
@@ -159,6 +164,12 @@ impl Config {
         let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000);
         let poll_hysteresis_ledgers =
             parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000);
+        // Bounded reorg rewind (issue #196): Stellar reorgs in practice are
+        // shallow (a handful of ledgers); a divergence deeper than this
+        // default is far more likely to be an RPC serving inconsistent data
+        // than a genuine consensus rollback, so it halts for an operator
+        // rather than deleting a large swath of history automatically.
+        let max_reorg_rewind_depth = parse_bounded_u64("MAX_REORG_REWIND_DEPTH", 50, 1, 100_000);
         let rpc_connect_timeout_ms =
             parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000);
         let rpc_request_timeout_ms =
@@ -212,6 +223,7 @@ impl Config {
             ),
             ("LAG_HIGH_WATERMARK", lag_high_watermark.as_ref()),
             ("POLL_HYSTERESIS_LEDGERS", poll_hysteresis_ledgers.as_ref()),
+            ("MAX_REORG_REWIND_DEPTH", max_reorg_rewind_depth.as_ref()),
             ("RPC_CONNECT_TIMEOUT_MS", rpc_connect_timeout_ms.as_ref()),
             ("RPC_REQUEST_TIMEOUT_MS", rpc_request_timeout_ms.as_ref()),
             (
@@ -313,6 +325,7 @@ impl Config {
         let poll_interval_ceiling_ms = poll_interval_ceiling_ms.unwrap();
         let lag_high_watermark = lag_high_watermark.unwrap();
         let poll_hysteresis_ledgers = poll_hysteresis_ledgers.unwrap();
+        let max_reorg_rewind_depth = max_reorg_rewind_depth.unwrap();
         let rpc_connect_timeout_ms = rpc_connect_timeout_ms.unwrap();
         let rpc_request_timeout_ms = rpc_request_timeout_ms.unwrap();
         let rpc_pool_idle_timeout_ms = rpc_pool_idle_timeout_ms.unwrap();
@@ -344,6 +357,7 @@ impl Config {
             poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
             lag_high_watermark,
             poll_hysteresis_ledgers,
+            max_reorg_rewind_depth,
             rpc_connect_timeout: Duration::from_millis(rpc_connect_timeout_ms),
             rpc_request_timeout: Duration::from_millis(rpc_request_timeout_ms),
             rpc_pool_idle_timeout: Duration::from_millis(rpc_pool_idle_timeout_ms),
@@ -389,6 +403,7 @@ impl Config {
             poll_interval_floor_ms = self.poll_interval_floor.as_millis() as u64,
             poll_interval_ceiling_ms = self.poll_interval_ceiling.as_millis() as u64,
             lag_high_watermark = self.lag_high_watermark,
+            max_reorg_rewind_depth = self.max_reorg_rewind_depth,
             max_events_per_poll = self.max_events_per_poll,
             db_batch_size = self.db_batch_size,
             db_pool_size = self.db_pool_size,
@@ -966,6 +981,36 @@ mod tests {
         with_env(&vars, || {
             let err = Config::from_env().unwrap_err();
             assert!(err.to_string().contains("OUTBOX_BATCH_SIZE"));
+        });
+    }
+
+    #[test]
+    fn max_reorg_rewind_depth_defaults_to_50() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("MAX_REORG_REWIND_DEPTH");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.max_reorg_rewind_depth, 50);
+        });
+    }
+
+    #[test]
+    fn max_reorg_rewind_depth_reads_custom_value() {
+        let mut vars = required_vars();
+        vars.push(("MAX_REORG_REWIND_DEPTH", "10"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.max_reorg_rewind_depth, 10);
+        });
+    }
+
+    #[test]
+    fn max_reorg_rewind_depth_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("MAX_REORG_REWIND_DEPTH", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("MAX_REORG_REWIND_DEPTH"));
         });
     }
 

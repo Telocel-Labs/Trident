@@ -23,6 +23,7 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_rpc_retries_total` | counter | — | retries | Retries triggered by transient `getEvents` failures (exponential backoff). |
 | `trident_indexer_rpc_call_duration_seconds` | histogram | `method` (`getEvents`\|`getLedgers`) | seconds | Stellar RPC call latency, per method. |
 | `trident_indexer_rpc_errors_total` | counter | `method` | calls | Stellar RPC calls that returned an error, per method. |
+| `trident_indexer_reorgs_total` | counter | — | reorgs | Ledger reorganisations detected and repaired: affected `soroban_events`/`ledger_metadata`/projection rows deleted, cursor rewound (issue #196). |
 | `trident_indexer_last_poll_timestamp_seconds` | gauge | — | unix seconds | Set once per poll-loop iteration regardless of outcome — the dead-man's-switch (#218). Stale means the loop is hung, not just slow. |
 | `trident_indexer_db_pool_size` | gauge | — | connections | Current size of the indexer's own Postgres pool. |
 | `trident_indexer_db_pool_idle_connections` | gauge | — | connections | Idle connections in the indexer's own Postgres pool. |
