@@ -982,6 +982,141 @@ pub async fn insert_failed_event(
     Ok(())
 }
 
+/// One row from `failed_events`, as returned by [`list_pending_failed_events`].
+pub struct FailedEventRow {
+    pub id: Uuid,
+    pub ledger_sequence: i64,
+    pub contract_id: String,
+    pub transaction_hash: String,
+    pub error_message: String,
+    pub attempts: i32,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// List dead-lettered events still awaiting replay (`replayed_at IS NULL`),
+/// oldest first — the replay tool's `--list` output and the query the
+/// dead-letter-queue runbook used to ask an operator to run by hand (issue
+/// #574). Uses `idx_failed_events_pending`, the partial index migration 0028
+/// built for exactly this query.
+pub async fn list_pending_failed_events(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<FailedEventRow>, TridentError> {
+    let rows = sqlx::query_as::<_, (Uuid, i64, String, String, String, i32, DateTime<Utc>)>(
+        r#"
+        SELECT id, ledger_sequence, contract_id, transaction_hash, error_message, attempts, occurred_at
+        FROM failed_events
+        WHERE replayed_at IS NULL
+        ORDER BY occurred_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("list_pending_failed_events"))
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, ledger_sequence, contract_id, transaction_hash, error_message, attempts, occurred_at)| {
+                FailedEventRow {
+                    id,
+                    ledger_sequence,
+                    contract_id,
+                    transaction_hash,
+                    error_message,
+                    attempts,
+                    occurred_at,
+                }
+            },
+        )
+        .collect())
+}
+
+/// How replaying one `failed_events` row turned out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// The event was inserted into `soroban_events` (or already existed there
+    /// under its deterministic UUIDv5 id) and the row is now marked replayed.
+    Replayed,
+    /// No row with this id has `replayed_at IS NULL` — either the id does not
+    /// exist, or it was already replayed. Idempotent callers (a retried
+    /// `--all` run, a double-click on a replay button) see this instead of
+    /// an error.
+    AlreadyReplayedOrMissing,
+}
+
+/// Replay one dead-lettered event: re-run the same insert `commit_page`
+/// would have done (`soroban_events` row plus its outbox row, so a replayed
+/// event still reaches Redis subscribers via `redis_stream::relay`, not just
+/// Postgres), then stamp `replayed_at` — all in one transaction, so a crash
+/// mid-replay can never leave the event inserted but the row still showing
+/// as pending, or vice versa (issue #574).
+///
+/// Idempotent: `insert_events_batch`'s `ON CONFLICT DO NOTHING` on the
+/// deterministic UUIDv5 id (same derivation `event_uuid` uses at ingest time)
+/// makes a second replay of the same row a no-op on `soroban_events`, and the
+/// `WHERE replayed_at IS NULL` guard on the UPDATE below makes the second
+/// replay a no-op on `failed_events` too — replaying twice cannot
+/// double-insert or double-count.
+pub async fn replay_failed_event(pool: &PgPool, id: Uuid) -> Result<ReplayOutcome, TridentError> {
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT event_payload FROM failed_events WHERE id = $1 AND replayed_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event select"))
+    })?;
+
+    let Some((payload,)) = row else {
+        return Ok(ReplayOutcome::AlreadyReplayedOrMissing);
+    };
+
+    let event: SorobanEvent = serde_json::from_value(payload).map_err(|e| {
+        TridentError::storage(
+            anyhow::Error::new(e).context("replay_failed_event deserialise event_payload"),
+        )
+    })?;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event begin"))
+    })?;
+
+    let events = std::slice::from_ref(&event);
+    insert_events_batch(&mut *tx, events).await?;
+    insert_outbox_batch(&mut *tx, events).await?;
+
+    let updated = sqlx::query(
+        "UPDATE failed_events SET replayed_at = NOW() WHERE id = $1 AND replayed_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event mark replayed"))
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event commit"))
+    })?;
+
+    if updated.rows_affected() == 0 {
+        // Lost a race with a concurrent replay of the same id between the
+        // SELECT above and this UPDATE. The insert it just performed is a
+        // harmless no-op (ON CONFLICT DO NOTHING on the same deterministic
+        // id the other replay used), so this is not an error — just report
+        // it the same way as "already replayed".
+        return Ok(ReplayOutcome::AlreadyReplayedOrMissing);
+    }
+
+    Ok(ReplayOutcome::Replayed)
+}
+
 /// Contracts among `contract_ids` whose `token_metadata` row is still fresh
 /// (resolved or refreshed since `cutoff`), for either a positive or a cached
 /// negative ("not a token") result (issue #263). Contracts absent from this
@@ -1843,5 +1978,195 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// A row inserted via `insert_failed_event` must appear in
+    /// `list_pending_failed_events` until it is replayed, and disappear from
+    /// that listing (while staying in the table) once it is (issue #574).
+    #[tokio::test]
+    async fn list_pending_failed_events_excludes_replayed_rows() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CPENDING_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 998, 0);
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_failed_event(&pool, &event, "simulated failure", 3)
+            .await
+            .unwrap();
+
+        let id: (Uuid,) =
+            sqlx::query_as("SELECT id FROM failed_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let pending = list_pending_failed_events(&pool, 1000).await.unwrap();
+        assert!(
+            pending.iter().any(|row| row.id == id.0),
+            "freshly dead-lettered row must be listed as pending"
+        );
+
+        let outcome = replay_failed_event(&pool, id.0).await.unwrap();
+        assert_eq!(outcome, ReplayOutcome::Replayed);
+
+        let pending_after = list_pending_failed_events(&pool, 1000).await.unwrap();
+        assert!(
+            !pending_after.iter().any(|row| row.id == id.0),
+            "replayed row must no longer be listed as pending"
+        );
+
+        let still_in_table: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE id = $1")
+                .bind(id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            still_in_table.0, 1,
+            "replay marks the row done, it does not delete it"
+        );
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// The event ends up in `soroban_events` after replay, `replayed_at` is
+    /// stamped, and — the idempotency guarantee the deterministic UUIDv5 key
+    /// and `ON CONFLICT DO NOTHING` are supposed to provide — replaying the
+    /// same id a second time neither double-inserts the event nor errors
+    /// (issue #574).
+    #[tokio::test]
+    async fn replay_failed_event_persists_event_and_is_idempotent() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CREPLAY_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 997, 0);
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_failed_event(&pool, &event, "simulated failure", 3)
+            .await
+            .unwrap();
+        let id: (Uuid,) =
+            sqlx::query_as("SELECT id FROM failed_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            replay_failed_event(&pool, id.0).await.unwrap(),
+            ReplayOutcome::Replayed
+        );
+
+        let persisted: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted.0, 1, "the event must now exist in soroban_events");
+
+        let replayed_at: (Option<DateTime<Utc>>,) =
+            sqlx::query_as("SELECT replayed_at FROM failed_events WHERE id = $1")
+                .bind(id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(replayed_at.0.is_some(), "replayed_at must be stamped");
+
+        // Replaying again must be a no-op: AlreadyReplayedOrMissing, not a
+        // second row in soroban_events.
+        assert_eq!(
+            replay_failed_event(&pool, id.0).await.unwrap(),
+            ReplayOutcome::AlreadyReplayedOrMissing
+        );
+        let persisted_again: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted_again.0, 1, "a second replay must not double-insert");
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Replaying an id that was never dead-lettered must not error — the
+    /// same "idempotent, not a hard failure" contract as replaying twice.
+    #[tokio::test]
+    async fn replay_failed_event_missing_id_is_not_an_error() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let outcome = replay_failed_event(&pool, Uuid::new_v4()).await.unwrap();
+        assert_eq!(outcome, ReplayOutcome::AlreadyReplayedOrMissing);
     }
 }
