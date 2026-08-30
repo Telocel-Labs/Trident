@@ -94,8 +94,14 @@ func cacheVersionKey(contractID string) string {
 }
 
 // ResponseCache returns middleware that caches a GET handler's JSON response
-// in Redis for ttl (issue #221). Only GET requests are cacheable — this
-// must never wrap a route with side effects.
+// in Redis for ttl (issue #221). Only GET requests are cacheable — this must
+// never wrap a route with side effects: a cache HIT skips the wrapped
+// handler entirely, so any write the handler makes (DB insert, external
+// call, etc.) silently stops happening for the rest of the TTL once an entry
+// fills. This is a contract enforced by the caller at the mux.Handle call
+// site (see main.go), not by this middleware — nothing here inspects the
+// wrapped handler for side effects, so verify it by hand before adding a new
+// ResponseCache-wrapped route (issue #571).
 //
 // Concurrent requests for the same not-yet-cached key are collapsed via
 // singleflight: only one actually executes the wrapped handler, the rest
