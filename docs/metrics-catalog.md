@@ -25,6 +25,7 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_rpc_errors_total` | counter | `method` | calls | Stellar RPC calls that returned an error, per method. |
 | `trident_indexer_rpc_breaker_state` | gauge | — | enum (0=Closed,1=Open,2=HalfOpen) | Circuit breaker state around the poll cycle (issue #197). Open means the run loop is skipping polls entirely during a sustained RPC outage. |
 | `trident_indexer_rpc_consecutive_failures` | gauge | — | failures | Consecutive RPC-layer poll failures since the last success; resets to 0 on any success. Feeds the breaker's own threshold. |
+| `trident_indexer_reorgs_total` | counter | — | reorgs | Ledger reorganisations detected and repaired: affected `soroban_events`/`ledger_metadata`/projection rows deleted, cursor rewound (issue #196). |
 | `trident_indexer_last_poll_timestamp_seconds` | gauge | — | unix seconds | Set once per poll-loop iteration regardless of outcome — the dead-man's-switch (#218). Stale means the loop is hung, not just slow. |
 | `trident_indexer_db_pool_size` | gauge | — | connections | Current size of the indexer's own Postgres pool. |
 | `trident_indexer_db_pool_idle_connections` | gauge | — | connections | Idle connections in the indexer's own Postgres pool. |

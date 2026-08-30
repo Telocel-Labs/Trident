@@ -124,6 +124,19 @@ async fn run_replay(
     Ok(())
 }
 
+/// Collapse a stored `error_message` to one line for the `--list` table.
+/// Dead-letter messages are raw driver errors and are routinely multi-line;
+/// printed verbatim they break the column layout. The full text stays in the
+/// row for anyone querying `failed_events` directly.
+fn truncate_error(msg: &str) -> String {
+    const MAX: usize = 120;
+    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(MAX) {
+        Some((byte_idx, _)) => format!("{}…", &one_line[..byte_idx]),
+        None => one_line,
+    }
+}
+
 async fn print_pending(db: &sqlx::PgPool, limit: i64) -> Result<(), Box<dyn std::error::Error>> {
     let pending = db::list_pending_failed_events(db, limit).await?;
     if pending.is_empty() {
@@ -131,18 +144,19 @@ async fn print_pending(db: &sqlx::PgPool, limit: i64) -> Result<(), Box<dyn std:
         return Ok(());
     }
     println!(
-        "{:<36}  {:>12}  {:<56}  {:<26}  attempts  occurred_at",
-        "id", "ledger", "contract_id", "tx_hash"
+        "{:<36}  {:>12}  {:<56}  {:<26}  attempts  {:<24}  error",
+        "id", "ledger", "contract_id", "tx_hash", "occurred_at"
     );
     for row in &pending {
         println!(
-            "{:<36}  {:>12}  {:<56}  {:<26}  {:>8}  {}",
+            "{:<36}  {:>12}  {:<56}  {:<26}  {:>8}  {:<24}  {}",
             row.id,
             row.ledger_sequence,
             row.contract_id,
             row.transaction_hash,
             row.attempts,
             row.occurred_at.to_rfc3339(),
+            truncate_error(&row.error_message),
         );
     }
     println!("{} pending", pending.len());
@@ -189,7 +203,13 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if let Some(Command::Replay { id, all, list, limit }) = cli.command {
+    if let Some(Command::Replay {
+        id,
+        all,
+        list,
+        limit,
+    }) = cli.command
+    {
         // A one-shot operator command: connect, do the work, exit. None of
         // the daemon's tracer/metrics/health/signal-handler setup below runs
         // for this path.

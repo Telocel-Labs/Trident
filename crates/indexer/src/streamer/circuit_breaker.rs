@@ -242,7 +242,10 @@ mod tests {
         let mut breaker = CircuitBreaker::with_clock(config(1, 1000), clock);
         breaker.record(Outcome::RpcFailure);
         assert_eq!(breaker.state(), BreakerState::Open);
-        assert!(!breaker.should_allow(), "must block while cooldown has not elapsed");
+        assert!(
+            !breaker.should_allow(),
+            "must block while cooldown has not elapsed"
+        );
 
         advance(Duration::from_millis(500));
         assert!(
