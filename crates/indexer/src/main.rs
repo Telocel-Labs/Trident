@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
@@ -25,6 +26,128 @@ mod streamer;
 #[cfg(test)]
 mod testnet_correctness;
 mod token_metadata;
+
+/// `trident-indexer` runs the poll-loop daemon when invoked with no
+/// subcommand (every existing deployment — Docker, Helm, `cargo run`), so
+/// this and `Command` are additive: nothing about the daemon path changes.
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Operator tooling for the `failed_events` dead-letter queue (issue #574).
+/// `DATABASE_URL` is read the same way the daemon reads it.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Replay dead-lettered events back into `soroban_events`.
+    Replay {
+        /// Replay one event by its `failed_events.id`.
+        #[arg(long, conflicts_with = "all")]
+        id: Option<uuid::Uuid>,
+
+        /// Replay every row still pending (`replayed_at IS NULL`), oldest
+        /// first.
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+
+        /// List pending rows instead of replaying them. Combine with
+        /// neither `--id` nor `--all`, or use on its own — the runbook
+        /// query, run from the CLI instead of psql.
+        #[arg(long)]
+        list: bool,
+
+        /// Cap on rows considered by `--all` or `--list`.
+        #[arg(long, default_value_t = 1000)]
+        limit: i64,
+    },
+}
+
+/// Runs a `replay` subcommand to completion and exits — never starts the
+/// poll-loop daemon, the metrics/health servers, or a signal handler, since
+/// this is a one-shot operator command, not a long-running service.
+async fn run_replay(
+    id: Option<uuid::Uuid>,
+    all: bool,
+    list: bool,
+    limit: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to use `trident-indexer replay`")?;
+    let db = sqlx::PgPool::connect(&database_url).await?;
+
+    // Bare `replay` (no flags) behaves like `--list`: report what's
+    // outstanding — the runbook's query, run from the CLI instead of psql —
+    // without replaying anything, since a no-argument invocation is more
+    // likely a mistake or a status check than an intent to replay
+    // everything.
+    let list = list || (!all && id.is_none());
+    if list {
+        print_pending(&db, limit).await?;
+    }
+    if !all && id.is_none() {
+        return Ok(());
+    }
+
+    // `--list --all` previews before replaying; `--list --id` prints the
+    // full pending table before replaying just that one row.
+    let ids: Vec<uuid::Uuid> = match id {
+        Some(id) => vec![id],
+        None => db::list_pending_failed_events(&db, limit)
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect(),
+    };
+
+    let mut replayed = 0u32;
+    let mut skipped = 0u32;
+    for id in ids {
+        match db::replay_failed_event(&db, id).await {
+            Ok(db::ReplayOutcome::Replayed) => {
+                println!("replayed {id}");
+                replayed += 1;
+            }
+            Ok(db::ReplayOutcome::AlreadyReplayedOrMissing) => {
+                println!("skipped {id} (already replayed or not found)");
+                skipped += 1;
+            }
+            Err(e) => {
+                eprintln!("failed to replay {id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+    println!("{replayed} replayed, {skipped} skipped");
+
+    Ok(())
+}
+
+async fn print_pending(db: &sqlx::PgPool, limit: i64) -> Result<(), Box<dyn std::error::Error>> {
+    let pending = db::list_pending_failed_events(db, limit).await?;
+    if pending.is_empty() {
+        println!("No pending failed_events rows.");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:>12}  {:<56}  {:<26}  attempts  occurred_at",
+        "id", "ledger", "contract_id", "tx_hash"
+    );
+    for row in &pending {
+        println!(
+            "{:<36}  {:>12}  {:<56}  {:<26}  {:>8}  {}",
+            row.id,
+            row.ledger_sequence,
+            row.contract_id,
+            row.transaction_hash,
+            row.attempts,
+            row.occurred_at.to_rfc3339(),
+        );
+    }
+    println!("{} pending", pending.len());
+    Ok(())
+}
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
@@ -65,6 +188,17 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    if let Some(Command::Replay { id, all, list, limit }) = cli.command {
+        // A one-shot operator command: connect, do the work, exit. None of
+        // the daemon's tracer/metrics/health/signal-handler setup below runs
+        // for this path.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .init();
+        return run_replay(id, all, list, limit).await;
+    }
+
     init_tracing(init_tracer());
 
     tracing::info!("Trident indexer starting");

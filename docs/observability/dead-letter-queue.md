@@ -80,28 +80,49 @@ and decide whether to fix and replay it:
 
 ## Inspecting and replaying failed_events
 
-Pending (not yet replayed) rows, oldest first:
+`trident-indexer replay` (issue #574) is the supported way to inspect and
+replay dead-lettered events. It reads `DATABASE_URL` the same way the daemon
+does, connects, does the requested work, and exits — it never starts the
+poll loop.
 
-```sql
-SELECT id, ledger_sequence, contract_id, transaction_hash, error_message, attempts, occurred_at
-FROM failed_events
-WHERE replayed_at IS NULL
-ORDER BY occurred_at
-LIMIT 100;
+List rows still awaiting replay (`replayed_at IS NULL`), oldest first — the
+same query an operator used to run by hand:
+
+```sh
+trident-indexer replay --list
 ```
 
-`event_payload` holds the full normalised `SorobanEvent` (the same shape
-`insert_events_batch` writes to `soroban_events`) as JSONB, so once the root
-cause is fixed a row can be replayed by re-inserting it and marking it done:
+Replay one specific row by its `failed_events.id` (from the listing above):
 
-```sql
--- Re-derive the columns insert_events_batch expects from event_payload,
--- insert (idempotent — the natural key/PK make a repeat insert a no-op),
--- then mark it replayed:
-UPDATE failed_events SET replayed_at = NOW() WHERE id = '<id>';
+```sh
+trident-indexer replay --id <uuid>
 ```
 
-There is deliberately no automated replay job — a `failed_events` row means
+Replay every row still pending, oldest first (bounded by `--limit`, default
+1000):
+
+```sh
+trident-indexer replay --all
+```
+
+Add `--list` to either replay form to print the full pending table before
+acting on it. Every form prints a `<n> replayed, <m> skipped` summary; a
+skipped row is either one that no longer matches `replayed_at IS NULL`
+(already replayed, or the id does not exist) or one whose re-insert itself
+failed — the latter is logged to stderr with the underlying error and stays
+pending for the next attempt.
+
+Replay re-runs the same insert `commit_page` performs at ingest time — the
+event lands in `soroban_events` and gets an `event_outbox` row so it still
+reaches Redis subscribers via the relay, not just Postgres — then stamps
+`replayed_at` in the same transaction. It is idempotent: the deterministic
+UUIDv5 event id and `ON CONFLICT DO NOTHING` make a second replay of the same
+row a no-op rather than a duplicate, so running `--all` again after a partial
+failure is always safe.
+
+There is deliberately no *automated* replay job — a `failed_events` row means
 something about that specific event or that moment surprised the schema or
 the database, and an operator should look at `error_message` before deciding
-whether to replay as-is, patch the schema, or discard it.
+whether to replay as-is, patch the schema, or discard it. What issue #574
+removes is the need to hand-write the re-insert SQL once that decision is
+made.
