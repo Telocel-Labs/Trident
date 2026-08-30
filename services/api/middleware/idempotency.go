@@ -3,12 +3,17 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
@@ -44,6 +49,109 @@ type idempotencyRecord struct {
 	// concurrent request carrying the same key can be told to retry instead
 	// of executing the handler a second time.
 	InFlight bool `json:"in_flight,omitempty"`
+}
+
+// idempotencyEncryptionKey is the AES-256 key used to encrypt idempotency
+// records at rest in Redis (issue #572). Two of the routes this middleware
+// wraps — create api-key, create webhook — return a live credential
+// (trident_... key, whsec_... signing secret) in their 201 body, and that
+// body used to sit in Redis in plaintext for the full 24h TTL: readable by
+// anything with Redis visibility (a replica, a backup, MONITOR, a
+// compromise), not just the original caller.
+//
+// IDEMPOTENCY_ENCRYPTION_KEY (64 hex chars = 32 bytes) lets an operator pin
+// this across restarts, which matters if idempotency records need to survive
+// a redeploy. Left unset, a random key is generated at process startup:
+// records are still encrypted at rest, replay still works for the lifetime
+// of the process (the case #225 actually asks for — a client retrying after
+// a network blip, not across a redeploy), and a record written by a
+// previous process simply fails to decrypt and is treated as a miss — safe,
+// since the fingerprint check still runs on the fresh execution.
+var idempotencyEncryptionKey = loadOrGenerateIdempotencyKey()
+
+func loadOrGenerateIdempotencyKey() []byte {
+	if raw := os.Getenv("IDEMPOTENCY_ENCRYPTION_KEY"); raw != "" {
+		key, err := hex.DecodeString(raw)
+		if err == nil && len(key) == 32 {
+			return key
+		}
+		slog.Warn("IDEMPOTENCY_ENCRYPTION_KEY is not 64 hex characters (32 bytes); generating an ephemeral key instead")
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		// crypto/rand failing is not something this service can recover
+		// from safely anywhere else either; panicking at startup is
+		// preferable to silently persisting credentials in plaintext.
+		panic("idempotency: failed to generate encryption key: " + err.Error())
+	}
+	return key
+}
+
+// encryptIdempotencyPayload seals plaintext with AES-256-GCM under
+// idempotencyEncryptionKey, so what lands in Redis is ciphertext.
+func encryptIdempotencyPayload(plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(idempotencyEncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// decryptIdempotencyPayload reverses encryptIdempotencyPayload. An error
+// here (wrong key, e.g. a record written by a previous process when no
+// fixed IDEMPOTENCY_ENCRYPTION_KEY is configured, or corruption) is treated
+// by callers as a cache miss, not a hard failure.
+func decryptIdempotencyPayload(ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(idempotencyEncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(ciphertext) < gcm.NonceSize() {
+		return nil, errors.New("idempotency: ciphertext too short")
+	}
+	nonce, sealed := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+	return gcm.Open(nil, nonce, sealed, nil)
+}
+
+// marshalIdempotencyRecord JSON-encodes rec and seals it with AES-256-GCM
+// before it is ever written to Redis (issue #572), so a Redis dump, replica,
+// or MONITOR session sees only ciphertext — never the plaintext body two of
+// this middleware's routes carry (a freshly minted API key or webhook
+// signing secret).
+func marshalIdempotencyRecord(rec idempotencyRecord) ([]byte, error) {
+	plaintext, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
+	return encryptIdempotencyPayload(plaintext)
+}
+
+// unmarshalIdempotencyRecord reverses marshalIdempotencyRecord. Any failure —
+// wrong/rotated key, corruption, or (pre-#572) a plaintext JSON record left
+// over from before this change — is returned as an error, and every caller
+// treats that as a cache miss rather than surfacing it to the client.
+func unmarshalIdempotencyRecord(data []byte) (idempotencyRecord, error) {
+	var rec idempotencyRecord
+	plaintext, err := decryptIdempotencyPayload(data)
+	if err != nil {
+		return rec, err
+	}
+	if err := json.Unmarshal(plaintext, &rec); err != nil {
+		return rec, err
+	}
+	return rec, nil
 }
 
 // inFlightTTL bounds how long a reservation survives if the process handling
@@ -130,8 +238,7 @@ func Idempotency(rdb *redis.Client, ttl time.Duration) func(http.Handler) http.H
 			redisKey := idempotencyRedisKey(r.Context(), key)
 
 			if cached, err := rdb.Get(r.Context(), redisKey).Result(); err == nil {
-				var rec idempotencyRecord
-				if jsonErr := json.Unmarshal([]byte(cached), &rec); jsonErr == nil {
+				if rec, decErr := unmarshalIdempotencyRecord([]byte(cached)); decErr == nil {
 					if rec.InFlight {
 						// Another request holding this key is still executing.
 						// Replaying nothing and re-executing would double-create,
@@ -155,10 +262,12 @@ func Idempotency(rdb *redis.Client, ttl time.Duration) func(http.Handler) http.H
 					replayIdempotentResponse(w, rec)
 					return
 				}
-				// A malformed cache entry should not be possible — this
-				// middleware is the only writer — but treating it as a miss
-				// re-executes the handler rather than failing the request.
-				slog.WarnContext(r.Context(), "idempotency: malformed cache entry; re-executing", "key", key)
+				// A malformed or undecryptable cache entry is treated as a
+				// miss: re-executing costs a query, and — when
+				// IDEMPOTENCY_ENCRYPTION_KEY is unset — this is also the
+				// expected outcome for any record written by a previous
+				// process (see loadOrGenerateIdempotencyKey).
+				slog.WarnContext(r.Context(), "idempotency: cache entry unreadable; re-executing", "key", key)
 			} else if err != redis.Nil {
 				slog.WarnContext(r.Context(), "idempotency: redis get failed; proceeding without replay", "err", err)
 			}
@@ -171,7 +280,7 @@ func Idempotency(rdb *redis.Client, ttl time.Duration) func(http.Handler) http.H
 			// A failed reservation is not fatal: Redis being down should
 			// degrade to today's behaviour, not reject the write.
 			reserved := true
-			if data, err := json.Marshal(idempotencyRecord{Fingerprint: fingerprint, InFlight: true}); err == nil {
+			if data, err := marshalIdempotencyRecord(idempotencyRecord{Fingerprint: fingerprint, InFlight: true}); err == nil {
 				ok, err := rdb.SetNX(r.Context(), redisKey, data, inFlightTTL).Result()
 				if err != nil {
 					slog.WarnContext(r.Context(), "idempotency: redis reservation failed; proceeding unreserved", "err", err)
@@ -209,10 +318,12 @@ func Idempotency(rdb *redis.Client, ttl time.Duration) func(http.Handler) http.H
 				Header:      capture.header,
 				Body:        capture.body.Bytes(),
 			}
-			if data, err := json.Marshal(rec); err == nil {
+			if data, err := marshalIdempotencyRecord(rec); err == nil {
 				if err := rdb.Set(r.Context(), redisKey, data, ttl).Err(); err != nil {
 					slog.WarnContext(r.Context(), "idempotency: redis set failed; a retry will re-execute", "err", err)
 				}
+			} else {
+				slog.WarnContext(r.Context(), "idempotency: encrypting record failed; a retry will re-execute", "err", err)
 			}
 		})
 	}
