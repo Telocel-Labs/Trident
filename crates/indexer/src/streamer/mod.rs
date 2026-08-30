@@ -1135,17 +1135,25 @@ fn parse_retained_floor(message: &str) -> Option<u64> {
 ///    failures are transient (a connection blip, a lock wait, a statement
 ///    timeout) and clear well within this budget.
 /// 2. If the whole page still cannot be committed atomically, commit each
-///    event individually instead. This is the mechanism that actually
-///    distinguishes "transient" from "permanent": an event that keeps
-///    failing even in isolation, with nothing else in its transaction that
-///    could be the real cause, is genuinely unpersistable right now. One that
-///    succeeds alone was never the problem — some other row in the original
-///    batch was, and this isolates it without guessing at error strings.
-/// 3. Events that still fail after per-event retries are written to
-///    `failed_events` (a dead-letter queue analogous to `parse_errors`, but
-///    for well-formed events whose storage write failed rather than events
-///    that failed to decode) and skipped, so the page's cursor/ledger
-///    metadata commit — and therefore progress — is never blocked on them.
+///    event individually instead. "An event that keeps failing even in
+///    isolation, with nothing else in its transaction that could be the real
+///    cause, is genuinely unpersistable right now" only holds when the
+///    failure is specific to that event — during a failover, lock storm, or
+///    pool exhaustion, every event fails identically in isolation too. Stage
+///    3 below is what actually tells the two apart, via
+///    `db::classify_storage_failure` rather than guessing at error strings
+///    (issue #573).
+/// 3. An event still failing after per-event retries is classified: a
+///    transient storage failure (the database, not the row, is the problem)
+///    propagates immediately so the whole page is retried on the next poll —
+///    duplicates are already absorbed downstream by the deterministic
+///    UUIDv5 keys and `ON CONFLICT DO NOTHING`, so a retry is safe in a way
+///    dead-lettering healthy events is not. A permanent failure (a
+///    constraint violation, a data-type error) is written to `failed_events`
+///    (a dead-letter queue analogous to `parse_errors`, but for well-formed
+///    events whose storage write failed rather than events that failed to
+///    decode) and skipped, so the page's cursor/ledger metadata commit — and
+///    therefore progress — is never blocked on it.
 ///
 /// `invocation_metrics` and `storage_snapshots` are supplementary projections
 /// keyed by (contract, transaction) rather than by individual event; they are
@@ -1243,6 +1251,27 @@ async fn commit_page_with_fallback(
         .await;
 
         if let Err(e) = result {
+            // Distinguish a poison event from a database that is merely
+            // unavailable right now (issue #573). Per-event isolation's
+            // inference — "an event that fails even alone is unpersistable" —
+            // only holds when the failure is specific to that event. During a
+            // failover, lock storm, or pool exhaustion every event in the
+            // page fails identically in isolation, and without this check the
+            // whole (otherwise healthy) page was dead-lettered wholesale
+            // instead of retried.
+            if db::classify_storage_failure(&e) == db::StorageFailure::Transient {
+                tracing::warn!(
+                    contract_id = %event.contract_id,
+                    tx_hash = %event.transaction_hash,
+                    ledger = event.ledger_sequence,
+                    error = %e,
+                    attempts,
+                    "Event failed to persist after per-event retries with a transient storage \
+                     error; propagating instead of dead-lettering so the whole page retries"
+                );
+                return Err(e);
+            }
+
             tracing::error!(
                 contract_id = %event.contract_id,
                 tx_hash = %event.transaction_hash,
@@ -1446,6 +1475,37 @@ mod tests {
         })
     }
 
+    /// Like `events_page`, but scoped to a caller-chosen `contract_id` so a
+    /// test can assert on rows for its own contract without colliding with
+    /// `"CTEST"` fixtures elsewhere.
+    fn events_page_for_contract(contract_id: &str, ledger: u64, count: usize) -> serde_json::Value {
+        let events: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": contract_id,
+                    "id": format!("{:016}-{}", ledger, i),
+                    "pagingToken": format!("{}-{}", ledger, i),
+                    "txHash": format!("hash{:x}{}", ledger, i),
+                    "topic": [sym_xdr("transfer")],
+                    "value": void_xdr(),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": ledger
+            }
+        })
+    }
+
     fn error_500() -> ResponseTemplate {
         ResponseTemplate::new(500).set_body_string("Internal Server Error")
     }
@@ -1466,6 +1526,18 @@ mod tests {
 
     async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
         let db = sqlx::PgPool::connect(db_url).await.unwrap();
+        make_streamer_with_pool(db, db_url, redis_url, rpc_url).await
+    }
+
+    /// Like `make_streamer`, but takes an already-built pool so a test can
+    /// configure it first (e.g. a single connection with a fixed
+    /// `statement_timeout`, for `transient_db_outage_retries_the_page_instead_of_dead_lettering_it`).
+    async fn make_streamer_with_pool(
+        db: sqlx::PgPool,
+        db_url: &str,
+        redis_url: &str,
+        rpc_url: String,
+    ) -> Streamer {
         let config = Config {
             stellar_rpc_url: rpc_url.clone(),
             database_url: db_url.to_string(),
@@ -1677,6 +1749,139 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+    }
+
+    /// Issue #573's DB-down case: every event in an otherwise-healthy page
+    /// fails identically, in isolation, not because any of them is bad but
+    /// because the database itself is unreachable — here simulated with an
+    /// EXCLUSIVE table lock held by another session plus a short
+    /// `statement_timeout`, so every INSERT attempt fails with a real
+    /// Postgres `57014 query_canceled` (transient) rather than a mocked
+    /// error. Before `classify_storage_failure`, `commit_page_with_fallback`
+    /// could not tell this apart from a poison event and would dead-letter
+    /// every event in the page wholesale. It must instead propagate the
+    /// error so the page is retried, leaving the cursor exactly where it
+    /// was and neither table touched.
+    #[tokio::test]
+    async fn transient_db_outage_retries_the_page_instead_of_dead_lettering_it() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let contract_id = format!("CDBDOWN_{}", uuid::Uuid::new_v4());
+        // Must fall inside a named partition, same constraint as the poison-
+        // event test above: migration 0017 creates 0-6M and 50M-60M with a
+        // gap between, and the #525 exhaustion guard rejects anything the
+        // gap would send to soroban_events_default.
+        let ledger = 5_100_000u64;
+        let page = events_page_for_contract(&contract_id, ledger, 2);
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(page))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(ledger, 0)))
+            .mount(&server)
+            .await;
+
+        // A single-connection pool with statement_timeout fixed at connect
+        // time (mirroring main.rs's after_connect setup, issue #249): with
+        // only one connection, every query the streamer issues — whole-page
+        // and per-event alike — is guaranteed to run on the connection this
+        // timeout was set on, rather than a `SET` on one pooled connection
+        // that a later query might not reuse.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '200ms'")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&db_url)
+            .await
+            .unwrap();
+        let mut s = make_streamer_with_pool(db, &db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        // Hold an EXCLUSIVE lock on soroban_events from a separate session so
+        // every INSERT the streamer attempts — whole-page and per-event alike
+        // — blocks until it hits the statement_timeout above. The lock is
+        // never committed, so it is released unconditionally when this
+        // connection is dropped, even if an assertion below panics.
+        let locker = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let mut lock_tx = locker.begin().await.unwrap();
+        sqlx::query("LOCK TABLE soroban_events IN EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        let mut cursor = 0u64;
+        let result = s.poll_once(&mut cursor).await;
+
+        // Drop (implicit rollback) before asserting, so a failed assertion
+        // can't leave the lock held for the rest of the test binary.
+        drop(lock_tx);
+        locker.close().await;
+
+        assert!(
+            result.is_err(),
+            "a page that cannot reach the database at all must propagate an error, not report success"
+        );
+        assert_eq!(
+            cursor, 0,
+            "the cursor must not advance past events that were never actually persisted"
+        );
+
+        let persisted: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(persisted.0, 0, "nothing should have been persisted during the outage");
+
+        let dead_lettered: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            dead_lettered.0, 0,
+            "a transient outage must not dead-letter healthy events — issue #573"
+        );
+
+        // The outage has cleared (the lock was released above): a retry of
+        // the same page must now succeed and persist both events, proving no
+        // data was lost by propagating instead of dead-lettering.
+        sqlx::query("SET statement_timeout = '30s'")
+            .execute(&s.db)
+            .await
+            .unwrap();
+        s.poll_once(&mut cursor)
+            .await
+            .expect("retry after the outage clears must succeed");
+        assert_eq!(cursor, ledger);
+
+        let persisted_after_retry: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(persisted_after_retry.0, 2, "both events must land once the database recovers");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
             .bind(&contract_id)
             .execute(&s.db)
             .await

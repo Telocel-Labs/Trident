@@ -31,6 +31,107 @@ pub async fn connect_pool(database_url: &str, pool_size: u32) -> Result<PgPool, 
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("connect_pool")))
 }
 
+/// Classify a storage failure as permanent (the data itself is unpersistable —
+/// dead-letter it) or transient (the database is the problem — retry/propagate
+/// instead) (issue #573).
+///
+/// `commit_page` and every `insert_*_batch` helper wrap every `sqlx::Error` in
+/// `TridentError::storage`, which `TridentError::severity` classifies as
+/// uniformly `Retryable` — correct for the poll loop's top-level retry, but not
+/// precise enough for `commit_page_with_fallback`'s per-event isolation stage
+/// (issue #208): "an event that fails even alone is unpersistable" only holds
+/// when the failure is specific to that event. During a failover, lock storm,
+/// or pool exhaustion every event in the page fails identically in isolation,
+/// and without this distinction the whole page was dead-lettered wholesale
+/// instead of retried.
+///
+/// `anyhow::Error::new(e).context(...)` (how every call site here builds the
+/// `TridentError::StorageError` source) still carries the original
+/// `sqlx::Error` in its chain, so `chain().find_map` recovers it without
+/// touching any insert function's signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFailure {
+    /// The database itself is unavailable or overloaded right now — a
+    /// connection/IO/pool/protocol failure, or a Postgres error whose SQLSTATE
+    /// class is connection (`08`), resource exhaustion (`53`), operator
+    /// intervention (`57`, covering `57014` query_canceled i.e. a statement
+    /// timeout), or serialization/deadlock (`40001`/`40P01`). Retrying — or,
+    /// in the per-event fallback, propagating so the whole page is retried —
+    /// is the right response.
+    Transient,
+    /// The data itself is the problem: a constraint violation (SQLSTATE class
+    /// `23`), an invalid text representation / data exception (`22`), or a
+    /// row/column/type-level `sqlx::Error` that can never succeed by retrying.
+    /// Dead-lettering — what the queue is for — is the right response.
+    Permanent,
+}
+
+/// Classify a `TridentError` produced by this module's storage functions.
+/// Errors with no recoverable `sqlx::Error` in their chain (e.g. the
+/// timestamp-parse failure in `commit_page`) are treated as `Permanent`:
+/// retrying an identical page cannot change a parse outcome.
+pub fn classify_storage_failure(err: &TridentError) -> StorageFailure {
+    let TridentError::StorageError { source } = err else {
+        // Non-storage errors reaching this classifier is a caller bug, but
+        // failing safe here means treating it as permanent rather than
+        // looping forever on something retrying can never fix.
+        return StorageFailure::Permanent;
+    };
+
+    let Some(db_err) = source.chain().find_map(|c| c.downcast_ref::<sqlx::Error>()) else {
+        return StorageFailure::Permanent;
+    };
+
+    match db_err {
+        // Connection/IO/pool/protocol failures: the database is unreachable
+        // or the pool is exhausted, not that this row is bad.
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => StorageFailure::Transient,
+
+        sqlx::Error::Database(db) => match db.code() {
+            Some(code) => match code.as_ref() {
+                // Class 08: connection exception.
+                c if c.starts_with("08") => StorageFailure::Transient,
+                // Class 53: insufficient resources (disk/memory/connections).
+                c if c.starts_with("53") => StorageFailure::Transient,
+                // Class 57: operator intervention — includes 57014
+                // query_canceled, e.g. statement_timeout firing under load.
+                c if c.starts_with("57") => StorageFailure::Transient,
+                // 40001 serialization_failure, 40P01 deadlock_detected.
+                "40001" | "40P01" => StorageFailure::Transient,
+                // Class 23 (integrity_constraint_violation) and class 22
+                // (data_exception) are the row's own fault — retrying an
+                // identical INSERT reproduces the same violation.
+                _ => StorageFailure::Permanent,
+            },
+            // A DatabaseError with no SQLSTATE code is not a shape Postgres
+            // produces; fail safe rather than assume it will clear on retry.
+            None => StorageFailure::Permanent,
+        },
+
+        // Row/column/type/decoding errors are about the data or the query
+        // shape, not the database's availability.
+        sqlx::Error::RowNotFound
+        | sqlx::Error::TypeNotFound { .. }
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Encode(_)
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::Configuration(_)
+        | sqlx::Error::Migrate(_) => StorageFailure::Permanent,
+
+        // sqlx::Error is #[non_exhaustive]; an unrecognised future variant is
+        // treated the same as "no sqlx::Error found" — permanent, since
+        // retrying blind is worse than a false-positive dead-letter here.
+        _ => StorageFailure::Permanent,
+    }
+}
+
 // Stable namespace for deterministic event UUIDs (UUIDv5).
 // Using the DNS namespace is arbitrary; what matters is that it is fixed.
 const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
@@ -1073,6 +1174,58 @@ mod tests {
             topics: vec![],
             data: json!({}),
         }
+    }
+
+    /// Exercises `classify_storage_failure` against `sqlx::Error` variants
+    /// that don't require a database connection to construct. The
+    /// SQLSTATE-string branches (connection/resource/timeout/serialization
+    /// classes → transient, constraint/data-exception classes → permanent)
+    /// are instead exercised end-to-end against a real Postgres error in
+    /// `streamer::tests::transient_db_outage_retries_the_page_instead_of_dead_lettering_it`
+    /// and the existing `poison_event_is_dead_lettered_and_page_still_advances_cursor`.
+    #[test]
+    fn connection_level_io_error_is_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        let err = TridentError::storage(
+            anyhow::Error::new(sqlx::Error::Io(io_err)).context("test"),
+        );
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Transient);
+    }
+
+    #[test]
+    fn pool_timeout_is_transient() {
+        let err =
+            TridentError::storage(anyhow::Error::new(sqlx::Error::PoolTimedOut).context("test"));
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Transient);
+    }
+
+    #[test]
+    fn column_decode_error_is_permanent() {
+        let decode_err = Box::<dyn std::error::Error + Send + Sync>::from("bad column");
+        let err = TridentError::storage(
+            anyhow::Error::new(sqlx::Error::ColumnDecode {
+                index: "0".to_string(),
+                source: decode_err,
+            })
+            .context("test"),
+        );
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Permanent);
+    }
+
+    #[test]
+    fn error_with_no_sqlx_source_is_permanent() {
+        // e.g. the ledger-timestamp DateTime parse failure in commit_page:
+        // a TridentError::StorageError whose source chain never touched
+        // sqlx at all. Retrying an identical page cannot change a parse
+        // outcome, so this must not be treated as retryable.
+        let err = TridentError::storage(anyhow::anyhow!("not a valid timestamp"));
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Permanent);
+    }
+
+    #[test]
+    fn non_storage_error_is_permanent() {
+        let err = TridentError::config(anyhow::anyhow!("missing DATABASE_URL"));
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Permanent);
     }
 
     /// Deterministic UUID: same inputs must produce the same id.

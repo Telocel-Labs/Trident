@@ -23,18 +23,40 @@ tries every page as one atomic transaction first — the fast path, and what
 keeps events, their outbox rows, and the cursor advance atomic (issue #199).
 If that fails after a bounded retry (3 attempts, 200 ms–2 s exponential
 backoff), it falls back to committing each event in the page individually,
-each with its own bounded retry (3 attempts, 100 ms–1 s backoff). An event
-that still cannot be persisted after that is written to `failed_events` and
-skipped; the page's cursor and ledger metadata still commit once every event
-in it has been either persisted or dead-lettered, so **the cursor always
-advances** — a poison row can delay a page but never blocks it indefinitely.
+each with its own bounded retry (3 attempts, 100 ms–1 s backoff).
 
-This also structurally distinguishes transient from permanent failures
-without having to parse database error strings: an event that fails when
-batched with the rest of the page but succeeds on its own was never the
-problem — something else in that transaction was, and isolating it recovers
-the rest of the page automatically. An event that keeps failing even alone is
-the one that's actually broken.
+An event that still cannot be persisted after per-event retries is not
+dead-lettered outright: `db::classify_storage_failure` (issue #573) inspects
+the underlying `sqlx::Error` (via its SQLSTATE code for a genuine Postgres
+error, or its variant for a connection/pool-level failure) and splits the
+outcome in two:
+
+- **Transient** — a connection/IO/pool failure, or a Postgres error whose
+  SQLSTATE class is connection (`08`), resource exhaustion (`53`), operator
+  intervention (`57`, including `57014 query_canceled` — a statement timeout
+  firing under lock contention), or serialization/deadlock
+  (`40001`/`40P01`). The database is the problem, not the row: the error
+  propagates out of `commit_page_with_fallback` instead of being
+  dead-lettered, so the page is retried whole on the next poll cycle rather
+  than every event in it being wedged into `failed_events`. Duplicates are
+  safe — the deterministic UUIDv5 event ids and `ON CONFLICT DO NOTHING`
+  absorb the replay.
+- **Permanent** — a constraint violation (SQLSTATE class `23`), a data
+  exception (class `22`, e.g. invalid text representation), or a
+  row/column/type-level `sqlx::Error` with no SQLSTATE at all. Retrying an
+  identical page reproduces the same failure, so the event is written to
+  `failed_events` and skipped; the page's cursor and ledger metadata still
+  commit once every remaining event has been either persisted or
+  dead-lettered, so **the cursor always advances past a genuinely poison
+  event** — it just no longer advances past a page that failed only because
+  the database was briefly unavailable.
+
+Before this classification existed, every per-event failure was treated the
+same way: "an event that fails even alone is unpersistable." That inference
+only holds when the failure is specific to the event — during a failover,
+lock storm, or pool exhaustion, every event in the page fails identically in
+isolation, and a page of perfectly healthy events would land in
+`failed_events` wholesale, needing manual replay for no reason.
 
 ## Metrics
 
