@@ -210,3 +210,55 @@ func TestIdempotency_RequestBodyStillReachesTheHandler(t *testing.T) {
 		t.Fatalf("handler did not see the original body: %s", rec.Body.String())
 	}
 }
+
+// TestIdempotency_RedisValueIsEncryptedAtRest is the regression test for
+// issue #572: two of the routes this middleware wraps (create api-key,
+// create webhook) return a live credential in their 201 body, and that body
+// used to be stored in Redis as plaintext JSON for the full TTL — readable
+// by anything with Redis visibility (a replica, a backup, MONITOR, a
+// compromise). The raw value stored under the idempotency key must contain
+// neither the credential nor any recognisable JSON structure.
+func TestIdempotency_RedisValueIsEncryptedAtRest(t *testing.T) {
+	rdb := newIdempotencyTestRedis(t)
+
+	const secret = "whsec_abcdef0123456789abcdef0123456789"
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"secret":"` + secret + `"}`))
+	})
+	h := middleware.Idempotency(rdb, time.Minute)(handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks", bytes.NewReader([]byte(`{"contractId":"C1","targetUrl":"https://example.test/hook"}`)))
+	req.Header.Set("Idempotency-Key", "encrypt-check")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(secret)) {
+		t.Fatalf("client response missing the secret: %s", rec.Body.String())
+	}
+
+	keys, err := rdb.Keys(t.Context(), "idempotency:*").Result()
+	if err != nil {
+		t.Fatalf("scanning redis keys: %v", err)
+	}
+	if len(keys) == 0 {
+		t.Fatal("no idempotency record was written to redis")
+	}
+
+	for _, key := range keys {
+		raw, err := rdb.Get(t.Context(), key).Result()
+		if err != nil {
+			t.Fatalf("reading redis key %q: %v", key, err)
+		}
+		if bytes.Contains([]byte(raw), []byte(secret)) {
+			t.Fatalf("redis key %q stores the secret in plaintext: %q", key, raw)
+		}
+		if json.Valid([]byte(raw)) {
+			t.Fatalf("redis key %q stores valid, presumably unencrypted JSON: %q", key, raw)
+		}
+	}
+}

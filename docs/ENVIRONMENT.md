@@ -140,6 +140,7 @@ description is accurate. Keep this file honest by hand.
 | `PPROF_ENABLED` | Optional | `false` | Enables the internal-only pprof profiling server. Never exposed publicly — bind it to loopback/localhost only. |
 | `PPROF_ADDR` | Optional | `127.0.0.1:6060` | Bind address for the pprof server, when enabled. |
 | `GRPC_MTLS_ENABLED` / `GRPC_MTLS_CA_CERT` / `GRPC_MTLS_CLIENT_CERT` / `GRPC_MTLS_CLIENT_KEY` | Optional (see grpc-api section) | — | Client-side counterpart of the grpc-api mTLS flag (issue #320); `services/api/grpc/client.go`. |
+| `IDEMPOTENCY_ENCRYPTION_KEY` | Optional | random key generated at startup | 64 hex characters (32 bytes), AES-256 key used to encrypt idempotency records at rest in Redis (issue #572) — `POST /v1/api-keys` and `POST /v1/webhooks` return a live credential in their body, and `middleware.Idempotency` stores that body for `DefaultIdempotencyTTL` (24h). Left unset, a random key is generated per process: records are still encrypted, but a record written before a restart cannot be decrypted afterward and is treated as a cache miss (safe — the request is just re-executed). Set this if idempotency replay must survive a redeploy. |
 
 ## Docker Compose only
 
