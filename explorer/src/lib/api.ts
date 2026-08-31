@@ -5,7 +5,7 @@ const TESTNET_URL =
 const MAINNET_URL =
   import.meta.env.TRIDENT_MAINNET_API_URL ?? "https://api.mainnet.trident.dev";
 const API_KEY: string = import.meta.env.EXPLORER_API_KEY ?? "";
-const API_TIMEOUT = 30000; // 30 second timeout
+export const API_TIMEOUT = 30000; // 30 second timeout
 
 function baseUrl(network: Network): string {
   return network === "mainnet" ? MAINNET_URL : TESTNET_URL;
