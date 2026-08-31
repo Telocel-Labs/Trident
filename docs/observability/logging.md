@@ -1,4 +1,4 @@
-# Structured Logging & Correlation IDs (issue #294)
+# Logging and Observability
 
 Both Trident stacks — the Go REST API (`services/api`) and the Rust services
 (`crates/indexer`, `crates/api`) — emit **one JSON object per log line**, and
@@ -11,7 +11,7 @@ both needs a field-mapping rule per stack, not one shared parser (issue
 #239 standardised the *Go* side's own fields; unifying the two stacks onto
 one literal wire format is a separate, not-yet-scheduled piece of work).
 
-## Schema
+Every inbound HTTP request to Trident is assigned a unique request ID (or inherits one from the inbound `X-Request-Id` header if supplied by the client/proxy). 
 
 | Field | Type | Always present | Description |
 |-------|------|:--:|-------------|
