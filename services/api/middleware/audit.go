@@ -155,7 +155,11 @@ func (aw *AuditWriter) insertBatch(ctx context.Context, batch []AuditEntry) erro
 			e.DurationMs,
 			e.ResultCount,
 			e.RequestID,
-			e.Network,
+			// NULL, not "", when the handler never set one: chk_audit_log_network
+			// (migration 0031, issue #252) permits NULL or a known network name,
+			// so an empty string fails the CHECK and takes the whole batch with
+			// it — audit rows for every unscoped route were being dropped.
+			nullIfEmpty(e.Network),
 			e.Timestamp,
 		}
 	}
@@ -235,6 +239,16 @@ func AuditAPIKeyIDFromContext(ctx context.Context) *uuid.UUID {
 // WithAuditNetwork stores the network in the request context for audit logging.
 func WithAuditNetwork(ctx context.Context, network string) context.Context {
 	return context.WithValue(ctx, auditLogNetworkKey, network)
+}
+
+// nullIfEmpty maps an unset network to a SQL NULL. The audit row records
+// which network a request was scoped to; routes that are not network-scoped
+// leave it unset, and "unknown" is NULL rather than the empty string.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // AuditNetworkFromContext retrieves the audit network from the request context.

@@ -15,7 +15,26 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Validate Quickstart Code Samples
+      # The sample imports @trident-indexer/sdk, so the SDK's declarations
+      # must exist before it can be type-checked. Building it here means the
+      # check verifies the sample against the SDK's real surface rather than
+      # just parsing it.
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
         run: |
-          echo "Validating quickstart TypeScript sample syntax..."
-          npx tsc --noEmit docs/site/examples/quickstart.ts
+          npm ci
+          npm run build
+
+      - name: Validate Quickstart Code Samples
+        working-directory: docs/site/examples
+        run: |
+          echo "Type-checking the quickstart sample against the SDK..."
+          # -p typescript, not a bare `npx tsc`: npx resolves `tsc` to the
+          # unrelated, abandoned `tsc@2.0.4` package, which prints "This is
+          # not the tsc command you are looking for" and exits 1.
+          #
+          # tsconfig.json here maps @trident-indexer/sdk to the declarations
+          # built in the previous step and sets an ES2020 target, so the
+          # sample is checked against the SDK's real surface (the default ES5
+          # target has no Promise, so every async sample failed to compile).
+          npx -y -p typescript@5 tsc --noEmit -p tsconfig.json

@@ -2,10 +2,10 @@
 import Base from '../../../layouts/Base.astro';
 import ErrorState from '../../../components/ErrorState.astro';
 import { isValidContractId } from '../../../lib/contracts';
-import { listEvents } from '../../../lib/api';
+import { listEvents, ApiError, API_TIMEOUT } from '../../../lib/api';
 import { probeContractOnChain } from '../../../lib/soroban';
 import { truncate, relativeTime, stellarExpertBase, tryFormatJson } from '../../../lib/format';
-import { ErrorType, getErrorState } from '../../../lib/errors';
+import { ErrorType, getErrorState, classifyError } from '../../../lib/errors';
 import type { ErrorState as ErrorStateType } from '../../../lib/errors';
 import type { Network, SorobanEvent } from '../../../lib/types';
 
@@ -81,52 +81,30 @@ if (!isValidContractId(address)) {
     }
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
-    let errorType = ErrorType.API_ERROR;
-    const status = error.message.match(/API (\d+)/)?.[1];
-    if (status === '404') errorType = ErrorType.NOT_FOUND;
-    else if (status === '429') errorType = ErrorType.RATE_LIMITED;
-    else if (error.name === 'AbortError') errorType = ErrorType.TIMEOUT;
+
+    // lib/api throws ApiError with a real, structured .status on any non-2xx
+    // response, so the status is read directly rather than parsed back out of
+    // the message. ApiError's message comes from the API's own JSON error
+    // envelope and is arbitrary server text, so it cannot be relied on to
+    // contain "API <code>" (or the "not found"/"timeout" substrings
+    // classifyError also looks for). A plain Error simply has no .status.
+    const statusCode = err instanceof ApiError ? String(err.status) : undefined;
+
+    let errorType = classifyError(error, statusCode ? Number(statusCode) : undefined);
+
+    // fetchWithTimeout aborts via AbortController, which surfaces as a
+    // DOMException named AbortError rather than anything ApiError-shaped.
+    if (error.name === 'AbortError') {
+      errorType = ErrorType.TIMEOUT;
+    }
+
     errorState = getErrorState(errorType, {
       error,
-      statusCode: status,
-      timeout: 30,
+      statusCode,
+      timeout: API_TIMEOUT / 1000,
       address,
     });
   }
-} catch (err) {
-  const error = err instanceof Error ? err : new Error(String(err));
-
-  // The SDK (issue #520) throws TridentApiError with a real, structured
-  // .status field on any non-2xx response — the previous hand-rolled
-  // fetchWithTimeout instead encoded the status INTO the message
-  // ("API 404"), which is what the regex below used to parse back out.
-  // TridentApiError's message comes from the API's own JSON error
-  // envelope and is arbitrary server text, so it won't reliably contain
-  // "API <code>" (or "not found"/"timeout" substrings classifyError also
-  // checks) — reading .status directly is both simpler and correct for
-  // both error shapes, since a plain Error just has it as undefined.
-  const statusCode = err instanceof TridentApiError ? String(err.status) : undefined;
-
-  // Classify the error
-  let errorType = classifyError(error, statusCode ? Number(statusCode) : undefined);
-
-  // Timeouts surface as TridentError{code:"TIMEOUT"} from the SDK's own
-  // per-attempt AbortController. The old hand-rolled client raised a bare
-  // DOMException named "AbortError" instead, so that shape is still checked
-  // for the client-side <script> fetches below, which don't go through the SDK.
-  if (
-    (err instanceof TridentError && err.code === 'TIMEOUT') ||
-    error.name === 'AbortError'
-  ) {
-    errorType = ErrorType.TIMEOUT;
-  }
-
-  errorState = getErrorState(errorType, {
-    error,
-    statusCode,
-    timeout: TRIDENT_TIMEOUT_MS / 1000,
-    address,
-  });
 }
 
 // Collect distinct topic_0 values for the filter dropdown

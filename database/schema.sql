@@ -564,6 +564,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_events_pending
     ON failed_events (contract_id, ledger_sequence, event_index)
     WHERE replayed_at IS NULL;
 
+-- ---------------------------------------------------------------------------
+-- backfill_jobs  (migration 0032)
+-- Queue of ledger-range backfills enqueued by the indexer's gap scan and
+-- executed by `crates/backfill --from-queue` (issue #216).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_ledger      BIGINT      NOT NULL,
+    to_ledger        BIGINT      NOT NULL,
+    network          TEXT        NOT NULL,
+    status           TEXT        NOT NULL DEFAULT 'pending'
+                                  CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    claimed_at       TIMESTAMPTZ,
+    completed_at     TIMESTAMPTZ,
+    error            TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_backfill_jobs_range CHECK (to_ledger >= from_ledger)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_backfill_jobs_pending_range
+    ON backfill_jobs (network, from_ledger, to_ledger)
+    WHERE status IN ('pending', 'running');
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_pending
+    ON backfill_jobs (created_at)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_stale
+    ON backfill_jobs (claimed_at)
+    WHERE status = 'running';
+
+
 
 -- ---------------------------------------------------------------------------
 -- Network value constraints  (migration 0031, issue #252)
