@@ -10,6 +10,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/middleware"
 )
 
 // connectWebhookTestDB mirrors handlers_test.connectRealTestDB (this is
@@ -84,6 +86,10 @@ func TestListWebhooksHandler_Pagination(t *testing.T) {
 		}
 		req := httptest.NewRequest(http.MethodGet, url, nil)
 		req.Header.Set("X-API-Key", apiKeyID)
+		// The handler scopes the listing to the API key id in the request
+		// context, which middleware.APIKey sets after its database lookup.
+		// This test calls the handler directly, so it supplies the same value.
+		req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 		rec := httptest.NewRecorder()
 		listWebhooksHandler(db).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {

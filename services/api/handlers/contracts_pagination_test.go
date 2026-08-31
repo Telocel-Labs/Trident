@@ -21,20 +21,24 @@ func TestListContracts_CursorIsOpaque(t *testing.T) {
 	pool := connectRealTestDB(t)
 	ctx := t.Context()
 
-	network := fmt.Sprintf("pagination-test-%d", time.Now().UnixNano())
+	// chk_indexed_contracts_network (migration 0031, issue #252) restricts
+	// network to the known names, so rows are isolated by a unique
+	// contract_id prefix rather than by inventing a per-run network value.
+	const network = "testnet"
+	prefix := fmt.Sprintf("CPAGE%d", time.Now().UnixNano())
 	var ids []string
 	for i := 0; i < 3; i++ {
 		var id string
 		if err := pool.QueryRow(ctx,
 			`INSERT INTO indexed_contracts (contract_id, network) VALUES ($1, $2) RETURNING id`,
-			fmt.Sprintf("CCONTRACT%d", i), network,
+			fmt.Sprintf("%s_%d", prefix, i), network,
 		).Scan(&id); err != nil {
 			t.Fatalf("insert test contract %d: %v", i, err)
 		}
 		ids = append(ids, id)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(t.Context(), `DELETE FROM indexed_contracts WHERE network = $1`, network)
+		_, _ = pool.Exec(t.Context(), `DELETE FROM indexed_contracts WHERE contract_id LIKE $1`, prefix+"%")
 	})
 
 	cfg := handlers.ContractConfig{AdminKey: testContractsAdminKey, DB: pool}
@@ -73,20 +77,23 @@ func TestListContracts_PaginatesAllRowsExactlyOnce(t *testing.T) {
 	pool := connectRealTestDB(t)
 	ctx := t.Context()
 
-	network := fmt.Sprintf("pagination-walk-test-%d", time.Now().UnixNano())
+	// See the note above: network is constrained, so isolation comes from a
+	// unique contract_id prefix instead.
+	const network = "testnet"
+	prefix := fmt.Sprintf("CWALK%d", time.Now().UnixNano())
 	var ids []string
 	for i := 0; i < 5; i++ {
 		var id string
 		if err := pool.QueryRow(ctx,
 			`INSERT INTO indexed_contracts (contract_id, network) VALUES ($1, $2) RETURNING id`,
-			fmt.Sprintf("CWALK%d", i), network,
+			fmt.Sprintf("%s_%d", prefix, i), network,
 		).Scan(&id); err != nil {
 			t.Fatalf("insert test contract %d: %v", i, err)
 		}
 		ids = append(ids, id)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(t.Context(), `DELETE FROM indexed_contracts WHERE network = $1`, network)
+		_, _ = pool.Exec(t.Context(), `DELETE FROM indexed_contracts WHERE contract_id LIKE $1`, prefix+"%")
 	})
 
 	cfg := handlers.ContractConfig{AdminKey: testContractsAdminKey, DB: pool}
@@ -115,7 +122,9 @@ func TestListContracts_PaginatesAllRowsExactlyOnce(t *testing.T) {
 			t.Fatalf("page %d: decode: %v", page, err)
 		}
 		for _, c := range resp.Contracts {
-			if c.Network != nil && *c.Network == network {
+			// Match on the run's own contract_id prefix: network is a shared
+			// value now, so it no longer identifies this test's rows.
+			if strings.HasPrefix(c.ContractID, prefix) {
 				if seen[c.ID] {
 					t.Fatalf("page %d: id %s seen twice", page, c.ID)
 				}

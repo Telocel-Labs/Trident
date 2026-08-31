@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/middleware"
 )
 
 // TestCreateWebhookHandler_RejectsUnknownNetwork guards against issue #252:
@@ -39,6 +41,11 @@ func TestCreateWebhookHandler_RejectsUnknownNetwork(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks", body)
 	req.Header.Set("X-API-Key", apiKeyID)
 	req.Header.Set("Content-Type", "application/json")
+	// The handler resolves webhook ownership from the API key id in the
+	// request context, which middleware.APIKey puts there after a database
+	// lookup. This test invokes the handler directly, so it must supply the
+	// same value the middleware would.
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -84,6 +91,11 @@ func TestCreateWebhookHandler_AcceptsKnownNetwork(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks", body)
 	req.Header.Set("X-API-Key", apiKeyID)
 	req.Header.Set("Content-Type", "application/json")
+	// The handler resolves webhook ownership from the API key id in the
+	// request context, which middleware.APIKey puts there after a database
+	// lookup. This test invokes the handler directly, so it must supply the
+	// same value the middleware would.
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
