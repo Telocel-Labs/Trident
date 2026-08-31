@@ -31,7 +31,7 @@ func TestSideEffectingRoutesAreNotCached(t *testing.T) {
 	// silence go-redis' pool logger so a passing run stays readable.
 	redis.SetLogger(quietRedisLogger{})
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	bindings := routeBindings()
 

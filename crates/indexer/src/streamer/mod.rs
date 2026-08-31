@@ -2474,18 +2474,17 @@ mod tests {
         let ledger = 5_100_000u64;
         let page = events_page_for_contract(&contract_id, ledger, 2);
 
+        // Every getEvents call serves the same two-event page: the first
+        // poll fails on the locked table, and the retry once the outage
+        // clears must re-fetch those same events and persist them. A mock
+        // that served an empty page on the retry would prove nothing — the
+        // cursor would stay put and no rows would land, which is exactly
+        // the data loss this test exists to rule out.
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(rpc_ok(page))
-            .up_to_n_times(1)
             .mount(&server)
             .await;
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(rpc_ok(events_page(ledger, 0)))
-            .mount(&server)
-            .await;
-
         // A single-connection pool with statement_timeout fixed at connect
         // time (mirroring main.rs's after_connect setup, issue #249): with
         // only one connection, every query the streamer issues — whole-page
