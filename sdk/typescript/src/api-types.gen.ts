@@ -316,7 +316,11 @@ export interface paths {
         delete: operations["deleteApiKey"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Update an API key
+         * @description Update an API key's label and/or rate-limit tier (admin only). At least one of the two fields must be present. A tier change takes effect immediately — the shared tier cache is invalidated on success. Only active (non-revoked) keys can be updated.
+         */
+        patch: operations["updateApiKey"];
         trace?: never;
     };
     "/v1/admin/db": {
@@ -333,6 +337,254 @@ export interface paths {
         get: operations["getAdminDbStats"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/keys/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * API key usage report
+         * @description Per-key usage over a time window (admin only), aggregated from the audit log. Both `from` and `to` are required RFC 3339 timestamps; the window may not exceed 31 days. Unknown query parameters are rejected.
+         */
+        get: operations["getAdminKeyUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/contracts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List registered contracts
+         * @description Keyset-paginated list of contracts registered for indexing (admin only). `limit` outside 1..200 silently falls back to the default of 100; unknown query parameters are ignored.
+         */
+        get: operations["listAdminContracts"];
+        put?: never;
+        /**
+         * Register a contract for indexing
+         * @description Register (or re-register) a contract in the indexing allowlist (admin only). Upserts on (contract_id, network) — re-registering an existing contract updates its label and index_from and still returns 201.
+         */
+        post: operations["createAdminContract"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/contracts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unregister a contract
+         * @description Remove a contract registration by its registration ID (the `id` returned at registration, not the contract address). Idempotent — deleting a non-existent registration still returns 204.
+         */
+        delete: operations["deleteAdminContract"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/contracts/{id}/call": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Simulate a read-only contract call
+         * @description Simulate a contract function invocation via Soroban RPC and return the decoded result. Nothing is submitted to the network. Note the three success shapes: a simulation-level failure still returns HTTP 200 with `success: false` and `error` set; a result that cannot be decoded returns `success: true` with only `raw_xdr`.
+         */
+        post: operations["callContract"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List webhook subscriptions
+         * @description Webhook subscriptions owned by the calling API key. Includes each subscription's signing secret. Returns JSON null (not an empty array) when the key owns no subscriptions. Webhook endpoints are not yet part of the frozen v1 surface; some of their error responses are plain text rather than the canonical error envelope.
+         */
+        get: operations["listWebhooks"];
+        put?: never;
+        /**
+         * Create a webhook subscription
+         * @description Subscribe a target URL to events from a contract. Target URLs must be https, resolve publicly, and not point at private, loopback, link-local, or metadata addresses. The returned secret signs every delivery. Note the camelCase field names — webhook endpoints predate the snake_case convention and are not yet part of the frozen v1 surface.
+         */
+        post: operations["createWebhook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a webhook subscription
+         * @description Permanently delete a webhook subscription and stop its deliveries.
+         */
+        delete: operations["deleteWebhook"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/rotate-secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate a webhook signing secret
+         * @description Generate a new primary signing secret for the subscription, demoting the current one to secondary in the same statement so in-flight deliveries signed with the old secret still verify. Scoped to the caller's API key: rotating another tenant's subscription returns 404. Requires a database-backed API key; legacy env-hash authentication carries no key identity to scope ownership to.
+         */
+        post: operations["rotateWebhookSecret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Pause webhook deliveries
+         * @description Pause deliveries for a subscription. Returns the paused status even when the ID matches no subscription (no existence check).
+         */
+        patch: operations["pauseWebhook"];
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Resume webhook deliveries
+         * @description Resume deliveries for a paused subscription. Returns the resumed status even when the ID matches no subscription (no existence check).
+         */
+        patch: operations["resumeWebhook"];
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/deliveries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent webhook deliveries
+         * @description The 100 most recent delivery attempts for a subscription, newest first. Returns JSON null (not an empty array) when there are none.
+         */
+        get: operations["listWebhookDeliveries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/dead-letters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List dead-lettered deliveries
+         * @description Deliveries that exhausted their retries (status dead_lettered), up to 200, newest first. Always an array — empty when there are none.
+         */
+        get: operations["listWebhookDeadLetters"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/dead-letters/{deliveryId}/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replay a dead-lettered delivery
+         * @description Re-attempt one dead-lettered delivery and record the outcome. The response reports the replay result in snake_case (unlike the other webhook endpoints).
+         */
+        post: operations["replayWebhookDeadLetter"];
         delete?: never;
         options?: never;
         head?: never;
@@ -591,6 +843,20 @@ export interface components {
             /** @description Storage snapshot values (latest, or full history when queried via /storage/history) */
             values: components["schemas"]["ContractStorageValue"][];
         };
+        ContractStorageHistoryResponse: {
+            /** @description The contract whose storage history was queried */
+            contract_id: string;
+            /** @description Network the contract is indexed on */
+            network: string;
+            /** @description The storage key whose history was queried */
+            storage_key: string;
+            /** @description Storage history entries, oldest first */
+            values: components["schemas"]["ContractStorageValue"][];
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
+        };
         ContractStorageValue: {
             /** @description Base64-encoded XDR LedgerKey this value was read from */
             storage_key: string;
@@ -632,6 +898,10 @@ export interface components {
              * @description Timestamp when response was generated
              */
             generated_at: string;
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
         };
         ContractStats: {
             /** @description Soroban contract address */
@@ -698,6 +968,43 @@ export interface components {
             /** @description Opaque cursor for the next page (null if has_more is false). */
             next_cursor: string | null;
         };
+        AdminKeyUsageResponse: {
+            /** Format: uuid */
+            api_key_id: string;
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            /** Format: int64 */
+            total_requests: number;
+            /**
+             * Format: int64
+             * @description Requests with status code < 400
+             */
+            successful_requests: number;
+            /** @description Per-endpoint breakdown; empty when the window has no requests */
+            by_endpoint: components["schemas"]["EndpointUsage"][];
+        };
+        EndpointUsage: {
+            endpoint: string;
+            /** Format: int64 */
+            requests: number;
+            avg_duration_ms: number;
+        };
+        ContractRegistrationRequest: {
+            /** @description Contract address (C... strkey, 56 characters) */
+            contract_id: string;
+            /** @description Network scope; omitted or empty means all networks */
+            network?: string;
+            /** @description Human-readable label */
+            label?: string;
+            /**
+             * Format: int64
+             * @description Ledger sequence to start indexing from
+             * @default 0
+             */
+            index_from: number;
+        };
         ContractResponse: {
             /** Format: uuid */
             id: string;
@@ -712,6 +1019,99 @@ export interface components {
             index_from: number;
             /** Format: date-time */
             created_at: string;
+        };
+        ContractCallRequest: {
+            /** @description Contract function name to invoke */
+            function: string;
+            /** @description Base64-encoded XDR ScVal arguments, in order */
+            args?: string[];
+        };
+        ContractCallResponse: {
+            /** @description False when the simulation itself reported a failure (still HTTP 200) */
+            success: boolean;
+            /** @description Decoded return value; omitted when undecodable or failed */
+            result?: unknown;
+            /** @description Raw base64 XDR of the return value; omitted on failure */
+            raw_xdr?: string;
+            /** @description Simulation error message; present only when success=false */
+            error?: string;
+        };
+        WebhookSubscription: {
+            /** Format: uuid */
+            id: string;
+            /** @description Omitted when empty */
+            apiKeyId?: string;
+            contractId: string;
+            /** @description Topic filter; omitted when unfiltered */
+            topic0?: string | null;
+            targetUrl: string;
+            /** @description HMAC signing secret for deliveries; omitted when empty */
+            secret?: string;
+            /** Format: date-time */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description Present while deliveries are paused
+             */
+            pausedAt?: string | null;
+            network: string;
+        };
+        WebhookCreateRequest: {
+            contractId: string;
+            /** @description Optional topic filter */
+            topic0?: string | null;
+            /** @description Delivery target; must be https with a publicly resolvable, non-private host */
+            targetUrl: string;
+            /** @default testnet */
+            network: string;
+        };
+        WebhookCreateResponse: {
+            /** Format: uuid */
+            id: string;
+            /** @description HMAC signing secret — shown here and in the listing */
+            secret: string;
+            targetUrl: string;
+            contractId: string;
+            network: string;
+        };
+        WebhookDelivery: {
+            /** Format: int64 */
+            id: number;
+            /** Format: uuid */
+            subscriptionId: string;
+            eventId: string;
+            attempt: number;
+            attempts: number;
+            status: string;
+            /** @description HTTP status of the delivery attempt; omitted when none occurred */
+            statusCode?: number | null;
+            /** @description Omitted when empty */
+            responseBody?: string;
+            /** Format: date-time */
+            deliveredAt: string;
+            success: boolean;
+        };
+        WebhookRotateSecretResponse: {
+            /** Format: uuid */
+            id: string;
+            /** @description The new primary signing secret (whsec_ prefixed) */
+            secret: string;
+            /** @description The demoted secret, now serving as secondary during the overlap window */
+            previousSecret: string;
+        };
+        WebhookStatusResponse: {
+            /** @enum {string} */
+            status: "paused" | "resumed";
+        };
+        WebhookReplayResponse: {
+            success: boolean;
+            /** @enum {string} */
+            status: "success" | "failed";
+            attempt: number;
+            /** @description 0 when no HTTP response occurred */
+            status_code: number;
+            /** @description Truncated to 500 characters */
+            response_body: string;
         };
         ErrorResponse: {
             error: {
@@ -1175,6 +1575,10 @@ export interface operations {
             query: {
                 /** @description Storage key to fetch history for, as returned by the storage/spec endpoints */
                 key: string;
+                /** @description Maximum number of history entries to return */
+                limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path: {
@@ -1194,7 +1598,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ContractStorageResponse"];
+                    "application/json": components["schemas"]["ContractStorageHistoryResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1236,6 +1640,8 @@ export interface operations {
                 network?: "testnet" | "mainnet";
                 /** @description Number of top contracts to return */
                 limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -1371,6 +1777,69 @@ export interface operations {
             429: components["responses"]["TooManyRequestsIPOnly"];
         };
     };
+    updateApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description API key ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description New display label for the key */
+                    label?: string;
+                    /** @description New rate-limit tier name */
+                    rate_limit_tier?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The updated API key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIKeyResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Admin API key is not configured on the server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description API key not found (or already revoked) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     getAdminDbStats: {
         parameters: {
             query?: never;
@@ -1414,6 +1883,626 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getAdminKeyUsage: {
+        parameters: {
+            query: {
+                /** @description Window start (RFC 3339) */
+                from: string;
+                /** @description Window end (RFC 3339); must be >= from, window <= 31 days */
+                to: string;
+            };
+            header?: never;
+            path: {
+                /** @description API key ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage aggregates for the key over the window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminKeyUsageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Usage query failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listAdminContracts: {
+        parameters: {
+            query?: {
+                /** @description Page size */
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous page's next_cursor */
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of registered contracts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListContractsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Listing failed (including a malformed cursor) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createAdminContract: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContractRegistrationRequest"];
+            };
+        };
+        responses: {
+            /** @description Contract registered (created or updated) */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Registration failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteAdminContract: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Contract registration ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registration removed (or never existed) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Delete failed (including a malformed registration ID) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    callContract: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Contract address (C... strkey, 56 characters) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContractCallRequest"];
+            };
+        };
+        responses: {
+            /** @description Simulation completed (including simulation-level failures, which report success=false with an error message) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractCallResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Soroban RPC call failed or returned no result */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listWebhooks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Subscriptions owned by the calling key (null when none) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookSubscription"][] | null;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Listing failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Database unavailable (plain-text body) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    createWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WebhookCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Subscription created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookCreateResponse"];
+                };
+            };
+            /** @description Invalid body or target URL (plain-text body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Creation failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Database unavailable (plain-text body) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    deleteWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Subscription deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Subscription not found (plain-text body) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Delete failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    rotateWebhookSecret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Secret rotated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookRotateSecretResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description No subscription with this ID belongs to the caller's API key (plain-text body) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Rotation failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    pauseWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deliveries paused */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Update failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    resumeWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deliveries resumed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Update failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listWebhookDeliveries: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recent delivery attempts (null when none) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDelivery"][] | null;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Listing failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listWebhookDeadLetters: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dead-lettered delivery attempts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDelivery"][];
+                };
+            };
+            /** @description Missing webhook ID (plain-text body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Listing failed (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Database unavailable (plain-text body) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    replayWebhookDeadLetter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+                /** @description Numeric delivery ID from the dead-letters listing */
+                deliveryId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Replay attempted; success reflects the delivery outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookReplayResponse"];
+                };
+            };
+            /** @description Missing webhook or delivery ID (plain-text body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description No matching dead-lettered delivery (plain-text body) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Replay failed to record (plain-text body) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Database unavailable (plain-text body) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
                 };
             };
         };

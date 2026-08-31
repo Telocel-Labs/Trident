@@ -556,6 +556,19 @@ paths:
           schema:
             type: string
           description: Storage key to fetch history for, as returned by the storage/spec endpoints
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of history entries to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: Recorded changes for the requested storage key
@@ -569,7 +582,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ContractStorageResponse"
+                $ref: "#/components/schemas/ContractStorageHistoryResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -638,6 +651,11 @@ paths:
             maximum: 100
             default: 50
           description: Number of top contracts to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: >-
@@ -758,6 +776,73 @@ paths:
           $ref: "#/components/responses/TooManyRequestsIPOnly"
 
   /v1/api-keys/{id}:
+    patch:
+      summary: Update an API key
+      description: >-
+        Update an API key's label and/or rate-limit tier (admin only). At
+        least one of the two fields must be present. A tier change takes
+        effect immediately — the shared tier cache is invalidated on success.
+        Only active (non-revoked) keys can be updated.
+      operationId: updateApiKey
+      tags:
+        - API Keys
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: API key ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                label:
+                  type: string
+                  description: New display label for the key
+                rate_limit_tier:
+                  type: string
+                  description: New rate-limit tier name
+      responses:
+        "200":
+          description: The updated API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Admin API key is not configured on the server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: API key not found (or already revoked)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Request body exceeds the 1 MiB limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       summary: Delete an API key
       description: Revoke and delete an API key (admin only)
@@ -839,6 +924,660 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/admin/keys/{id}/usage:
+    get:
+      summary: API key usage report
+      description: >-
+        Per-key usage over a time window (admin only), aggregated from the
+        audit log. Both `from` and `to` are required RFC 3339 timestamps; the
+        window may not exceed 31 days. Unknown query parameters are rejected.
+      operationId: getAdminKeyUsage
+      tags:
+        - Admin
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: API key ID
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+          description: Window start (RFC 3339)
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+          description: Window end (RFC 3339); must be >= from, window <= 31 days
+      responses:
+        "200":
+          description: Usage aggregates for the key over the window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminKeyUsageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "500":
+          description: Usage query failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/admin/contracts:
+    post:
+      summary: Register a contract for indexing
+      description: >-
+        Register (or re-register) a contract in the indexing allowlist (admin
+        only). Upserts on (contract_id, network) — re-registering an existing
+        contract updates its label and index_from and still returns 201.
+      operationId: createAdminContract
+      tags:
+        - Admin
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContractRegistrationRequest"
+      responses:
+        "201":
+          description: Contract registered (created or updated)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Request body exceeds the 1 MiB limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "500":
+          description: Registration failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      summary: List registered contracts
+      description: >-
+        Keyset-paginated list of contracts registered for indexing (admin
+        only). `limit` outside 1..200 silently falls back to the default of
+        100; unknown query parameters are ignored.
+      operationId: listAdminContracts
+      tags:
+        - Admin
+      security:
+        - AdminKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 100
+          description: Page size
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque pagination cursor from a previous page's next_cursor
+      responses:
+        "200":
+          description: One page of registered contracts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListContractsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "500":
+          description: Listing failed (including a malformed cursor)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/admin/contracts/{id}:
+    delete:
+      summary: Unregister a contract
+      description: >-
+        Remove a contract registration by its registration ID (the `id`
+        returned at registration, not the contract address). Idempotent —
+        deleting a non-existent registration still returns 204.
+      operationId: deleteAdminContract
+      tags:
+        - Admin
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Contract registration ID
+      responses:
+        "204":
+          description: Registration removed (or never existed)
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "500":
+          description: Delete failed (including a malformed registration ID)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/contracts/{id}/call:
+    post:
+      summary: Simulate a read-only contract call
+      description: >-
+        Simulate a contract function invocation via Soroban RPC and return
+        the decoded result. Nothing is submitted to the network. Note the
+        three success shapes: a simulation-level failure still returns HTTP
+        200 with `success: false` and `error` set; a result that cannot be
+        decoded returns `success: true` with only `raw_xdr`.
+      operationId: callContract
+      tags:
+        - Contracts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Contract address (C... strkey, 56 characters)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContractCallRequest"
+      responses:
+        "200":
+          description: >-
+            Simulation completed (including simulation-level failures, which
+            report success=false with an error message)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractCallResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Request body exceeds the 1 MiB limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "502":
+          description: Soroban RPC call failed or returned no result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/webhooks:
+    get:
+      summary: List webhook subscriptions
+      description: >-
+        Webhook subscriptions owned by the calling API key. Includes each
+        subscription's signing secret. Returns JSON null (not an empty
+        array) when the key owns no subscriptions. Webhook endpoints are not
+        yet part of the frozen v1 surface; some of their error responses are
+        plain text rather than the canonical error envelope.
+      operationId: listWebhooks
+      tags:
+        - Webhooks
+      responses:
+        "200":
+          description: Subscriptions owned by the calling key (null when none)
+          content:
+            application/json:
+              schema:
+                type: array
+                nullable: true
+                items:
+                  $ref: "#/components/schemas/WebhookSubscription"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Listing failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          description: Database unavailable (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+    post:
+      summary: Create a webhook subscription
+      description: >-
+        Subscribe a target URL to events from a contract. Target URLs must
+        be https, resolve publicly, and not point at private, loopback,
+        link-local, or metadata addresses. The returned secret signs every
+        delivery. Note the camelCase field names — webhook endpoints predate
+        the snake_case convention and are not yet part of the frozen v1
+        surface.
+      operationId: createWebhook
+      tags:
+        - Webhooks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookCreateRequest"
+      responses:
+        "201":
+          description: Subscription created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookCreateResponse"
+        "400":
+          description: Invalid body or target URL (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Request body exceeds the 1 MiB limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Creation failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          description: Database unavailable (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/webhooks/{id}:
+    delete:
+      summary: Delete a webhook subscription
+      description: >-
+        Permanently delete a webhook subscription and stop its deliveries.
+      operationId: deleteWebhook
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Subscription ID
+      responses:
+        "204":
+          description: Subscription deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Subscription not found (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Delete failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/webhooks/{id}/rotate-secret:
+    post:
+      summary: Rotate a webhook signing secret
+      description: >-
+        Generate a new primary signing secret for the subscription, demoting
+        the current one to secondary in the same statement so in-flight
+        deliveries signed with the old secret still verify. Scoped to the
+        caller's API key: rotating another tenant's subscription returns 404.
+        Requires a database-backed API key; legacy env-hash authentication
+        carries no key identity to scope ownership to.
+      operationId: rotateWebhookSecret
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Subscription ID
+      responses:
+        "200":
+          description: Secret rotated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookRotateSecretResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: >-
+            No subscription with this ID belongs to the caller's API key
+            (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Rotation failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/webhooks/{id}/pause:
+    patch:
+      summary: Pause webhook deliveries
+      description: >-
+        Pause deliveries for a subscription. Returns the paused status even
+        when the ID matches no subscription (no existence check).
+      operationId: pauseWebhook
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Subscription ID
+      responses:
+        "200":
+          description: Deliveries paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookStatusResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Update failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/webhooks/{id}/resume:
+    patch:
+      summary: Resume webhook deliveries
+      description: >-
+        Resume deliveries for a paused subscription. Returns the resumed
+        status even when the ID matches no subscription (no existence
+        check).
+      operationId: resumeWebhook
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Subscription ID
+      responses:
+        "200":
+          description: Deliveries resumed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookStatusResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Update failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/webhooks/{id}/deliveries:
+    get:
+      summary: List recent webhook deliveries
+      description: >-
+        The 100 most recent delivery attempts for a subscription, newest
+        first. Returns JSON null (not an empty array) when there are none.
+      operationId: listWebhookDeliveries
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Subscription ID
+      responses:
+        "200":
+          description: Recent delivery attempts (null when none)
+          content:
+            application/json:
+              schema:
+                type: array
+                nullable: true
+                items:
+                  $ref: "#/components/schemas/WebhookDelivery"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Listing failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/webhooks/{id}/dead-letters:
+    get:
+      summary: List dead-lettered deliveries
+      description: >-
+        Deliveries that exhausted their retries (status dead_lettered), up
+        to 200, newest first. Always an array — empty when there are none.
+      operationId: listWebhookDeadLetters
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Subscription ID
+      responses:
+        "200":
+          description: Dead-lettered delivery attempts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WebhookDelivery"
+        "400":
+          description: Missing webhook ID (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Listing failed (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          description: Database unavailable (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/webhooks/{id}/dead-letters/{deliveryId}/replay:
+    post:
+      summary: Replay a dead-lettered delivery
+      description: >-
+        Re-attempt one dead-lettered delivery and record the outcome. The
+        response reports the replay result in snake_case (unlike the other
+        webhook endpoints).
+      operationId: replayWebhookDeadLetter
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Subscription ID
+        - name: deliveryId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Numeric delivery ID from the dead-letters listing
+      responses:
+        "200":
+          description: Replay attempted; success reflects the delivery outcome
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookReplayResponse"
+        "400":
+          description: Missing webhook or delivery ID (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No matching dead-lettered delivery (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          description: Replay failed to record (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          description: Database unavailable (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
 
   /metrics:
     get:
@@ -1258,6 +1997,37 @@ components:
             $ref: "#/components/schemas/ContractStorageValue"
           description: Storage snapshot values (latest, or full history when queried via /storage/history)
 
+    ContractStorageHistoryResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - storage_key
+        - values
+        - has_more
+      properties:
+        contract_id:
+          type: string
+          description: The contract whose storage history was queried
+        network:
+          type: string
+          description: Network the contract is indexed on
+        storage_key:
+          type: string
+          description: The storage key whose history was queried
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractStorageValue"
+          description: Storage history entries, oldest first
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
+
     ContractStorageValue:
       type: object
       additionalProperties: false
@@ -1293,6 +2063,7 @@ components:
         - to_ledger
         - network
         - generated_at
+        - has_more
       properties:
         contracts:
           type: array
@@ -1315,6 +2086,13 @@ components:
           type: string
           format: date-time
           description: Timestamp when response was generated
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
 
     ContractStats:
       type: object
@@ -1457,6 +2235,73 @@ components:
           nullable: true
           description: Opaque cursor for the next page (null if has_more is false).
 
+    AdminKeyUsageResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - api_key_id
+        - from
+        - to
+        - total_requests
+        - successful_requests
+        - by_endpoint
+      properties:
+        api_key_id:
+          type: string
+          format: uuid
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        total_requests:
+          type: integer
+          format: int64
+        successful_requests:
+          type: integer
+          format: int64
+          description: Requests with status code < 400
+        by_endpoint:
+          type: array
+          description: Per-endpoint breakdown; empty when the window has no requests
+          items:
+            $ref: "#/components/schemas/EndpointUsage"
+    EndpointUsage:
+      type: object
+      additionalProperties: false
+      required:
+        - endpoint
+        - requests
+        - avg_duration_ms
+      properties:
+        endpoint:
+          type: string
+        requests:
+          type: integer
+          format: int64
+        avg_duration_ms:
+          type: number
+    ContractRegistrationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - contract_id
+      properties:
+        contract_id:
+          type: string
+          description: Contract address (C... strkey, 56 characters)
+        network:
+          type: string
+          description: Network scope; omitted or empty means all networks
+        label:
+          type: string
+          description: Human-readable label
+        index_from:
+          type: integer
+          format: int64
+          default: 0
+          description: Ledger sequence to start indexing from
     ContractResponse:
       type: object
       additionalProperties: false
@@ -1486,6 +2331,214 @@ components:
           type: string
           format: date-time
 
+    ContractCallRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - function
+      properties:
+        function:
+          type: string
+          description: Contract function name to invoke
+        args:
+          type: array
+          maxItems: 32
+          description: Base64-encoded XDR ScVal arguments, in order
+          items:
+            type: string
+    ContractCallResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          description: >-
+            False when the simulation itself reported a failure (still HTTP
+            200)
+        result:
+          description: Decoded return value; omitted when undecodable or failed
+        raw_xdr:
+          type: string
+          description: Raw base64 XDR of the return value; omitted on failure
+        error:
+          type: string
+          description: Simulation error message; present only when success=false
+    WebhookSubscription:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - contractId
+        - targetUrl
+        - createdAt
+        - network
+      properties:
+        id:
+          type: string
+          format: uuid
+        apiKeyId:
+          type: string
+          description: Omitted when empty
+        contractId:
+          type: string
+        topic0:
+          type: string
+          nullable: true
+          description: Topic filter; omitted when unfiltered
+        targetUrl:
+          type: string
+        secret:
+          type: string
+          description: HMAC signing secret for deliveries; omitted when empty
+        createdAt:
+          type: string
+          format: date-time
+        pausedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Present while deliveries are paused
+        network:
+          type: string
+    WebhookCreateRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - contractId
+        - targetUrl
+      properties:
+        contractId:
+          type: string
+        topic0:
+          type: string
+          nullable: true
+          description: Optional topic filter
+        targetUrl:
+          type: string
+          description: >-
+            Delivery target; must be https with a publicly resolvable,
+            non-private host
+        network:
+          type: string
+          default: testnet
+    WebhookCreateResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - secret
+        - targetUrl
+        - contractId
+        - network
+      properties:
+        id:
+          type: string
+          format: uuid
+        secret:
+          type: string
+          description: HMAC signing secret — shown here and in the listing
+        targetUrl:
+          type: string
+        contractId:
+          type: string
+        network:
+          type: string
+    WebhookDelivery:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - subscriptionId
+        - eventId
+        - attempt
+        - attempts
+        - status
+        - deliveredAt
+        - success
+      properties:
+        id:
+          type: integer
+          format: int64
+        subscriptionId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+        attempt:
+          type: integer
+        attempts:
+          type: integer
+        status:
+          type: string
+        statusCode:
+          type: integer
+          nullable: true
+          description: HTTP status of the delivery attempt; omitted when none occurred
+        responseBody:
+          type: string
+          description: Omitted when empty
+        deliveredAt:
+          type: string
+          format: date-time
+        success:
+          type: boolean
+    WebhookRotateSecretResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - secret
+        - previousSecret
+      properties:
+        id:
+          type: string
+          format: uuid
+        secret:
+          type: string
+          description: The new primary signing secret (whsec_ prefixed)
+        previousSecret:
+          type: string
+          description: >-
+            The demoted secret, now serving as secondary during the overlap
+            window
+    WebhookStatusResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - paused
+            - resumed
+    WebhookReplayResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - success
+        - status
+        - attempt
+        - status_code
+        - response_body
+      properties:
+        success:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - success
+            - failed
+        attempt:
+          type: integer
+        status_code:
+          type: integer
+          description: 0 when no HTTP response occurred
+        response_body:
+          type: string
+          description: Truncated to 500 characters
     ErrorResponse:
       type: object
       additionalProperties: false
@@ -1697,3 +2750,7 @@ tags:
     description: Admin endpoints
   - name: Metrics
     description: Monitoring and metrics
+  - name: Contracts
+    description: Contract schema, spec, storage, and simulation endpoints
+  - name: Webhooks
+    description: Webhook subscriptions and delivery management (not yet part of the frozen v1 surface)

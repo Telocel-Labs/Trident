@@ -144,12 +144,11 @@ struct GetLedgersResult {
 /// `getLatestLedger` takes no parameters, but the JSON-RPC envelope this client
 /// builds always serialises a `params` member.
 ///
-/// Test-gated alongside [`RpcClient::get_latest_ledger`], its only caller.
-#[cfg(test)]
+/// Wire types for [`RpcClient::get_latest_ledger`] (un-gated with it for the
+/// reconciliation loop, issue #511).
 #[derive(Serialize)]
 struct EmptyParams {}
 
-#[cfg(test)]
 #[derive(Deserialize)]
 struct GetLatestLedgerResult {
     sequence: u64,
@@ -516,12 +515,13 @@ impl RpcClient {
     /// a caller who does not yet know the tip cannot supply. This method has no
     /// such precondition.
     ///
-    /// Test-gated: the poll loop learns the tip from the `getEvents` responses
-    /// it already makes, so the running indexer has no reason to spend an extra
-    /// round trip on it. Only the testnet correctness suite (issue #419), which
-    /// must choose a ledger window before it can request anything, needs it.
-    /// Remove the gate if a production caller ever appears.
-    #[cfg(test)]
+    /// The poll loop learns the tip from the `getEvents` responses it already
+    /// makes, so it never calls this. The testnet correctness suite (issue
+    /// #419) and the reconciliation loop (issue #511) both need to choose a
+    /// settled ledger window before they can request anything, which is
+    /// exactly the case this method exists for. (Previously `#[cfg(test)]`
+    /// with a note to remove the gate when a production caller appeared —
+    /// the reconciler is that caller.)
     pub async fn get_latest_ledger(&self) -> Result<u64, TridentError> {
         let result: GetLatestLedgerResult = self
             .call("getLatestLedger", 3, EmptyParams {}, "getLatestLedger")

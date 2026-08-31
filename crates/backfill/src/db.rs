@@ -81,7 +81,7 @@ pub async fn complete_job(pool: &PgPool, id: Uuid) -> Result<(), TridentError> {
 /// Mark a claimed job `failed` with a reason (issue #216). Left for an
 /// operator to inspect and re-enqueue rather than auto-retried: a partially
 /// applied range is not necessarily safe to blindly re-run (see the
-/// `idx_backfill_jobs_stale` comment in migration 0031).
+/// `idx_backfill_jobs_stale` comment in migration 0032).
 pub async fn fail_job(pool: &PgPool, id: Uuid, error: &str) -> Result<(), TridentError> {
     sqlx::query(
         "UPDATE backfill_jobs SET status = 'failed', completed_at = NOW(), error = $2 WHERE id = $1",

@@ -11,13 +11,18 @@
 //! - Returning `TridentError::ParseError` for any input that cannot be decoded so
 //!   the caller (Streamer) can decide whether to skip or halt.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value as Json;
-use stellar_strkey::{ed25519, Contract};
-use stellar_xdr::curr::{
-    AccountId, ContractId, Limited, Limits, PublicKey, ReadXdr, ScAddress, ScVal,
-};
+use stellar_xdr::curr::ScVal;
 use trident_common::{EventType, SorobanEvent, TridentError};
+
+// ScVal decoding moved to the shared crate so the live parser and the
+// backfill re-ingest path can never render the same XDR differently
+// (issue #506). Re-exported here so in-crate callers and the existing test
+// suite — including the proptest fuzz pass CI runs at PROPTEST_CASES=50000 —
+// keep addressing them through `crate::parser::*`.
+pub use trident_common::scval::{
+    decode_scval, scaddress_to_string, scval_to_json, scval_to_string,
+};
 
 use crate::rpc::RawEvent;
 
@@ -205,267 +210,6 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
         other => Err(TridentError::parse(anyhow::anyhow!(
             "unknown event type: {other}"
         ))),
-    }
-}
-
-/// Render a 256-bit unsigned value, supplied as four 64-bit limbs
-/// (most-significant first), as a decimal string.
-///
-/// Rust has no u256, and the previous implementation packed all four limbs
-/// into a u128 with 32-bit shifts — which both truncated the top half and
-/// mis-positioned the rest, so any value above 2^128 decoded to a
-/// plausible-looking but wrong number. Long multiplication over decimal
-/// digits avoids needing a big-integer dependency for the one place we need
-/// this (issue #415).
-fn u256_limbs_to_decimal(limbs: [u64; 4]) -> String {
-    // digits holds the running value, least-significant decimal digit first.
-    let mut digits: Vec<u8> = vec![0];
-    for limb in limbs {
-        // value = value * 2^64 + limb, done as two steps over base-10 digits.
-        for _ in 0..64 {
-            let mut carry = 0u8;
-            for d in digits.iter_mut() {
-                let doubled = *d * 2 + carry;
-                *d = doubled % 10;
-                carry = doubled / 10;
-            }
-            if carry > 0 {
-                digits.push(carry);
-            }
-        }
-        let mut carry = limb as u128;
-        let mut i = 0;
-        while carry > 0 || i < digits.len() {
-            if i == digits.len() {
-                digits.push(0);
-            }
-            let sum = digits[i] as u128 + (carry % 10);
-            digits[i] = (sum % 10) as u8;
-            carry = carry / 10 + sum / 10;
-            i += 1;
-        }
-    }
-    while digits.len() > 1 && *digits.last().unwrap() == 0 {
-        digits.pop();
-    }
-    digits.iter().rev().map(|d| (b'0' + d) as char).collect()
-}
-
-/// Render a 256-bit signed value from its limbs. `hi_hi` is the signed
-/// most-significant limb; negatives are two's complement across all 256 bits,
-/// so they are negated into the unsigned domain and printed with a sign.
-fn i256_limbs_to_decimal(hi_hi: i64, hi_lo: u64, lo_hi: u64, lo_lo: u64) -> String {
-    if hi_hi >= 0 {
-        return u256_limbs_to_decimal([hi_hi as u64, hi_lo, lo_hi, lo_lo]);
-    }
-    // Two's complement negate: invert all limbs, then add one with carry.
-    let mut limbs = [!(hi_hi as u64), !hi_lo, !lo_hi, !lo_lo];
-    for limb in limbs.iter_mut().rev() {
-        let (next, overflow) = limb.overflowing_add(1);
-        *limb = next;
-        if !overflow {
-            break;
-        }
-    }
-    format!("-{}", u256_limbs_to_decimal(limbs))
-}
-
-pub fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
-    let bytes = STANDARD
-        .decode(b64)
-        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("base64 decode")))?;
-    let mut cursor = std::io::Cursor::new(bytes);
-    ScVal::read_xdr(&mut Limited::new(&mut cursor, Limits::none()))
-        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("XDR decode ScVal")))
-}
-
-/// Convert a topic `ScVal` to a compact string representation.
-pub fn scval_to_string(val: &ScVal) -> String {
-    match val {
-        ScVal::Symbol(s) => s.to_utf8_string_lossy(),
-        ScVal::String(s) => s.to_utf8_string_lossy(),
-        ScVal::Bool(b) => b.to_string(),
-        ScVal::Void => "void".into(),
-        ScVal::U32(n) => n.to_string(),
-        ScVal::I32(n) => n.to_string(),
-        ScVal::U64(n) => n.to_string(),
-        ScVal::I64(n) => n.to_string(),
-        ScVal::U128(parts) => {
-            let val = ((parts.hi as u128) << 64) | (parts.lo as u128);
-            val.to_string()
-        }
-        ScVal::I128(parts) => {
-            let val = ((parts.hi as i128) << 64) | (parts.lo as i128);
-            val.to_string()
-        }
-        ScVal::U256(parts) => {
-            u256_limbs_to_decimal([parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo])
-        }
-        ScVal::I256(parts) => {
-            i256_limbs_to_decimal(parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo)
-        }
-        ScVal::Bytes(b) => hex::encode(b.as_slice()),
-        ScVal::Address(addr) => scaddress_to_string(addr),
-        // Timepoint and Duration are u64 newtypes; without these arms they fell
-        // through to the debug catch-all and rendered as "Timepoint(1700000000)"
-        // rather than a usable value, while also tripping the
-        // unhandled-variant metric on well-understood types (issue #415).
-        ScVal::Timepoint(t) => t.0.to_string(),
-        ScVal::Duration(d) => d.0.to_string(),
-        // A contract error in topic/data position. Rendered via Debug
-        // deliberately: the variant carries a code whose meaning is
-        // contract-defined, so there is no stable scalar to project it to.
-        ScVal::Error(e) => format!("{e:?}"),
-        ScVal::Vec(Some(items)) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(scval_to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        ScVal::Vec(None) => "Vec(None)".to_string(),
-        ScVal::Map(Some(entries)) => format!(
-            "{{{}}}",
-            entries
-                .iter()
-                .map(|e| format!("{}:{}", scval_to_string(&e.key), scval_to_string(&e.val)))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        ScVal::Map(None) => "Map(None)".to_string(),
-        // Complex host-object types (issue #209). These carry structured data
-        // rather than a single scalar, so the compact string form names the
-        // variant with just enough of its payload to be useful in a topic
-        // string; the full structure is only available via scval_to_json.
-        ScVal::ContractInstance(inst) => match &inst.executable {
-            stellar_xdr::curr::ContractExecutable::Wasm(hash) => {
-                format!("contract_instance(wasm:{})", hex::encode(hash.0))
-            }
-            stellar_xdr::curr::ContractExecutable::StellarAsset => {
-                "contract_instance(stellar_asset)".to_string()
-            }
-        },
-        ScVal::LedgerKeyContractInstance => "ledger_key_contract_instance".to_string(),
-        ScVal::LedgerKeyNonce(nonce) => nonce.nonce.to_string(),
-    }
-}
-
-/// Recursively convert a `ScVal` to a `serde_json::Value` for the event body.
-pub fn scval_to_json(val: &ScVal) -> Json {
-    match val {
-        ScVal::Void => Json::Null,
-        ScVal::Bool(b) => Json::Bool(*b),
-        ScVal::Symbol(s) => Json::String(s.to_utf8_string_lossy()),
-        ScVal::String(s) => Json::String(s.to_utf8_string_lossy()),
-        ScVal::U32(n) => Json::from(*n),
-        ScVal::I32(n) => Json::from(*n),
-        ScVal::U64(n) => Json::from(*n),
-        ScVal::I64(n) => Json::from(*n),
-        ScVal::U128(parts) => {
-            let v = ((parts.hi as u128) << 64) | (parts.lo as u128);
-            // Use string for values that overflow JSON's safe integer range
-            if v <= u64::MAX as u128 {
-                Json::from(v as u64)
-            } else {
-                Json::String(v.to_string())
-            }
-        }
-        ScVal::I128(parts) => {
-            let v = ((parts.hi as i128) << 64) | (parts.lo as i128);
-            if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
-                Json::from(v as i64)
-            } else {
-                Json::String(v.to_string())
-            }
-        }
-        ScVal::U256(parts) => Json::String(u256_limbs_to_decimal([
-            parts.hi_hi,
-            parts.hi_lo,
-            parts.lo_hi,
-            parts.lo_lo,
-        ])),
-        ScVal::I256(parts) => Json::String(i256_limbs_to_decimal(
-            parts.hi_hi,
-            parts.hi_lo,
-            parts.lo_hi,
-            parts.lo_lo,
-        )),
-        ScVal::Bytes(b) => Json::String(hex::encode(b.as_slice())),
-        ScVal::Address(addr) => Json::String(scaddress_to_string(addr)),
-        // u64-valued, so emitted as strings for the same reason U64/I64 are:
-        // values above 2^53 do not survive a JSON number round-trip through a
-        // JavaScript consumer (issue #415).
-        ScVal::Timepoint(t) => Json::String(t.0.to_string()),
-        ScVal::Duration(d) => Json::String(d.0.to_string()),
-        ScVal::Error(e) => Json::String(format!("{e:?}")),
-        ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
-        ScVal::Vec(None) => Json::Array(vec![]),
-        ScVal::Map(Some(entries)) => scmap_to_json(entries),
-        ScVal::Map(None) => Json::Object(serde_json::Map::new()),
-        // Complex host-object types (issue #209). `ContractInstance` is the
-        // full data behind a contract's ledger entry — which Wasm it runs (or
-        // that it's a built-in Stellar Asset Contract) plus its persistent
-        // instance storage — so it is projected as a structured object rather
-        // than collapsed to a debug string. The two ledger-key marker variants
-        // (`LedgerKeyContractInstance`/`LedgerKeyNonce`) never carry a
-        // contract-defined payload — they exist to select a ledger entry by
-        // key, not to hold data — so their JSON shape is a fixed, documented
-        // one rather than something contract-specific.
-        ScVal::ContractInstance(inst) => {
-            let executable = match &inst.executable {
-                stellar_xdr::curr::ContractExecutable::Wasm(hash) => {
-                    let mut m = serde_json::Map::new();
-                    m.insert("type".into(), Json::String("wasm".into()));
-                    m.insert("wasm_hash".into(), Json::String(hex::encode(hash.0)));
-                    Json::Object(m)
-                }
-                stellar_xdr::curr::ContractExecutable::StellarAsset => {
-                    let mut m = serde_json::Map::new();
-                    m.insert("type".into(), Json::String("stellar_asset".into()));
-                    Json::Object(m)
-                }
-            };
-            let storage = match &inst.storage {
-                Some(entries) => scmap_to_json(entries),
-                None => Json::Null,
-            };
-            let mut obj = serde_json::Map::new();
-            obj.insert("executable".into(), executable);
-            obj.insert("storage".into(), storage);
-            Json::Object(obj)
-        }
-        ScVal::LedgerKeyContractInstance => Json::String("ledger_key_contract_instance".into()),
-        ScVal::LedgerKeyNonce(nonce) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("nonce".into(), Json::String(nonce.nonce.to_string()));
-            Json::Object(obj)
-        }
-    }
-}
-
-/// Convert a decoded `ScMap` to a JSON object. Shared by `ScVal::Map` and
-/// `ScVal::ContractInstance`'s `storage` field, which is the same underlying
-/// type (issue #209).
-fn scmap_to_json(entries: &stellar_xdr::curr::ScMap) -> Json {
-    let obj: serde_json::Map<String, Json> = entries
-        .iter()
-        .map(|e| (scval_to_string(&e.key), scval_to_json(&e.val)))
-        .collect();
-    Json::Object(obj)
-}
-
-pub(crate) fn scaddress_to_string(addr: &ScAddress) -> String {
-    match addr {
-        ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(bytes))) => {
-            // stellar-strkey 0.0.16+ returns heapless::String — convert to std::String
-            ed25519::PublicKey(bytes.0).to_string().as_str().to_owned()
-        }
-        // stellar-xdr 26.x wraps the hash in ContractId; the inner Hash holds [u8; 32]
-        ScAddress::Contract(ContractId(hash)) => Contract(hash.0).to_string().as_str().to_owned(),
-        // stellar-xdr 26.x added MuxedAccount, ClaimableBalance, LiquidityPool variants;
-        // these do not appear in Soroban contract events but the match must be exhaustive.
-        other => format!("{other:?}"),
     }
 }
 
@@ -1224,7 +968,17 @@ mod tests {
 
     #[test]
     fn scval_to_string_vec_none() {
+        // An ABSENT vec renders as the explicit "Vec(None)" marker (#209's
+        // documented shape) — distinct from "[]", which is a present-but-
+        // empty vec. The distinction survived the move to the shared decoder
+        // (issue #506).
         assert_eq!(scval_to_string(&ScVal::Vec(None)), "Vec(None)");
+        assert_eq!(
+            scval_to_string(&ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                vec![].try_into().unwrap()
+            )))),
+            "[]"
+        );
     }
 
     #[test]
@@ -1811,6 +1565,29 @@ mod tests {
             )
     }
 
+    // Hostile-input fuzzing (issue #507): truncation, trailing bytes, lying
+    // length prefixes, and hostile nesting depth. The parser consumes
+    // untrusted network data, so malformed input must yield a handled error
+    // — never a panic, a stack overflow, or an unbounded allocation. These
+    // run in the same parser::tests:: pass CI re-executes with
+    // PROPTEST_CASES=50000 (.github/workflows/ci.yml, rust job).
+    // -----------------------------------------------------------------------
+
+    /// Wire bytes for a Vec nested `depth` levels around a U32, built
+    /// directly as bytes: encoding a deep value through the XDR writer
+    /// would recurse just as deep, so hostile depths must be synthesized.
+    fn nested_vec_wire(depth: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..depth {
+            out.extend_from_slice(&16u32.to_be_bytes()); // ScValType::Vec
+            out.extend_from_slice(&1u32.to_be_bytes()); // Option: Some
+            out.extend_from_slice(&1u32.to_be_bytes()); // one element
+        }
+        out.extend_from_slice(&3u32.to_be_bytes()); // ScValType::U32
+        out.extend_from_slice(&7u32.to_be_bytes());
+        out
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
 
@@ -1831,6 +1608,74 @@ mod tests {
         fn parse_event_with_projection_never_panics_index_diagnostic_false(raw in arb_raw_event()) {
             let parser = Parser::new(false);
             let _ = parser.parse_event_with_projection(&raw);
+        }
+
+        #[test]
+        fn truncated_valid_xdr_is_a_handled_error(b64 in arb_scval_b64(), cut in any::<prop::sample::Index>()) {
+            let bytes = STANDARD.decode(&b64).expect("generator emits valid base64");
+            // Every strict prefix of a valid encoding is incomplete: XDR is
+            // self-delimiting, so the decoder must error — and must not panic.
+            let cut = cut.index(bytes.len().max(1));
+            if cut < bytes.len() {
+                let truncated = STANDARD.encode(&bytes[..cut]);
+                prop_assert!(decode_scval(&truncated).is_err(),
+                    "strict prefix of a valid encoding decoded successfully");
+            }
+        }
+
+        #[test]
+        fn trailing_garbage_after_a_valid_value_is_rejected(
+            b64 in arb_scval_b64(),
+            extra in proptest::collection::vec(any::<u8>(), 1..32),
+        ) {
+            let mut bytes = STANDARD.decode(&b64).expect("generator emits valid base64");
+            bytes.extend(extra);
+            prop_assert!(decode_scval(&STANDARD.encode(&bytes)).is_err(),
+                "value followed by trailing bytes must be rejected");
+        }
+
+        #[test]
+        fn arbitrary_nesting_depth_never_panics(depth in 1u32..300) {
+            // Below the budget this decodes and renders; above it, a handled
+            // error. Either way the process survives — without the depth
+            // limit a deep payload overflows the stack, which is a SIGABRT,
+            // not an Err. The boundary assertions pin the budget in
+            // CONTAINER LEVELS: everything the Soroban host can legally emit
+            // (<= 100 levels, DEFAULT_HOST_DEPTH_LIMIT) must decode; each
+            // Vec level costs ~4 reader frames against MAX_SCVAL_DEPTH=500,
+            // so failures may only start well past the host limit.
+            let b64 = STANDARD.encode(nested_vec_wire(depth));
+            match decode_scval(&b64) {
+                Ok(val) => {
+                    let _ = scval_to_string(&val);
+                    let _ = scval_to_json(&val);
+                }
+                Err(_) => {
+                    prop_assert!(
+                        depth > 100,
+                        "host-legal nesting must decode, failed at depth {depth}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn deep_nesting_beyond_the_budget_is_rejected(depth in 200u32..2000) {
+            let b64 = STANDARD.encode(nested_vec_wire(depth));
+            prop_assert!(decode_scval(&b64).is_err(),
+                "nesting past MAX_SCVAL_DEPTH must be a handled error");
+        }
+
+        #[test]
+        fn lying_collection_length_prefix_never_panics(claim in any::<u32>(), tag in 0u32..24) {
+            // A collection/bytes discriminant followed by an arbitrary length
+            // claim and almost no real data: the reader's byte budget is the
+            // input length, so the claim cannot drive allocation or scanning
+            // past the payload.
+            let mut wire = tag.to_be_bytes().to_vec();
+            wire.extend_from_slice(&claim.to_be_bytes());
+            wire.extend_from_slice(&[0xAA; 8]);
+            let _ = decode_scval(&STANDARD.encode(&wire));
         }
     }
 

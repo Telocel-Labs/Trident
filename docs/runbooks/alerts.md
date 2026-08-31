@@ -117,6 +117,80 @@ malformed events.
 3. If it's a new, valid event shape, this is a parser bug — file/fix rather
    than treating it as transient.
 
+## TridentIndexerUnexpectedScValVariant
+
+**Means:** an event payload contained an ScVal variant that no well-behaved
+contract emits — `ContractInstance`, `LedgerKeyContractInstance`, or
+`LedgerKeyNonce`. The decoder (issue #506) stored the value faithfully as a
+tagged JSON object; nothing was lost or coerced, but the traffic is
+anomalous.
+
+**Why this threshold:** any occurrence at all is worth a look — these
+variants exist for ledger entries, not event payloads, so a contract putting
+them into events is at best confused and at worst probing the decoder. `> 0
+over 1h, for 5m` surfaces every occurrence without flapping on a single
+scrape.
+
+Note this alert cannot fire for *unknown* variants: the decoder matches the
+`ScVal` enum exhaustively with no fallback arm, so a variant added by an XDR
+upgrade fails compilation instead of reaching production.
+
+**First steps:**
+1. Find the warn-level `decoded an ScVal variant that should not appear in
+   event payloads` log lines — they name the variant and decode context.
+2. Identify the emitting contract from the surrounding event logs and review
+   what it publishes.
+3. If a legitimate new use appears for one of these variants in event
+   payloads, decide its first-class rendering and demote it from the
+   anomalous set.
+## TridentIndexerReconciliationMismatch
+
+**Means:** the reconciliation loop (issue #511) re-fetched a settled ledger
+window from `getEvents` - applying the ingest pipeline's own filter and skip
+rules - and the per-ledger event counts disagree with what the database
+holds (`soroban_events` plus `parse_errors`). Some ledgers are
+under-indexed (missing events) or over-indexed (extra events).
+
+**Why this threshold:** any disagreement at all means the indexed data is
+wrong for those ledgers; the gauge is refreshed every pass (default 10
+minutes), so `for: 15m` means at least two consecutive passes agreed on the
+disagreement. Warning rather than critical while the detector is new;
+ratchet to critical once it has run clean on testnet for a while.
+
+**First steps:**
+1. Find the `Reconciliation discrepancy` warn logs - they name each ledger
+   range with the RPC and database counts
+   (`trident_indexer_reconcile_missing_events_total` vs
+   `_extra_events_total` says which direction).
+2. For missing events, re-ingest the reported ranges:
+   `trident-backfill --from-ledger <from> --to-ledger <to>` (idempotent).
+   Use `--dry-run` first to preview counts for any range on demand.
+3. If the discrepancy reappears on later passes for NEW ranges, the ingest
+   pipeline is dropping events right now - check parse-error rates, RPC
+   health, and recent deploys before backfilling further.
+4. Extra events (indexed rows the chain does not report) usually mean a
+   backfill wrote rows outside the allowlist rules or a duplicate-index bug
+   - inspect the rows in the reported range before deleting anything.
+
+## TridentIndexerReconciliationFailing
+
+**Means:** the reconciliation loop keeps aborting before producing a report
+- `getLatestLedger`/`getEvents` failures, or database errors during the
+count queries.
+
+**Why this threshold:** a single failed pass self-heals next interval; more
+than two failures inside 30 minutes, sustained for 30 minutes, means the
+loop has effectively stopped verifying. While this fires, the mismatch
+alert's silence is unknown, not clean.
+
+**First steps:**
+1. Check the `Reconciliation pass failed` warn logs for the error.
+2. If RPC-related, see `TridentIndexerRPCErrorRateHigh` - the reconciler
+   shares the endpoint pool and fails alongside it.
+3. If the indexer cursor has not yet reached the settled window (fresh
+   deploy, deep backfill), passes fail with "nothing to reconcile yet" -
+   expected until the indexer catches up.
+
 ## TridentIndexerRPCErrorRateHigh
 
 **Means:** over 5% of Stellar RPC calls (`getEvents`/`getLedgers`) errored in
@@ -686,3 +760,64 @@ those, so it fires on the level rather than the slope.
    gone: `SELECT pg_drop_replication_slot('<name>');`
 3. If it is ordinary growth, treat it as
    `TridentDiskFillingWithin48Hours` above.
+
+## TridentIndexerPersistDeadLetterBacklog
+
+**Means:** `failed_events` has pending rows — at least one event decoded
+fine but its database commit kept failing through the whole-page retry, the
+per-event isolation retry, and its backoff budget, so the streamer captured
+the failing event (full payload + error message), counted it on
+`trident_indexer_persist_dead_lettered_total`, and advanced the cursor past
+it (issues #208/#508). The data is safe but missing from `soroban_events`
+until replayed.
+
+**Why this threshold:** any pending row at all means indexed data is
+incomplete, and rows leave the pending state only through the replay
+procedure below — so the alert stays up until the gap is actually closed. A
+silent DLQ is the same as data loss. `for: 5m` only absorbs scrape jitter.
+Pending rows are unique per event (migration 0030): the gauge counts
+distinct poisoned events, not retry bursts.
+
+**First steps:**
+
+1. Inspect the queue:
+
+   ```sql
+   SELECT contract_id, ledger_sequence, error_message, attempts, occurred_at
+   FROM failed_events WHERE replayed_at IS NULL ORDER BY occurred_at;
+   ```
+
+   `error_message` names the exact commit error, updated to the most recent
+   failure; `attempts` accumulates across redeliveries.
+2. Fix the underlying cause (a malformed field failing column conversion, a
+   constraint interaction, …). The failure survived the whole retry budget,
+   so replaying before the fix will just fail again.
+3. **Replay** once the fix is deployed: re-ingest the affected range with
+   the backfill CLI (idempotent — `ON CONFLICT DO NOTHING` absorbs the
+   events that did commit). Note its scope: backfill restores rows in
+   `soroban_events` only — it does not write outbox rows or token
+   projections, so replayed events are not delivered to Redis/webhook
+   subscribers and do not appear in `token_events`. Acceptable for
+   historical repair, but know what you are and are not restoring:
+
+   ```
+   trident-backfill --from-ledger <min> --to-ledger <max> [--contract <id>]
+   ```
+
+   using `SELECT MIN(ledger_sequence), MAX(ledger_sequence) FROM
+   failed_events WHERE replayed_at IS NULL;` for the range.
+4. Verify the events landed, then mark the rows replayed — this is what
+   resolves the alert (rows are kept as history, never deleted):
+
+   ```sql
+   UPDATE failed_events d
+   SET replayed_at = NOW()
+   FROM soroban_events e
+   WHERE d.replayed_at IS NULL
+     AND e.ledger_sequence = d.ledger_sequence
+     AND e.transaction_hash = d.transaction_hash
+     AND e.event_index = d.event_index;
+   ```
+
+   The gauge refreshes on the next active poll cycle; the alert clears once
+   no pending rows remain.

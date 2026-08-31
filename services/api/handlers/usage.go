@@ -48,6 +48,17 @@ type UsageResponse struct {
 // (which fills in as the day progresses) and catches any audit_log rows that
 // arrived late relative to the previous run, since the audit writer batches
 // asynchronously.
+
+// errorBody builds the legacy {"error":{"message":...}} envelope. Only the
+// (currently unmounted) usage handlers in this file still use it — the
+// mounted admin-contract handlers moved to the canonical httputil envelope
+// when they were documented in the OpenAPI spec (issue #513). If these
+// handlers are ever mounted, migrate them to httputil.WriteErrorCtx and
+// delete this.
+func errorBody(message string) map[string]any {
+	return map[string]any{"error": map[string]any{"message": message}}
+}
+
 func RollupUsage(ctx context.Context, db *pgxpool.Pool, since time.Time) error {
 	_, err := db.Exec(ctx, `
 		INSERT INTO usage_rollup (api_key_id, period_start, period_end, request_count, error_count, avg_duration_ms, updated_at)

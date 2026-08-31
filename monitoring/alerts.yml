@@ -126,6 +126,85 @@ groups:
             recognise yet.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerparseerrorratehigh"
 
+      # Unexpected ScVal variants (#506). The decoder matches every ScVal
+      # variant exhaustively — a new XDR variant fails compilation, so this
+      # cannot fire for "unknown" types. It fires when a structurally valid
+      # variant that should never appear in an event payload
+      # (ContractInstance / LedgerKeyContractInstance / LedgerKeyNonce) is
+      # decoded from live traffic: the value is stored faithfully, but the
+      # emitting contract deserves a look.
+      - alert: TridentIndexerUnexpectedScValVariant
+        expr: increase(trident_scval_unexpected_variant_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident decoded {{ $value | humanize }} anomalous ScVal variant(s) in the last hour"
+          description: >
+            An event payload contained an ScVal variant that no well-behaved
+            contract emits (ContractInstance or a ledger-key form). The value
+            was decoded and stored faithfully — never coerced — and the
+            indexer logs name the variant and context. Identify the emitting
+            contract from the logs and review what it is publishing.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
+      # A non-empty persist dead-letter queue is data missing from
+      # soroban_events until someone replays it — a silently growing DLQ is
+      # the same as data loss. Rows leave the pending state only through the
+      # documented replay procedure, so this fires for as long as any exist.
+      - alert: TridentIndexerPersistDeadLetterBacklog
+        expr: trident_indexer_persist_dead_letter_backlog > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident dead-letter queue holds {{ $value }} event(s) that failed to persist"
+          description: >
+            failed_events has pending rows: at least one event exhausted the
+            persist retry budget and was captured with its payload and error
+            message instead of being indexed. Ingestion has advanced past it,
+            but the data is missing from soroban_events until it is replayed.
+            Diagnose error_message, fix the underlying cause, then run the
+            replay procedure in the runbook and mark the rows replayed_at.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
+
+  # ---------------------------------------------------------------------------
+  # Ledger-range reconciliation against the RPC source (#511).
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.reconciliation
+    rules:
+      - alert: TridentIndexerReconciliationMismatch
+        expr: trident_indexer_reconcile_discrepant_ledgers > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexed counts disagree with the RPC source for {{ $value }} ledger(s)"
+          description: >
+            The reconciliation loop compared indexed event counts per ledger
+            against getEvents over a settled window and found disagreement.
+            The indexer logs name the exact ledger ranges with both counts.
+            This is the silent-under-indexing signal: the API may be
+            returning confident, incomplete answers for these ledgers.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerreconciliationmismatch"
+
+      - alert: TridentIndexerReconciliationFailing
+        expr: increase(trident_indexer_reconcile_pass_failures_total[30m]) > 2
+        for: 30m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident reconciliation passes are failing"
+          description: >
+            The reconciliation loop keeps aborting before producing a report
+            (RPC or database failures). While this fires, nothing is
+            verifying that indexed counts match the chain - treat the
+            mismatch alert's silence as unknown, not clean.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerreconciliationfailing"
+
   # ---------------------------------------------------------------------------
   # Stellar RPC health (#297).
   # ---------------------------------------------------------------------------

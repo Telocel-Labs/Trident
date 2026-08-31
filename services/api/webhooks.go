@@ -89,22 +89,32 @@ type webhookDelivery struct {
 	Success        bool      `json:"success"`
 }
 
-func resolveAPIKeyID(ctx context.Context, db *sql.DB, r *http.Request) (string, error) {
-	if db == nil {
-		return "", nil
+// resolveAPIKeyID returns the authenticated API key's UUID, which
+// middleware.NewDBAuth resolved and attached to the request context.
+//
+// It previously interpreted the raw X-API-Key HEADER as an api_keys.id UUID
+// — which no real key ever is, since keys are "trident_<hex>" strings — and
+// then fell back to `INSERT INTO api_keys DEFAULT VALUES`, which violates
+// the table's NOT NULL constraints. Every legitimate caller therefore got a
+// 500 before reaching a subscription, making the documented list/create
+// happy paths unreachable (caught while bringing these routes under the
+// OpenAPI contract test, issue #513).
+//
+// Legacy env-hash keys have no database identity and cannot own webhook
+// subscriptions; that is now an explicit auth error instead of a stray row
+// insert.
+func resolveAPIKeyID(ctx context.Context) (string, error) {
+	if id := middleware.APIKeyIDFromContext(ctx); id != "" {
+		return id, nil
 	}
-	if header := strings.TrimSpace(r.Header.Get("X-API-Key")); header != "" {
-		var id string
-		if err := db.QueryRowContext(ctx, `SELECT id FROM api_keys WHERE id = $1`, header).Scan(&id); err == nil {
-			return id, nil
-		}
-	}
-	var id string
-	if err := db.QueryRowContext(ctx, `INSERT INTO api_keys DEFAULT VALUES RETURNING id`).Scan(&id); err != nil {
-		return "", err
-	}
-	return id, nil
+	return "", errAPIKeyNotResolvable
 }
+
+// errAPIKeyNotResolvable marks a request authenticated without a
+// database-backed API key (legacy env-hash auth).
+var errAPIKeyNotResolvable = errors.New(
+	"webhook ownership requires a database-backed API key",
+)
 
 type webhookDeliveryResult struct {
 	Success      bool
@@ -558,7 +568,11 @@ func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -694,7 +708,11 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "failed to generate webhook secret", http.StatusInternalServerError)
 			return
 		}
-		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -998,7 +1016,15 @@ func rotateWebhookSecretHandler(db *sql.DB) http.HandlerFunc {
 		// Rotation must be scoped to the caller's API key. Without this an
 		// authenticated caller could rotate any other tenant's webhook secret
 		// and read both the old and new values back.
-		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			// Same canonical contract as webhook creation: legacy env-hash
+			// auth carries no key identity to scope ownership to, and an
+			// unresolvable key is the caller's auth mode, not a server
+			// fault — 401, never a 500.
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

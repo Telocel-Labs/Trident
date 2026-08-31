@@ -88,6 +88,10 @@ description is accurate. Keep this file honest by hand.
 | `OUTBOX_POLL_INTERVAL_MS` | Optional | `100` (min `10`, max `60000`) | How often the relay scans for unpublished events. |
 | `OUTBOX_BATCH_SIZE` | Optional | `500` (min `1`, max `10000`) | Max events published per relay pass. |
 | `OUTBOX_BACKLOG_ALERT_THRESHOLD` | Optional | `10000` (min `1`, max `10000000`) | Backlog size that logs an alert-worthy warning. |
+| `RECONCILE_ENABLED` | Optional | `true` | Runs the ledger-range reconciliation loop that compares indexed event counts against the RPC source (#511). Disabling it means nothing verifies indexed data against the chain. |
+| `RECONCILE_INTERVAL_MS` | Optional | `600000` (min `10000`, max `86400000`) | Time between reconciliation passes. |
+| `RECONCILE_LEDGER_SPAN` | Optional | `400` (min `10`, max `100000`) | Settled ledgers each pass compares. |
+| `RECONCILE_TIP_MARGIN` | Optional | `100` (min `0`, max `10000`) | Distance behind the chain tip the window sits, so in-flight ledgers never read as discrepancies. |
 
 ### Lag alerting
 

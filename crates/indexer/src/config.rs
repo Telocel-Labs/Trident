@@ -60,6 +60,15 @@ pub struct Config {
     pub outbox_batch_size: i64,
     /// Backlog size at which the relay warns that delivery is falling behind.
     pub outbox_backlog_alert_threshold: i64,
+    /// Whether the ledger-range reconciliation loop runs (issue #511).
+    pub reconcile_enabled: bool,
+    /// Time between reconciliation passes.
+    pub reconcile_interval: std::time::Duration,
+    /// How many settled ledgers each pass compares against the RPC.
+    pub reconcile_ledger_span: u64,
+    /// How far behind the chain tip the window sits, so in-flight ledgers
+    /// the streamer has not committed yet never read as discrepancies.
+    pub reconcile_tip_margin: u64,
     pub index_diagnostic: bool,
     /// Topic patterns pushed into the `getEvents` RPC filter alongside the
     /// contract allowlist (issue #203). Empty means "no topic narrowing".
@@ -223,6 +232,10 @@ impl Config {
         let outbox_batch_size = parse_bounded_u64("OUTBOX_BATCH_SIZE", 500, 1, 10_000);
         let outbox_backlog_alert_threshold =
             parse_bounded_u64("OUTBOX_BACKLOG_ALERT_THRESHOLD", 10_000, 1, 10_000_000);
+        let reconcile_interval_ms =
+            parse_bounded_u64("RECONCILE_INTERVAL_MS", 600_000, 10_000, 86_400_000);
+        let reconcile_ledger_span = parse_bounded_u64("RECONCILE_LEDGER_SPAN", 400, 10, 100_000);
+        let reconcile_tip_margin = parse_bounded_u64("RECONCILE_TIP_MARGIN", 100, 0, 10_000);
         let alert_lag_threshold = parse_bounded_u64("ALERT_LAG_THRESHOLD", 200, 1, 1_000_000);
         let alert_cooldown_minutes = parse_bounded_u64("ALERT_COOLDOWN_MINUTES", 30, 1, 10_080);
         let statement_timeout_ms =
@@ -288,6 +301,9 @@ impl Config {
                 "OUTBOX_BACKLOG_ALERT_THRESHOLD",
                 outbox_backlog_alert_threshold.as_ref(),
             ),
+            ("RECONCILE_INTERVAL_MS", reconcile_interval_ms.as_ref()),
+            ("RECONCILE_LEDGER_SPAN", reconcile_ledger_span.as_ref()),
+            ("RECONCILE_TIP_MARGIN", reconcile_tip_margin.as_ref()),
             ("ALERT_LAG_THRESHOLD", alert_lag_threshold.as_ref()),
             ("ALERT_COOLDOWN_MINUTES", alert_cooldown_minutes.as_ref()),
             ("DB_STATEMENT_TIMEOUT_MS", statement_timeout_ms.as_ref()),
@@ -332,6 +348,12 @@ impl Config {
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+
+        // Enabled unless explicitly turned off: the reconciler is the proof
+        // that indexed data matches the chain, so it defaults on (issue #511).
+        let reconcile_enabled = std::env::var("RECONCILE_ENABLED")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
 
         let topic_filters = match std::env::var("INDEX_TOPIC_FILTERS") {
             Ok(spec) => match crate::rpc::filters::parse_topic_filters(&spec) {
@@ -381,6 +403,9 @@ impl Config {
         let outbox_poll_interval_ms = outbox_poll_interval_ms.unwrap();
         let outbox_batch_size = outbox_batch_size.unwrap() as i64;
         let outbox_backlog_alert_threshold = outbox_backlog_alert_threshold.unwrap() as i64;
+        let reconcile_interval = std::time::Duration::from_millis(reconcile_interval_ms.unwrap());
+        let reconcile_ledger_span = reconcile_ledger_span.unwrap();
+        let reconcile_tip_margin = reconcile_tip_margin.unwrap();
         let alert_lag_threshold = alert_lag_threshold.unwrap();
         let alert_cooldown_minutes = alert_cooldown_minutes.unwrap();
         let statement_timeout_ms = statement_timeout_ms.unwrap();
@@ -414,6 +439,10 @@ impl Config {
             outbox_poll_interval: Duration::from_millis(outbox_poll_interval_ms),
             outbox_batch_size,
             outbox_backlog_alert_threshold,
+            reconcile_enabled,
+            reconcile_interval,
+            reconcile_ledger_span,
+            reconcile_tip_margin,
             index_diagnostic,
             topic_filters,
             max_events_per_poll: max_events_per_poll as u32,
@@ -1041,6 +1070,13 @@ mod tests {
             assert_eq!(cfg.outbox_poll_interval.as_millis(), 100);
             assert_eq!(cfg.outbox_batch_size, 500);
             assert_eq!(cfg.outbox_backlog_alert_threshold, 10_000);
+            assert!(cfg.reconcile_enabled);
+            assert_eq!(
+                cfg.reconcile_interval,
+                std::time::Duration::from_millis(600_000)
+            );
+            assert_eq!(cfg.reconcile_ledger_span, 400);
+            assert_eq!(cfg.reconcile_tip_margin, 100);
         });
     }
 

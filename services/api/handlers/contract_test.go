@@ -13,7 +13,6 @@ import (
 	"github.com/Depo-dev/trident/services/api/gen"
 	"github.com/Depo-dev/trident/services/api/handlers"
 	"github.com/getkin/kin-openapi/openapi3"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -208,123 +207,10 @@ func TestContract_ErrorResponseValidation(t *testing.T) {
 	})
 }
 
-// TestContract_RouteParity verifies that every route registered in main.go
-// is documented in the OpenAPI spec and vice versa
-func TestContract_RouteParity(t *testing.T) {
-	doc := loadOpenAPISpec(t)
-
-	// Extract documented routes from OpenAPI spec
-	documentedRoutes := make(map[string]bool)
-	for path, pathItem := range doc.Paths.Map() {
-		if pathItem.Get != nil {
-			documentedRoutes["GET "+path] = true
-		}
-		if pathItem.Post != nil {
-			documentedRoutes["POST "+path] = true
-		}
-		if pathItem.Put != nil {
-			documentedRoutes["PUT "+path] = true
-		}
-		if pathItem.Patch != nil {
-			documentedRoutes["PATCH "+path] = true
-		}
-		if pathItem.Delete != nil {
-			documentedRoutes["DELETE "+path] = true
-		}
-	}
-
-	// Expected routes from main.go (this list should be kept in sync with main.go)
-	// Note: Some routes like /metrics, /internal/status, /ws, /graphql are intentionally
-	// excluded from the OpenAPI spec as they are internal or use different protocols
-	// Note: Admin routes and webhook routes are also currently not documented in OpenAPI
-	expectedRoutes := map[string]bool{
-		"GET /v1/health":                         true,
-		"GET /v1/ready":                          true,
-		"GET /v1/version":                        true,
-		"GET /v1/events":                         true,
-		"POST /v1/events/batch":                  true,
-		"GET /v1/events/{id}":                    true,
-		"GET /v1/events/stream":                  true,
-		"GET /v1/admin/db":                       true,
-		"GET /v1/admin/keys/{id}/usage":          true,
-		"POST /v1/admin/contracts":               true,
-		"GET /v1/admin/contracts":                true,
-		"DELETE /v1/admin/contracts/{id}":        true,
-		"POST /v1/api-keys":                      true,
-		"GET /v1/api-keys":                       true,
-		"PATCH /v1/api-keys/{id}":                true,
-		"DELETE /v1/api-keys/{id}":               true,
-		"GET /v1/stats/indexer":                  true,
-		"GET /v1/contracts/{id}/events/schema":   true,
-		"GET /v1/contracts/{id}/spec":            true,
-		"GET /v1/contracts/{id}/storage":         true,
-		"GET /v1/contracts/{id}/storage/history": true,
-		"GET /v1/stats/contracts":                true,
-		"POST /v1/contracts/{id}/call":           true,
-		// Webhook routes (not yet documented in OpenAPI)
-		"GET /v1/webhooks":                                        true,
-		"POST /v1/webhooks":                                       true,
-		"DELETE /v1/webhooks/{id}":                                true,
-		"PATCH /v1/webhooks/{id}/pause":                           true,
-		"PATCH /v1/webhooks/{id}/resume":                          true,
-		"GET /v1/webhooks/{id}/deliveries":                        true,
-		"GET /v1/webhooks/{id}/dead-letters":                      true,
-		"POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay": true,
-	}
-
-	// Routes that are intentionally excluded from OpenAPI documentation
-	// (internal routes, admin routes, webhook routes, etc.)
-	excludedFromOpenAPI := map[string]bool{
-		"GET /metrics":                                            true,
-		"GET /internal/status":                                    true,
-		"GET /ws":                                                 true,
-		"GET /graphql":                                            true,
-		"GET /v1/admin/db":                                        true,
-		"GET /v1/admin/keys/{id}/usage":                           true,
-		"POST /v1/admin/contracts":                                true,
-		"GET /v1/admin/contracts":                                 true,
-		"DELETE /v1/admin/contracts/{id}":                         true,
-		"POST /v1/api-keys":                                       true,
-		"GET /v1/api-keys":                                        true,
-		"PATCH /v1/api-keys/{id}":                                 true,
-		"DELETE /v1/api-keys/{id}":                                true,
-		"POST /v1/contracts/{id}/call":                            true, // Contract call endpoint (not yet documented)
-		"GET /v1/webhooks":                                        true,
-		"POST /v1/webhooks":                                       true,
-		"DELETE /v1/webhooks/{id}":                                true,
-		"PATCH /v1/webhooks/{id}/pause":                           true,
-		"PATCH /v1/webhooks/{id}/resume":                          true,
-		"GET /v1/webhooks/{id}/deliveries":                        true,
-		"GET /v1/webhooks/{id}/dead-letters":                      true,
-		"POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay": true,
-	}
-
-	// Check for undocumented routes (excluding intentionally excluded ones)
-	var undocumented []string
-	for route := range expectedRoutes {
-		if !documentedRoutes[route] && !excludedFromOpenAPI[route] {
-			undocumented = append(undocumented, route)
-		}
-	}
-
-	// Check for documented but not implemented routes (excluding intentionally excluded ones)
-	var unimplemented []string
-	for route := range documentedRoutes {
-		if !expectedRoutes[route] && !excludedFromOpenAPI[route] {
-			unimplemented = append(unimplemented, route)
-		}
-	}
-
-	if len(undocumented) > 0 {
-		t.Errorf("Routes registered in main.go but not documented in OpenAPI spec:\n%s",
-			strings.Join(undocumented, "\n"))
-	}
-
-	if len(unimplemented) > 0 {
-		t.Errorf("Routes documented in OpenAPI spec but not registered in main.go:\n%s",
-			strings.Join(unimplemented, "\n"))
-	}
-
-	assert.Empty(t, undocumented, "all registered routes should be documented (or intentionally excluded)")
-	assert.Empty(t, unimplemented, "all documented routes should be registered (or intentionally excluded)")
-}
+// Route<->spec parity is enforced by TestEveryRouteIsDocumentedOrExempted and
+// TestSpecHasNoPhantomOperations (services/api/routes_inventory_test.go),
+// which derive the implemented-route set from the live registration table in
+// routes.go rather than from a hand-maintained list. The previous
+// TestContract_RouteParity kept exactly such a list here ("should be kept in
+// sync with main.go") — the drift this suite exists to make structurally
+// impossible — and is superseded by the table-driven tests (issue #513).

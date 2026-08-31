@@ -45,7 +45,7 @@ ALTER TABLE soroban_events
     ADD CONSTRAINT uq_soroban_events_tx_index_network
     UNIQUE (ledger_sequence, transaction_hash, event_index, network);
 
--- network enum (migration 0030)
+-- network enum (migration 0031)
 ALTER TABLE soroban_events
     ADD CONSTRAINT chk_soroban_events_network
     CHECK (network IN ('mainnet', 'testnet'));
@@ -588,9 +588,14 @@ CREATE TABLE IF NOT EXISTS failed_events (
 
 CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_at) WHERE replayed_at IS NULL;
+-- Pending rows are unique per event (migration 0030): redelivered failures
+-- update in place, so COUNT(*) of pending rows = distinct poisoned events.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_events_pending
+    ON failed_events (contract_id, ledger_sequence, event_index)
+    WHERE replayed_at IS NULL;
 
 -- ---------------------------------------------------------------------------
--- backfill_jobs  (migration 0031)
+-- backfill_jobs  (migration 0032)
 -- Queue of ledger-range backfills enqueued by the indexer's gap scan and
 -- executed by `crates/backfill --from-queue` (issue #216).
 -- ---------------------------------------------------------------------------

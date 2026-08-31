@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/cursor"
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -17,12 +18,6 @@ import (
 type ContractConfig struct {
 	AdminKey string
 	DB       *pgxpool.Pool
-}
-
-// errorBody builds the {"error":{"message":...}} envelope used by this
-// file's writeJSON error responses.
-func errorBody(message string) map[string]any {
-	return map[string]any{"error": map[string]any{"message": message}}
 }
 
 // ContractResponse is the JSON representation of an indexed_contracts row.
@@ -65,12 +60,12 @@ type ListContractsResponse struct {
 func CreateContract(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin contracts endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 			return
 		}
 
@@ -80,18 +75,18 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 				middleware.WriteBodyTooLarge(w, r)
 				return
 			}
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid request body"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid request body")
 			return
 		}
 
 		if req.ContractID == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("contract_id is required"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contract_id is required")
 			return
 		}
 
 		// Validate strkey format: must start with C and be 56 chars.
 		if len(req.ContractID) != 56 || req.ContractID[0] != 'C' {
-			writeJSON(w, http.StatusBadRequest, errorBody("contract_id must be a valid 56-character strkey starting with C"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contract_id must be a valid 56-character strkey starting with C")
 			return
 		}
 
@@ -112,7 +107,7 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 
 		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to create contract", "err", err)
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to register contract"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to register contract")
 			return
 		}
 
@@ -132,12 +127,12 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 func ListContracts(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin contracts endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 			return
 		}
 
@@ -175,7 +170,7 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 		rows, err := cfg.DB.Query(ctx, query, cursorID, limit+1)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to list contracts", "err", err)
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to list contracts"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to list contracts")
 			return
 		}
 		defer rows.Close()
@@ -191,7 +186,7 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 			var createdAt time.Time
 			if err := rows.Scan(&c.ID, &c.ContractID, &c.Network, &c.Label, &c.IndexFrom, &createdAt); err != nil {
 				slog.ErrorContext(r.Context(), "failed to scan contract row", "err", err)
-				writeJSON(w, http.StatusInternalServerError, errorBody("scan error"))
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "scan error")
 				return
 			}
 			c.CreatedAt = createdAt.UTC().Format(time.RFC3339)
@@ -219,18 +214,18 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 func DeleteContract(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin contracts endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 			return
 		}
 
 		id := r.PathValue("id")
 		if id == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("missing contract id"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "missing contract id")
 			return
 		}
 
@@ -240,7 +235,7 @@ func DeleteContract(cfg ContractConfig) http.HandlerFunc {
 		tag, err := cfg.DB.Exec(ctx, `DELETE FROM indexed_contracts WHERE id = $1`, id)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to delete contract", "err", err)
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to delete contract"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to delete contract")
 			return
 		}
 

@@ -174,7 +174,11 @@ func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 		}
 		defer rows.Close()
 
-		var byEndpoint []AdminEndpointUsage
+		// Initialized non-nil so an empty window serializes as [] rather than
+		// null — the generated SDK models (Rust Vec, Python list) reject null
+		// for this field, and "no requests" is an empty breakdown, not an
+		// absent one (issue #513).
+		byEndpoint := []AdminEndpointUsage{}
 		for rows.Next() {
 			var eu AdminEndpointUsage
 			if err := rows.Scan(&eu.Endpoint, &eu.Requests, &eu.AvgDurationMs); err != nil {

@@ -139,9 +139,15 @@ func (b *GraphQLBackend) ContractStats(ctx context.Context, req ws.StatsQuery) (
 		params.ToLedgerPtr = &to
 	}
 
-	stats, err := queryContractStats(ctx, b.DB, params)
+	// GraphQL contractStats exposes no cursor argument, so this is always the
+	// first page: nil keyset. queryContractStats fetches limit+1 rows to let
+	// REST callers detect a next page, so trim the probe row here.
+	stats, err := queryContractStats(ctx, b.DB, params, nil)
 	if err != nil {
 		return nil, ws.NewBackendError(httputil.INTERNAL, "failed to fetch statistics")
+	}
+	if len(stats) > int(params.Limit) {
+		stats = stats[:params.Limit]
 	}
 
 	out := make([]map[string]any, 0, len(stats))

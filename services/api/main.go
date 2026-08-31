@@ -290,48 +290,10 @@ func main() {
 	handlers.SetInternalStatusDeps(pool, redisClient, hub)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/health", handlers.Health())
-	mux.HandleFunc("GET /v1/ready", handlers.Ready(healthDB, redisClient, grpcClient))
-	mux.HandleFunc("GET /v1/version", handlers.VersionHandler(pool))
-	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
-	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
-	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
-	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
-	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
-	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
-	// Admin contract registration CRUD (issue #230)
-	contractCfg := handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool}
-	mux.HandleFunc("POST /v1/admin/contracts", handlers.CreateContract(contractCfg))
-	mux.HandleFunc("GET /v1/admin/contracts", handlers.ListContracts(contractCfg))
-	mux.HandleFunc("DELETE /v1/admin/contracts/{id}", handlers.DeleteContract(contractCfg))
-	// API key management (admin-only via X-Admin-Key header). Idempotency
-	// wraps only the create route (issue #225): a retried creation with the
-	// same Idempotency-Key + body replays the original response instead of
-	// minting a second key.
-	mux.Handle("POST /v1/api-keys", middleware.Idempotency(redisClient, middleware.DefaultIdempotencyTTL)(handlers.CreateAPIKey(apiKeyCfg)))
-	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
-	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
-	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
-	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
-	// Contract spec changes only when a contract is redeployed — rare,
-	// read-only, no side effects — so it's cached (issue #221) with a TTL
-	// well above the 60s used for stats/contracts below, and is invalidated
-	// immediately on a new event for that contract rather than waiting out
-	// the TTL (see StartCacheInvalidator).
-	const contractMetadataCacheTTL = 5 * time.Minute
-	// ContractEventSchemas is intentionally NOT wrapped in ResponseCache
-	// (issue #571): unlike ContractSpec, it writes to contract_event_schemas
-	// on every call (persistContractSchemas), and ResponseCache must never
-	// wrap a route with side effects — a cache HIT would skip that write for
-	// the rest of the TTL. Its queries are indexed lookups against
-	// token_events/soroban_events, cheap enough that going uncached doesn't
-	// need a cache of its own.
-	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
-	mux.Handle("GET /v1/contracts/{id}/spec",
-		middleware.ResponseCache(redisClient, contractMetadataCacheTTL, middleware.DefaultCacheKey)(handlers.ContractSpec(schemaRegistryDB)))
-	mux.HandleFunc("GET /v1/contracts/{id}/storage", handlers.ContractStorageLatest(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/storage/history", handlers.ContractStorageHistory(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
+	// Route registration lives in routes.go as a single table shared with the
+	// OpenAPI inventory contract test (issue #513): every route is either
+	// documented in api/openapi.yaml or carries an explicit exemption, and the
+	// test fails on any drift in either direction.
 	// nil (untyped) when STELLAR_RPC_URL is unset, so CallContract's `rpc ==
 	// nil` check reports 503 rather than a typed-nil interface slipping
 	// through and panicking on first use.
@@ -339,25 +301,6 @@ func main() {
 	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
 		sorobanCaller = sorobanrpc.NewClient(rpcURL)
 	}
-	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
-	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
-	// Idempotency (issue #225): a retried subscription creation with the same
-	// Idempotency-Key + body replays the original response instead of
-	// creating a second subscription (and a second webhook secret).
-	mux.Handle("POST /v1/webhooks", middleware.Idempotency(redisClient, middleware.DefaultIdempotencyTTL)(createWebhookHandler(webhookDB)))
-	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
-	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
-	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks/{id}/rotate-secret", rotateWebhookSecretHandler(webhookDB))
-	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
-	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
-	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
-
-	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
-
 	var rlDB middleware.TierDB
 	if pool != nil {
 		rlDB = pool
@@ -371,20 +314,24 @@ func main() {
 	}
 	authDB.Redis = redisClient
 
-	// GraphQL/WS is registered after rlCfg and authDB exist because it must
-	// reuse them (issue #223). The HTTP middlewares cannot cover this
-	// endpoint on their own: NewDBAuth skips any path that is neither /v1/*
-	// nor /ws, and TieredRateLimit keys off the X-API-Key header, which a
-	// WebSocket client never sends — it authenticates in the connection_init
-	// payload instead. Passing the same auth config and rate-limit config in
-	// here gives GraphQL the same api_keys lookup and the same per-key
-	// sliding window REST gets, rather than the legacy env-var key set and no
-	// limit at all.
-	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, ws.GraphQLDeps{
-		Auth:        middleware.GraphQLDBAuth(authDB),
-		RateLimiter: middleware.GraphQLRateLimiter(rlCfg),
-		Backend:     handlers.NewGraphQLBackend(pool),
-	})))
+	registerRoutes(mux, routeDeps{
+		rlCfg:            rlCfg,
+		authDB:           authDB,
+		pool:             pool,
+		healthDB:         healthDB,
+		schemaRegistryDB: schemaRegistryDB,
+		redisClient:      redisClient,
+		grpcClient:       grpcClient,
+		adminCfg:         adminCfg,
+		contractCfg:      handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool},
+		apiKeyCfg:        apiKeyCfg,
+		sorobanCaller:    sorobanCaller,
+		webhookDB:        webhookDB,
+		hub:              hub,
+		keyValidator:     middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES"))),
+	})
+
+	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)

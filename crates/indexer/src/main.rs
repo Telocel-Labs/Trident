@@ -16,6 +16,7 @@ mod health;
 mod metrics;
 mod parser;
 mod poll;
+mod reconcile;
 mod redis_stream;
 mod rpc;
 mod spec;
@@ -316,6 +317,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let relay_shutdown = shutdown.clone();
     let relay_handle = tokio::spawn(async move { relay.run(relay_shutdown).await });
+
+    // Ledger-range reconciliation (issue #511): periodically re-fetches a
+    // settled window from the RPC and compares per-ledger event counts
+    // against the database, so silent under-indexing surfaces in minutes
+    // instead of at the next incident. Read-only; stops on the same shutdown
+    // signal, and needs no drain — a pass in flight holds no state worth
+    // finishing.
+    if cfg.reconcile_enabled {
+        let reconcile_rpc = rpc::RpcClient::with_endpoints(
+            cfg.stellar_rpc_urls.clone(),
+            &rpc::RpcHttpSettings {
+                connect_timeout: cfg.rpc_connect_timeout,
+                request_timeout: cfg.rpc_request_timeout,
+                pool_idle_timeout: cfg.rpc_pool_idle_timeout,
+                pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
+                tcp_keepalive: cfg.rpc_tcp_keepalive,
+            },
+        )?;
+        let reconciler = reconcile::Reconciler::new(&cfg, db_pool.clone(), reconcile_rpc);
+        let reconcile_shutdown = shutdown.clone();
+        tokio::spawn(async move { reconciler.run(reconcile_shutdown).await });
+    } else {
+        tracing::warn!(
+            "RECONCILE_ENABLED=false: nothing is verifying indexed counts against the RPC source"
+        );
+    }
 
     // Allow the shutdown drain to finish its in-flight work before the process
     // is killed. Kubernetes/Fly terminationGracePeriodSeconds should be ≥ this

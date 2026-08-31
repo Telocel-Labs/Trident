@@ -4019,17 +4019,13 @@ name = "trident-backfill"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "chrono",
  "clap",
- "hex",
  "indicatif",
  "reqwest",
  "serde",
  "serde_json",
  "sqlx",
- "stellar-strkey 0.0.16",
- "stellar-xdr",
  "tokio",
  "tokio-retry",
  "tracing",
@@ -4043,9 +4039,14 @@ name = "trident-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
+ "hex",
+ "metrics",
  "serde",
  "serde_json",
+ "stellar-strkey 0.0.16",
+ "stellar-xdr",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

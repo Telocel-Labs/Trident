@@ -1072,6 +1072,14 @@ impl Streamer {
             metrics::record_events_processed(events_in_page as u64);
             metrics::record_events_skipped(skipped_in_page);
 
+            // Refresh the dead-letter backlog gauge every active cycle so an
+            // operator replay (which shrinks the queue out-of-band) is
+            // reflected without restarting the indexer. Best-effort: the
+            // gauge is observability, not control flow.
+            if let Ok(depth) = db::count_pending_failed_events(&self.db).await {
+                metrics::set_persist_dead_letter_backlog(depth);
+            }
+
             // Decide whether this page advances the cursor, and gather the
             // ledger provenance that must land in the same transaction.
             let mut next_cursor: Option<u64> = None;
@@ -1608,7 +1616,16 @@ async fn commit_page_with_fallback(
                 "Event failed to persist after per-event retries; dead-lettering"
             );
             match db::insert_failed_event(db, event, &e.to_string(), attempts).await {
-                Ok(()) => metrics::record_dead_lettered(),
+                Ok(()) => {
+                    // The PERSIST counter, not the parse one: these answer
+                    // different operational questions (issue #508), and the
+                    // backlog gauge refreshes immediately so the alert sees
+                    // the new row without waiting for the next active cycle.
+                    metrics::record_persist_dead_lettered();
+                    if let Ok(depth) = db::count_pending_failed_events(db).await {
+                        metrics::set_persist_dead_letter_backlog(depth);
+                    }
+                }
                 Err(dl_err) => {
                     // The dead-letter write goes to the same database the
                     // event's own INSERT just failed against. Failing here is
@@ -1926,6 +1943,10 @@ mod tests {
             outbox_poll_interval: Duration::from_millis(10),
             outbox_batch_size: 500,
             outbox_backlog_alert_threshold: 10_000,
+            reconcile_enabled: false,
+            reconcile_interval: Duration::from_secs(600),
+            reconcile_ledger_span: 400,
+            reconcile_tip_margin: 100,
             metrics_port: 0,
             alert_webhook_url: None,
             alert_lag_threshold: 200,

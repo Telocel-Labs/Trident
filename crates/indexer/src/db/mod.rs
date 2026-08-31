@@ -963,7 +963,7 @@ pub async fn scan_ledger_gaps(
 /// Enqueue a `backfill_jobs` row for one gap, so `crates/backfill
 /// --from-queue` picks it up and re-fetches the missing range (issue #216).
 ///
-/// Idempotent: `uq_backfill_jobs_pending_range` (migration 0031) makes this a
+/// Idempotent: `uq_backfill_jobs_pending_range` (migration 0032) makes this a
 /// no-op when an identical pending/running job already exists, so a scan
 /// that re-finds the same still-unrepaired gap on its next run does not pile
 /// up duplicate jobs.
@@ -1295,6 +1295,16 @@ pub async fn insert_parse_error(
 /// JSONB so it can be inspected and replayed once the underlying cause (a
 /// constraint violation, an outage that outlasted the retry budget, etc.) is
 /// understood, without needing to re-fetch it from Stellar RPC.
+///
+/// Keyed over PENDING rows by the event's natural key — the same
+/// (contract_id, ledger_sequence, event_index) triple `event_uuid` and
+/// migration 0025 make canonical (issue #508): a poison
+/// event re-encountered across polls — an RPC redelivery, a backfill overlap
+/// — updates its existing row (attempt count folded in, latest error kept)
+/// instead of accumulating duplicates, so the pending row count equals the
+/// number of distinct poisoned events, which is exactly what the backlog
+/// gauge and its alert report. A row an operator already replayed is history
+/// and does not block recording a fresh failure of the same event.
 pub async fn insert_failed_event(
     pool: &PgPool,
     event: &SorobanEvent,
@@ -1311,6 +1321,10 @@ pub async fn insert_failed_event(
             (ledger_sequence, contract_id, transaction_hash, event_index,
              event_payload, error_message, attempts)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (contract_id, ledger_sequence, event_index) WHERE replayed_at IS NULL
+        DO UPDATE SET
+            attempts      = failed_events.attempts + EXCLUDED.attempts,
+            error_message = EXCLUDED.error_message
         "#,
     )
     .bind(event.ledger_sequence as i64)
@@ -1468,6 +1482,23 @@ pub async fn replay_failed_event(pool: &PgPool, id: Uuid) -> Result<ReplayOutcom
     }
 
     Ok(ReplayOutcome::Replayed)
+}
+
+/// Number of dead-lettered events still awaiting replay. Published as the
+/// `trident_indexer_persist_dead_letter_backlog` gauge each active poll
+/// cycle (and on every dead-letter write), so the non-empty-DLQ alert has a
+/// live series to fire on — a silent queue is indistinguishable from data
+/// loss (issue #508). Counts only pending rows: a replayed row is resolved
+/// history, not backlog.
+pub async fn count_pending_failed_events(pool: &PgPool) -> Result<i64, TridentError> {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE replayed_at IS NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| {
+                TridentError::storage(anyhow::Error::new(e).context("count_pending_failed_events"))
+            })?;
+    Ok(row.0)
 }
 
 /// Contracts among `contract_ids` whose `token_metadata` row is still fresh
@@ -1630,6 +1661,79 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// Dead-lettering the same event twice must collapse to ONE pending row
+    /// with the attempt counts folded together (issue #508) — the pending
+    /// count is what the backlog gauge reports, and it must mean "distinct
+    /// poisoned events", not "retry bursts".
+    ///
+    /// Uses the shared test database (TEST_DATABASE_URL) like the other
+    /// integration tests; skips when it is not configured.
+    #[tokio::test]
+    async fn failed_event_redelivery_updates_one_pending_row() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // A unique contract per run, like the other failed_events test: the
+        // shared fixture reuses one transaction hash everywhere, so scoping
+        // by contract keeps parallel tests out of each other's rows.
+        let contract_id = format!("CDLQ_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 43, 0);
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+
+        insert_failed_event(&pool, &event, "first failure", 4)
+            .await
+            .expect("first dead-letter failed");
+        insert_failed_event(&pool, &event, "second failure", 4)
+            .await
+            .expect("redelivered dead-letter must not error");
+
+        let (rows, attempts, error): (i64, i32, String) = sqlx::query_as(
+            "SELECT COUNT(*) OVER (), attempts, error_message FROM failed_events              WHERE contract_id = $1 AND replayed_at IS NULL",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row query failed");
+        assert_eq!(rows, 1, "redelivery must update, not duplicate");
+        assert_eq!(attempts, 8, "attempt counts fold together");
+        assert_eq!(error, "second failure", "latest error wins");
+
+        // A REPLAYED row is history: the same event failing again gets a
+        // fresh pending row rather than resurrecting the resolved one.
+        sqlx::query("UPDATE failed_events SET replayed_at = NOW() WHERE transaction_hash = $1")
+            .bind(&event.transaction_hash)
+            .execute(&pool)
+            .await
+            .expect("mark replayed");
+        insert_failed_event(&pool, &event, "regression after replay", 1)
+            .await
+            .expect("post-replay dead-letter failed");
+        let pending: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM failed_events              WHERE contract_id = $1 AND replayed_at IS NULL",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("pending count failed");
+        assert_eq!(
+            pending.0, 1,
+            "a replayed row must not block a fresh failure"
+        );
+    }
+
     /// Committing the same event twice must not error and the row count in
     /// `soroban_events` must remain 1.
     ///
@@ -1678,7 +1782,7 @@ mod tests {
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
     }
 
-    /// The `chk_soroban_events_network` CHECK constraint (migration 0030,
+    /// The `chk_soroban_events_network` CHECK constraint (migration 0031,
     /// issue #252) must reject a row whose network is neither 'mainnet' nor
     /// 'testnet' — the failure mode this exists to close is a typo like
     /// 'tesnet' silently creating an invisible data partition.
