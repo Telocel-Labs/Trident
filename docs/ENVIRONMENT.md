@@ -51,6 +51,8 @@ description is accurate. Keep this file honest by hand.
 | `POLL_INTERVAL_CEILING_MS` | Optional | `5000` (min `100`, max `600000`) | Adaptive-poll ceiling: slowest interval, used when caught up. |
 | `LAG_HIGH_WATERMARK` | Optional | `100` (min `1`, max `100000000`) | Ledger lag at/above which the floor interval applies. |
 | `POLL_HYSTERESIS_LEDGERS` | Optional | `10` (min `0`, max `1000000`) | Hysteresis deadband to prevent oscillation around the watermark. |
+| `MAX_REORG_REWIND_DEPTH` | Optional | `50` (min `1`, max `100000`) | Maximum ledgers a detected reorg may auto-repair; a deeper divergence halts the streamer for an operator (issue #196). |
+| `GAP_SCAN_MAX_PER_RUN` | Optional | `100` (min `1`, max `10000`) | Maximum gaps enqueued as `backfill_jobs` rows per periodic `ledger_metadata` gap scan (issue #216). |
 | `MAX_EVENTS_PER_POLL` | Optional | `200` (min `1`, max `10000`) | Max events fetched per `getEvents` RPC call. |
 | `DB_BATCH_SIZE` | Optional | `1000` (min `1`, max `10000`) | Max rows per batched INSERT when a page commits. |
 | `INDEXER_DB_POOL_SIZE` | Optional | `3` | Indexer's own Postgres pool size. |
@@ -76,6 +78,8 @@ description is accurate. Keep this file honest by hand.
 | `RPC_TCP_KEEPALIVE_MS` | Optional | `60000` (min `1000`, max `600000`) | TCP keep-alive probe interval. |
 | `RPC_FAILOVER_THRESHOLD` | Optional | `3` (min `1`, max `100`) | Consecutive failures before an endpoint is parked. |
 | `RPC_ENDPOINT_COOLDOWN_MS` | Optional | `30000` (min `1000`, max `3600000`) | Cooldown before a parked endpoint is retried. |
+| `RPC_BREAKER_FAILURE_THRESHOLD` | Optional | `5` (min `1`, max `1000`) | Consecutive RPC-layer poll failures before the circuit breaker opens and the run loop stops attempting polls (issue #197). |
+| `RPC_BREAKER_COOLDOWN_MS` | Optional | `30000` (min `1000`, max `3600000`) | How long the breaker stays open before allowing a single probe poll through. |
 
 ### Outbox relay
 
@@ -143,6 +147,7 @@ description is accurate. Keep this file honest by hand.
 | `PPROF_ENABLED` | Optional | `false` | Enables the internal-only pprof profiling server. Never exposed publicly — bind it to loopback/localhost only. |
 | `PPROF_ADDR` | Optional | `127.0.0.1:6060` | Bind address for the pprof server, when enabled. |
 | `GRPC_MTLS_ENABLED` / `GRPC_MTLS_CA_CERT` / `GRPC_MTLS_CLIENT_CERT` / `GRPC_MTLS_CLIENT_KEY` | Optional (see grpc-api section) | — | Client-side counterpart of the grpc-api mTLS flag (issue #320); `services/api/grpc/client.go`. |
+| `IDEMPOTENCY_ENCRYPTION_KEY` | Optional | random key generated at startup | 64 hex characters (32 bytes), AES-256 key used to encrypt idempotency records at rest in Redis (issue #572) — `POST /v1/api-keys` and `POST /v1/webhooks` return a live credential in their body, and `middleware.Idempotency` stores that body for `DefaultIdempotencyTTL` (24h). Left unset, a random key is generated per process: records are still encrypted, but a record written before a restart cannot be decrypted afterward and is treated as a cache miss (safe — the request is just re-executed). Set this if idempotency replay must survive a redeploy. |
 
 ## Docker Compose only
 

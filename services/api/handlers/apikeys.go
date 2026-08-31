@@ -119,9 +119,12 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}
-		if req.Network == "" {
-			req.Network = "mainnet"
+		network, verr := validation.ValidateNetwork("network", req.Network, "mainnet")
+		if verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
 		}
+		req.Network = network
 		if req.RateLimitTier == "" {
 			req.RateLimitTier = "standard"
 		}

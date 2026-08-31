@@ -321,4 +321,3 @@ mod tests {
         assert!(p.endpoints[0].is_available(now + Duration::from_secs(31)));
     }
 }
-

@@ -23,18 +23,40 @@ tries every page as one atomic transaction first — the fast path, and what
 keeps events, their outbox rows, and the cursor advance atomic (issue #199).
 If that fails after a bounded retry (3 attempts, 200 ms–2 s exponential
 backoff), it falls back to committing each event in the page individually,
-each with its own bounded retry (3 attempts, 100 ms–1 s backoff). An event
-that still cannot be persisted after that is written to `failed_events` and
-skipped; the page's cursor and ledger metadata still commit once every event
-in it has been either persisted or dead-lettered, so **the cursor always
-advances** — a poison row can delay a page but never blocks it indefinitely.
+each with its own bounded retry (3 attempts, 100 ms–1 s backoff).
 
-This also structurally distinguishes transient from permanent failures
-without having to parse database error strings: an event that fails when
-batched with the rest of the page but succeeds on its own was never the
-problem — something else in that transaction was, and isolating it recovers
-the rest of the page automatically. An event that keeps failing even alone is
-the one that's actually broken.
+An event that still cannot be persisted after per-event retries is not
+dead-lettered outright: `db::classify_storage_failure` (issue #573) inspects
+the underlying `sqlx::Error` (via its SQLSTATE code for a genuine Postgres
+error, or its variant for a connection/pool-level failure) and splits the
+outcome in two:
+
+- **Transient** — a connection/IO/pool failure, or a Postgres error whose
+  SQLSTATE class is connection (`08`), resource exhaustion (`53`), operator
+  intervention (`57`, including `57014 query_canceled` — a statement timeout
+  firing under lock contention), or serialization/deadlock
+  (`40001`/`40P01`). The database is the problem, not the row: the error
+  propagates out of `commit_page_with_fallback` instead of being
+  dead-lettered, so the page is retried whole on the next poll cycle rather
+  than every event in it being wedged into `failed_events`. Duplicates are
+  safe — the deterministic UUIDv5 event ids and `ON CONFLICT DO NOTHING`
+  absorb the replay.
+- **Permanent** — a constraint violation (SQLSTATE class `23`), a data
+  exception (class `22`, e.g. invalid text representation), or a
+  row/column/type-level `sqlx::Error` with no SQLSTATE at all. Retrying an
+  identical page reproduces the same failure, so the event is written to
+  `failed_events` and skipped; the page's cursor and ledger metadata still
+  commit once every remaining event has been either persisted or
+  dead-lettered, so **the cursor always advances past a genuinely poison
+  event** — it just no longer advances past a page that failed only because
+  the database was briefly unavailable.
+
+Before this classification existed, every per-event failure was treated the
+same way: "an event that fails even alone is unpersistable." That inference
+only holds when the failure is specific to the event — during a failover,
+lock storm, or pool exhaustion, every event in the page fails identically in
+isolation, and a page of perfectly healthy events would land in
+`failed_events` wholesale, needing manual replay for no reason.
 
 ## Metrics
 
@@ -58,28 +80,49 @@ and decide whether to fix and replay it:
 
 ## Inspecting and replaying failed_events
 
-Pending (not yet replayed) rows, oldest first:
+`trident-indexer replay` (issue #574) is the supported way to inspect and
+replay dead-lettered events. It reads `DATABASE_URL` the same way the daemon
+does, connects, does the requested work, and exits — it never starts the
+poll loop.
 
-```sql
-SELECT id, ledger_sequence, contract_id, transaction_hash, error_message, attempts, occurred_at
-FROM failed_events
-WHERE replayed_at IS NULL
-ORDER BY occurred_at
-LIMIT 100;
+List rows still awaiting replay (`replayed_at IS NULL`), oldest first — the
+same query an operator used to run by hand:
+
+```sh
+trident-indexer replay --list
 ```
 
-`event_payload` holds the full normalised `SorobanEvent` (the same shape
-`insert_events_batch` writes to `soroban_events`) as JSONB, so once the root
-cause is fixed a row can be replayed by re-inserting it and marking it done:
+Replay one specific row by its `failed_events.id` (from the listing above):
 
-```sql
--- Re-derive the columns insert_events_batch expects from event_payload,
--- insert (idempotent — the natural key/PK make a repeat insert a no-op),
--- then mark it replayed:
-UPDATE failed_events SET replayed_at = NOW() WHERE id = '<id>';
+```sh
+trident-indexer replay --id <uuid>
 ```
 
-There is deliberately no automated replay job — a `failed_events` row means
+Replay every row still pending, oldest first (bounded by `--limit`, default
+1000):
+
+```sh
+trident-indexer replay --all
+```
+
+Add `--list` to either replay form to print the full pending table before
+acting on it. Every form prints a `<n> replayed, <m> skipped` summary; a
+skipped row is either one that no longer matches `replayed_at IS NULL`
+(already replayed, or the id does not exist) or one whose re-insert itself
+failed — the latter is logged to stderr with the underlying error and stays
+pending for the next attempt.
+
+Replay re-runs the same insert `commit_page` performs at ingest time — the
+event lands in `soroban_events` and gets an `event_outbox` row so it still
+reaches Redis subscribers via the relay, not just Postgres — then stamps
+`replayed_at` in the same transaction. It is idempotent: the deterministic
+UUIDv5 event id and `ON CONFLICT DO NOTHING` make a second replay of the same
+row a no-op rather than a duplicate, so running `--all` again after a partial
+failure is always safe.
+
+There is deliberately no *automated* replay job — a `failed_events` row means
 something about that specific event or that moment surprised the schema or
 the database, and an operator should look at `error_message` before deciding
-whether to replay as-is, patch the schema, or discard it.
+whether to replay as-is, patch the schema, or discard it. What issue #574
+removes is the need to hand-write the re-insert SQL once that decision is
+made.

@@ -67,7 +67,7 @@ func ConstantTimeContains(validHashes map[string]struct{}, target string) bool {
 }
 
 // hmacKeyHash computes HMAC-SHA256 of key using API_KEY_SALT — used for the
-// legacy API_KEY_HASHES / API_KEY env-var authentication path.
+// legacy API_KEY_HASHES env-var authentication path.
 func hmacKeyHash(key string) string {
 	salt := []byte(os.Getenv("API_KEY_SALT"))
 	mac := hmac.New(sha256.New, salt)
@@ -115,7 +115,7 @@ func withAuthenticatedKey(ctx context.Context, idStr, network string) context.Co
 // NewDBAuth returns an authentication middleware that:
 //  1. Looks up the hashed API key in Redis cache (5 min TTL).
 //  2. Falls back to the api_keys database table (active keys only).
-//  3. Falls back to legacy HMAC-SHA256 env-var authentication (API_KEY_HASHES / API_KEY).
+//  3. Falls back to legacy HMAC-SHA256 env-var authentication (API_KEY_HASHES).
 //
 // On success, api_key_id and network are attached to the request context.
 // Unauthenticated requests receive 401 unless the path is excluded.
@@ -182,7 +182,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-			// ── 3. Legacy env-var fallback (API_KEY_HASHES / API_KEY) ──────
+			// ── 3. Legacy env-var fallback (API_KEY_HASHES) ────────────────
 			validHashes := ParseKeyHashes(os.Getenv("API_KEY_HASHES"))
 			if len(validHashes) > 0 {
 				if ConstantTimeContains(validHashes, hmacKeyHash(key)) {

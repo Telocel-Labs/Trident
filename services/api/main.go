@@ -198,7 +198,7 @@ func main() {
 	go ws.StartConsumer(ctx, redisClient, hub)
 	// Best-effort cache invalidation (issue #221): bumps a contract's cache
 	// version the moment a new event for it arrives, so ResponseCache-wrapped
-	// endpoints (contract spec/schema below) stop serving stale responses
+	// endpoints (contract spec below) stop serving stale responses
 	// immediately rather than waiting out their TTL.
 	go middleware.StartCacheInvalidator(ctx, redisClient, ws.StreamKey)
 

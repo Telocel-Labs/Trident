@@ -697,9 +697,12 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if req.Network == "" {
-			req.Network = "testnet"
+		network, verr := validation.ValidateNetwork("network", req.Network, "testnet")
+		if verr != nil {
+			http.Error(w, verr.Message, http.StatusBadRequest)
+			return
 		}
+		req.Network = network
 		secret, err := generateWebhookSecret()
 		if err != nil {
 			http.Error(w, "failed to generate webhook secret", http.StatusInternalServerError)

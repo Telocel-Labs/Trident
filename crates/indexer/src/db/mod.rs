@@ -31,6 +31,106 @@ pub async fn connect_pool(database_url: &str, pool_size: u32) -> Result<PgPool, 
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("connect_pool")))
 }
 
+/// Classify a storage failure as permanent (the data itself is unpersistable —
+/// dead-letter it) or transient (the database is the problem — retry/propagate
+/// instead) (issue #573).
+///
+/// `commit_page` and every `insert_*_batch` helper wrap every `sqlx::Error` in
+/// `TridentError::storage`, which `TridentError::severity` classifies as
+/// uniformly `Retryable` — correct for the poll loop's top-level retry, but not
+/// precise enough for `commit_page_with_fallback`'s per-event isolation stage
+/// (issue #208): "an event that fails even alone is unpersistable" only holds
+/// when the failure is specific to that event. During a failover, lock storm,
+/// or pool exhaustion every event in the page fails identically in isolation,
+/// and without this distinction the whole page was dead-lettered wholesale
+/// instead of retried.
+///
+/// `anyhow::Error::new(e).context(...)` (how every call site here builds the
+/// `TridentError::StorageError` source) still carries the original
+/// `sqlx::Error` in its chain, so `chain().find_map` recovers it without
+/// touching any insert function's signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFailure {
+    /// The database itself is unavailable or overloaded right now — a
+    /// connection/IO/pool/protocol failure, or a Postgres error whose SQLSTATE
+    /// class is connection (`08`), resource exhaustion (`53`), operator
+    /// intervention (`57`, covering `57014` query_canceled i.e. a statement
+    /// timeout), or serialization/deadlock (`40001`/`40P01`). Retrying — or,
+    /// in the per-event fallback, propagating so the whole page is retried —
+    /// is the right response.
+    Transient,
+    /// The data itself is the problem: a constraint violation (SQLSTATE class
+    /// `23`), an invalid text representation / data exception (`22`), or a
+    /// row/column/type-level `sqlx::Error` that can never succeed by retrying.
+    /// Dead-lettering — what the queue is for — is the right response.
+    Permanent,
+}
+
+/// Classify a `TridentError` produced by this module's storage functions.
+/// Errors with no recoverable `sqlx::Error` in their chain (e.g. the
+/// timestamp-parse failure in `commit_page`) are treated as `Permanent`:
+/// retrying an identical page cannot change a parse outcome.
+pub fn classify_storage_failure(err: &TridentError) -> StorageFailure {
+    let TridentError::StorageError { source } = err else {
+        // Non-storage errors reaching this classifier is a caller bug, but
+        // failing safe here means treating it as permanent rather than
+        // looping forever on something retrying can never fix.
+        return StorageFailure::Permanent;
+    };
+
+    let Some(db_err) = source.chain().find_map(|c| c.downcast_ref::<sqlx::Error>()) else {
+        return StorageFailure::Permanent;
+    };
+
+    match db_err {
+        // Connection/IO/pool/protocol failures: the database is unreachable
+        // or the pool is exhausted, not that this row is bad.
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => StorageFailure::Transient,
+
+        sqlx::Error::Database(db) => match db.code() {
+            Some(code) => match code.as_ref() {
+                // Class 08: connection exception.
+                c if c.starts_with("08") => StorageFailure::Transient,
+                // Class 53: insufficient resources (disk/memory/connections).
+                c if c.starts_with("53") => StorageFailure::Transient,
+                // Class 57: operator intervention — includes 57014
+                // query_canceled, e.g. statement_timeout firing under load.
+                c if c.starts_with("57") => StorageFailure::Transient,
+                // 40001 serialization_failure, 40P01 deadlock_detected.
+                "40001" | "40P01" => StorageFailure::Transient,
+                // Class 23 (integrity_constraint_violation) and class 22
+                // (data_exception) are the row's own fault — retrying an
+                // identical INSERT reproduces the same violation.
+                _ => StorageFailure::Permanent,
+            },
+            // A DatabaseError with no SQLSTATE code is not a shape Postgres
+            // produces; fail safe rather than assume it will clear on retry.
+            None => StorageFailure::Permanent,
+        },
+
+        // Row/column/type/decoding errors are about the data or the query
+        // shape, not the database's availability.
+        sqlx::Error::RowNotFound
+        | sqlx::Error::TypeNotFound { .. }
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::Configuration(_)
+        | sqlx::Error::Migrate(_) => StorageFailure::Permanent,
+
+        // sqlx::Error is #[non_exhaustive]; an unrecognised future variant is
+        // treated the same as "no sqlx::Error found" — permanent, since
+        // retrying blind is worse than a false-positive dead-letter here.
+        _ => StorageFailure::Permanent,
+    }
+}
+
 // Stable namespace for deterministic event UUIDs (UUIDv5).
 // Using the DNS namespace is arbitrary; what matters is that it is fixed.
 const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
@@ -706,6 +806,154 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     Ok(())
 }
 
+/// A contiguous run of missing ledger sequences in `ledger_metadata`
+/// (issue #216): every ledger in `[from_ledger, to_ledger]` (inclusive) is
+/// absent, while the sequences immediately outside that range are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerGap {
+    pub from_ledger: u64,
+    pub to_ledger: u64,
+}
+
+/// Scan `ledger_metadata` for holes in the processed range (issue #216).
+///
+/// A transient skip — an aborted poll before the transactional commit_page
+/// fix, or a bounded reorg rewind edge (#196) racing a crash — can leave a
+/// sequence permanently missing with no code path that would ever notice.
+/// This finds every contiguous run of missing sequences strictly between the
+/// lowest and highest processed ledger (a hole before the first or after the
+/// last processed ledger is not a gap — it is unprocessed history, which is
+/// what the normal poll loop / an initial backfill handles, not this scan).
+///
+/// `max_gaps` bounds how many gap rows a single call returns, so a
+/// pathologically gappy table cannot make one scan unboundedly expensive —
+/// the caller (a periodic, rate-limited task) picks up whatever it missed on
+/// the next run.
+pub async fn scan_ledger_gaps(
+    pool: &PgPool,
+    max_gaps: i64,
+) -> Result<Vec<LedgerGap>, TridentError> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        r#"
+        WITH ordered AS (
+            SELECT
+                ledger_sequence,
+                LAG(ledger_sequence) OVER (ORDER BY ledger_sequence) AS prev_sequence
+            FROM ledger_metadata
+        )
+        SELECT prev_sequence + 1 AS gap_start, ledger_sequence - 1 AS gap_end
+        FROM ordered
+        WHERE prev_sequence IS NOT NULL
+          AND ledger_sequence - prev_sequence > 1
+        ORDER BY gap_start
+        LIMIT $1
+        "#,
+    )
+    .bind(max_gaps)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("scan_ledger_gaps")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(from_ledger, to_ledger)| LedgerGap {
+            from_ledger: from_ledger as u64,
+            to_ledger: to_ledger as u64,
+        })
+        .collect())
+}
+
+/// Enqueue a `backfill_jobs` row for one gap, so `crates/backfill
+/// --from-queue` picks it up and re-fetches the missing range (issue #216).
+///
+/// Idempotent: `uq_backfill_jobs_pending_range` (migration 0032) makes this a
+/// no-op when an identical pending/running job already exists, so a scan
+/// that re-finds the same still-unrepaired gap on its next run does not pile
+/// up duplicate jobs.
+pub async fn enqueue_backfill_job(
+    pool: &PgPool,
+    gap: LedgerGap,
+    network: &str,
+) -> Result<(), TridentError> {
+    sqlx::query(
+        r#"
+        INSERT INTO backfill_jobs (from_ledger, to_ledger, network)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(gap.from_ledger as i64)
+    .bind(gap.to_ledger as i64)
+    .bind(network)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("enqueue_backfill_job")))?;
+
+    Ok(())
+}
+
+/// Mark `pending`/`running` `backfill_jobs` rows as `done` when their exact
+/// range no longer appears among `current_gaps` (issue #216) — i.e. a scan
+/// confirms the range has since been filled, whether by the backfill worker
+/// or by the live poll loop catching back up over it. Returns the number of
+/// rows closed, for `metrics::record_ledger_gaps_closed`.
+///
+/// Compares on the exact `(from_ledger, to_ledger)` pair rather than range
+/// overlap: `scan_ledger_gaps` always reports the maximal contiguous run of
+/// missing sequences, so a job whose range is only partially filled would
+/// show up in `current_gaps` as a *different*, smaller range — not an exact
+/// match — and is correctly left open rather than closed prematurely.
+pub async fn close_filled_backfill_jobs(
+    pool: &PgPool,
+    network: &str,
+    current_gaps: &[LedgerGap],
+) -> Result<u64, TridentError> {
+    if current_gaps.is_empty() {
+        // Every open job's range is, by definition, no longer a gap.
+        let result = sqlx::query(
+            r#"
+            UPDATE backfill_jobs
+            SET status = 'done', completed_at = NOW()
+            WHERE network = $1 AND status IN ('pending', 'running')
+            "#,
+        )
+        .bind(network)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("close_filled_backfill_jobs"))
+        })?;
+        return Ok(result.rows_affected());
+    }
+
+    let from_ledgers: Vec<i64> = current_gaps.iter().map(|g| g.from_ledger as i64).collect();
+    let to_ledgers: Vec<i64> = current_gaps.iter().map(|g| g.to_ledger as i64).collect();
+
+    let result = sqlx::query(
+        r#"
+        UPDATE backfill_jobs
+        SET status = 'done', completed_at = NOW()
+        WHERE network = $1
+          AND status IN ('pending', 'running')
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest($2::bigint[], $3::bigint[]) AS gap(from_ledger, to_ledger)
+              WHERE gap.from_ledger = backfill_jobs.from_ledger
+                AND gap.to_ledger = backfill_jobs.to_ledger
+          )
+        "#,
+    )
+    .bind(network)
+    .bind(&from_ledgers)
+    .bind(&to_ledgers)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("close_filled_backfill_jobs"))
+    })?;
+
+    Ok(result.rows_affected())
+}
+
 /// Read the latest processed ledger cursor from system_state.
 pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
     let row: (String,) =
@@ -1101,6 +1349,149 @@ pub async fn insert_failed_event(
     Ok(())
 }
 
+/// One row from `failed_events`, as returned by [`list_pending_failed_events`].
+pub struct FailedEventRow {
+    pub id: Uuid,
+    pub ledger_sequence: i64,
+    pub contract_id: String,
+    pub transaction_hash: String,
+    pub error_message: String,
+    pub attempts: i32,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// List dead-lettered events still awaiting replay (`replayed_at IS NULL`),
+/// oldest first — the replay tool's `--list` output and the query the
+/// dead-letter-queue runbook used to ask an operator to run by hand (issue
+/// #574). Uses `idx_failed_events_pending`, the partial index migration 0028
+/// built for exactly this query.
+pub async fn list_pending_failed_events(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<FailedEventRow>, TridentError> {
+    let rows = sqlx::query_as::<_, (Uuid, i64, String, String, String, i32, DateTime<Utc>)>(
+        r#"
+        SELECT id, ledger_sequence, contract_id, transaction_hash, error_message, attempts, occurred_at
+        FROM failed_events
+        WHERE replayed_at IS NULL
+        ORDER BY occurred_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("list_pending_failed_events"))
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                ledger_sequence,
+                contract_id,
+                transaction_hash,
+                error_message,
+                attempts,
+                occurred_at,
+            )| {
+                FailedEventRow {
+                    id,
+                    ledger_sequence,
+                    contract_id,
+                    transaction_hash,
+                    error_message,
+                    attempts,
+                    occurred_at,
+                }
+            },
+        )
+        .collect())
+}
+
+/// How replaying one `failed_events` row turned out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// The event was inserted into `soroban_events` (or already existed there
+    /// under its deterministic UUIDv5 id) and the row is now marked replayed.
+    Replayed,
+    /// No row with this id has `replayed_at IS NULL` — either the id does not
+    /// exist, or it was already replayed. Idempotent callers (a retried
+    /// `--all` run, a double-click on a replay button) see this instead of
+    /// an error.
+    AlreadyReplayedOrMissing,
+}
+
+/// Replay one dead-lettered event: re-run the same insert `commit_page`
+/// would have done (`soroban_events` row plus its outbox row, so a replayed
+/// event still reaches Redis subscribers via `redis_stream::relay`, not just
+/// Postgres), then stamp `replayed_at` — all in one transaction, so a crash
+/// mid-replay can never leave the event inserted but the row still showing
+/// as pending, or vice versa (issue #574).
+///
+/// Idempotent: `insert_events_batch`'s `ON CONFLICT DO NOTHING` on the
+/// deterministic UUIDv5 id (same derivation `event_uuid` uses at ingest time)
+/// makes a second replay of the same row a no-op on `soroban_events`, and the
+/// `WHERE replayed_at IS NULL` guard on the UPDATE below makes the second
+/// replay a no-op on `failed_events` too — replaying twice cannot
+/// double-insert or double-count.
+pub async fn replay_failed_event(pool: &PgPool, id: Uuid) -> Result<ReplayOutcome, TridentError> {
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT event_payload FROM failed_events WHERE id = $1 AND replayed_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event select"))
+    })?;
+
+    let Some((payload,)) = row else {
+        return Ok(ReplayOutcome::AlreadyReplayedOrMissing);
+    };
+
+    let event: SorobanEvent = serde_json::from_value(payload).map_err(|e| {
+        TridentError::storage(
+            anyhow::Error::new(e).context("replay_failed_event deserialise event_payload"),
+        )
+    })?;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event begin"))
+    })?;
+
+    let events = std::slice::from_ref(&event);
+    insert_events_batch(&mut *tx, events).await?;
+    insert_outbox_batch(&mut *tx, events).await?;
+
+    let updated = sqlx::query(
+        "UPDATE failed_events SET replayed_at = NOW() WHERE id = $1 AND replayed_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event mark replayed"))
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("replay_failed_event commit"))
+    })?;
+
+    if updated.rows_affected() == 0 {
+        // Lost a race with a concurrent replay of the same id between the
+        // SELECT above and this UPDATE. The insert it just performed is a
+        // harmless no-op (ON CONFLICT DO NOTHING on the same deterministic
+        // id the other replay used), so this is not an error — just report
+        // it the same way as "already replayed".
+        return Ok(ReplayOutcome::AlreadyReplayedOrMissing);
+    }
+
+    Ok(ReplayOutcome::Replayed)
+}
+
 /// Number of dead-lettered events still awaiting replay. Published as the
 /// `trident_indexer_persist_dead_letter_backlog` gauge each active poll
 /// cycle (and on every dead-letter write), so the non-empty-DLQ alert has a
@@ -1209,6 +1600,57 @@ mod tests {
             topics: vec![],
             data: json!({}),
         }
+    }
+
+    /// Exercises `classify_storage_failure` against `sqlx::Error` variants
+    /// that don't require a database connection to construct. The
+    /// SQLSTATE-string branches (connection/resource/timeout/serialization
+    /// classes → transient, constraint/data-exception classes → permanent)
+    /// are instead exercised end-to-end against a real Postgres error in
+    /// `streamer::tests::transient_db_outage_retries_the_page_instead_of_dead_lettering_it`
+    /// and the existing `poison_event_is_dead_lettered_and_page_still_advances_cursor`.
+    #[test]
+    fn connection_level_io_error_is_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        let err =
+            TridentError::storage(anyhow::Error::new(sqlx::Error::Io(io_err)).context("test"));
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Transient);
+    }
+
+    #[test]
+    fn pool_timeout_is_transient() {
+        let err =
+            TridentError::storage(anyhow::Error::new(sqlx::Error::PoolTimedOut).context("test"));
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Transient);
+    }
+
+    #[test]
+    fn column_decode_error_is_permanent() {
+        let decode_err = Box::<dyn std::error::Error + Send + Sync>::from("bad column");
+        let err = TridentError::storage(
+            anyhow::Error::new(sqlx::Error::ColumnDecode {
+                index: "0".to_string(),
+                source: decode_err,
+            })
+            .context("test"),
+        );
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Permanent);
+    }
+
+    #[test]
+    fn error_with_no_sqlx_source_is_permanent() {
+        // e.g. the ledger-timestamp DateTime parse failure in commit_page:
+        // a TridentError::StorageError whose source chain never touched
+        // sqlx at all. Retrying an identical page cannot change a parse
+        // outcome, so this must not be treated as retryable.
+        let err = TridentError::storage(anyhow::anyhow!("not a valid timestamp"));
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Permanent);
+    }
+
+    #[test]
+    fn non_storage_error_is_permanent() {
+        let err = TridentError::config(anyhow::anyhow!("missing DATABASE_URL"));
+        assert_eq!(classify_storage_failure(&err), StorageFailure::Permanent);
     }
 
     /// Deterministic UUID: same inputs must produce the same id.
@@ -1348,6 +1790,85 @@ mod tests {
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
     }
 
+    /// The `chk_soroban_events_network` CHECK constraint (migration 0031,
+    /// issue #252) must reject a row whose network is neither 'mainnet' nor
+    /// 'testnet' — the failure mode this exists to close is a typo like
+    /// 'tesnet' silently creating an invisible data partition.
+    #[tokio::test]
+    async fn soroban_events_rejects_unknown_network() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CNETCHK_{}", Uuid::new_v4());
+        let result = sqlx::query(
+            "INSERT INTO soroban_events \
+             (contract_id, ledger_sequence, ledger_timestamp, transaction_hash, \
+              event_index, event_type, network) \
+             VALUES ($1, 1, NOW(), 'txhash_netchk', 0, 'contract', 'tesnet')",
+        )
+        .bind(&contract_id)
+        .execute(&pool)
+        .await;
+
+        assert!(
+            result.is_err(),
+            "insert with network='tesnet' must violate chk_soroban_events_network"
+        );
+
+        // Belt and braces: confirm nothing landed despite the driver error.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count query failed");
+        assert_eq!(count.0, 0);
+    }
+
+    /// A known network value must still be accepted (the constraint is not
+    /// over-broad).
+    #[tokio::test]
+    async fn soroban_events_accepts_known_network() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CNETOK_{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO soroban_events \
+             (contract_id, ledger_sequence, ledger_timestamp, transaction_hash, \
+              event_index, event_type, network) \
+             VALUES ($1, 1, NOW(), 'txhash_netok', 0, 'contract', 'testnet')",
+        )
+        .bind(&contract_id)
+        .execute(&pool)
+        .await
+        .expect("insert with a known network must succeed");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+    }
+
     /// An empty batch must be a no-op rather than an invalid statement.
     #[tokio::test]
     async fn empty_batch_is_a_noop() {
@@ -1432,6 +1953,183 @@ mod tests {
 
         sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
             .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// scan_ledger_gaps must find every contiguous hole strictly between the
+    /// lowest and highest processed ledger, and must not report anything
+    /// before the first or after the last processed sequence (issue #216).
+    #[tokio::test]
+    async fn scan_ledger_gaps_finds_holes_but_not_the_edges() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Distinct range for this test: 7_500_000..7_500_020 with two holes,
+        // one 1-ledger and one 3-ledger.
+        let base = 7_500_000u64;
+        // Present: base, base+1 | gap: base+2 | present: base+3..=base+5 |
+        // gap: base+6..=base+8 | present: base+9.
+        let present: &[u64] = &[base, base + 1, base + 3, base + 4, base + 5, base + 9];
+        for &seq in present {
+            sqlx::query(
+                "INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp) \
+                 VALUES ($1, $2, NOW()) ON CONFLICT (ledger_sequence) DO NOTHING",
+            )
+            .bind(seq as i64)
+            .bind(format!("hash-{seq}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let gaps = scan_ledger_gaps(&pool, 100).await.unwrap();
+        let found: Vec<LedgerGap> = gaps
+            .into_iter()
+            .filter(|g| g.from_ledger >= base && g.to_ledger <= base + 9)
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![
+                LedgerGap {
+                    from_ledger: base + 2,
+                    to_ledger: base + 2
+                },
+                LedgerGap {
+                    from_ledger: base + 6,
+                    to_ledger: base + 8
+                },
+            ],
+            "must find exactly the two holes, ordered by start, and nothing at the edges"
+        );
+
+        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
+            .bind(base as i64)
+            .bind((base + 9) as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// enqueue_backfill_job must be idempotent for the same pending range
+    /// (issue #216): a repeat scan finding the same unrepaired gap must not
+    /// create a duplicate job.
+    #[tokio::test]
+    async fn enqueue_backfill_job_is_idempotent_for_pending_jobs() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let network = format!("gaptest-{}", Uuid::new_v4());
+        let gap = LedgerGap {
+            from_ledger: 8_100_000,
+            to_ledger: 8_100_010,
+        };
+
+        enqueue_backfill_job(&pool, gap, &network).await.unwrap();
+        enqueue_backfill_job(&pool, gap, &network).await.unwrap();
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count.0, 1,
+            "the same pending range must not be enqueued twice"
+        );
+
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// close_filled_backfill_jobs must mark a job done once its exact range
+    /// is no longer among the current gaps, and must leave a job whose range
+    /// is still (even partially) a gap alone (issue #216).
+    #[tokio::test]
+    async fn close_filled_backfill_jobs_closes_exact_matches_only() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let network = format!("gaptest-{}", Uuid::new_v4());
+        let filled_gap = LedgerGap {
+            from_ledger: 8_200_000,
+            to_ledger: 8_200_010,
+        };
+        let still_open_gap = LedgerGap {
+            from_ledger: 8_300_000,
+            to_ledger: 8_300_010,
+        };
+        enqueue_backfill_job(&pool, filled_gap, &network)
+            .await
+            .unwrap();
+        enqueue_backfill_job(&pool, still_open_gap, &network)
+            .await
+            .unwrap();
+
+        // Only still_open_gap is reported as a current gap: filled_gap has
+        // since been backfilled.
+        let closed = close_filled_backfill_jobs(&pool, &network, &[still_open_gap])
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+
+        let filled_status: String = sqlx::query_scalar(
+            "SELECT status FROM backfill_jobs WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&network)
+        .bind(filled_gap.from_ledger as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(filled_status, "done");
+
+        let open_status: String = sqlx::query_scalar(
+            "SELECT status FROM backfill_jobs WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&network)
+        .bind(still_open_gap.from_ledger as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            open_status, "pending",
+            "a job still reported as a gap must not be closed"
+        );
+
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
             .execute(&pool)
             .await
             .unwrap();
@@ -2052,5 +2750,196 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// A row inserted via `insert_failed_event` must appear in
+    /// `list_pending_failed_events` until it is replayed, and disappear from
+    /// that listing (while staying in the table) once it is (issue #574).
+    #[tokio::test]
+    async fn list_pending_failed_events_excludes_replayed_rows() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CPENDING_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 998, 0);
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_failed_event(&pool, &event, "simulated failure", 3)
+            .await
+            .unwrap();
+
+        let id: (Uuid,) = sqlx::query_as("SELECT id FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let pending = list_pending_failed_events(&pool, 1000).await.unwrap();
+        assert!(
+            pending.iter().any(|row| row.id == id.0),
+            "freshly dead-lettered row must be listed as pending"
+        );
+
+        let outcome = replay_failed_event(&pool, id.0).await.unwrap();
+        assert_eq!(outcome, ReplayOutcome::Replayed);
+
+        let pending_after = list_pending_failed_events(&pool, 1000).await.unwrap();
+        assert!(
+            !pending_after.iter().any(|row| row.id == id.0),
+            "replayed row must no longer be listed as pending"
+        );
+
+        let still_in_table: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE id = $1")
+                .bind(id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            still_in_table.0, 1,
+            "replay marks the row done, it does not delete it"
+        );
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// The event ends up in `soroban_events` after replay, `replayed_at` is
+    /// stamped, and — the idempotency guarantee the deterministic UUIDv5 key
+    /// and `ON CONFLICT DO NOTHING` are supposed to provide — replaying the
+    /// same id a second time neither double-inserts the event nor errors
+    /// (issue #574).
+    #[tokio::test]
+    async fn replay_failed_event_persists_event_and_is_idempotent() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CREPLAY_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 997, 0);
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_failed_event(&pool, &event, "simulated failure", 3)
+            .await
+            .unwrap();
+        let id: (Uuid,) = sqlx::query_as("SELECT id FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replay_failed_event(&pool, id.0).await.unwrap(),
+            ReplayOutcome::Replayed
+        );
+
+        let persisted: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted.0, 1, "the event must now exist in soroban_events");
+
+        let replayed_at: (Option<DateTime<Utc>>,) =
+            sqlx::query_as("SELECT replayed_at FROM failed_events WHERE id = $1")
+                .bind(id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(replayed_at.0.is_some(), "replayed_at must be stamped");
+
+        // Replaying again must be a no-op: AlreadyReplayedOrMissing, not a
+        // second row in soroban_events.
+        assert_eq!(
+            replay_failed_event(&pool, id.0).await.unwrap(),
+            ReplayOutcome::AlreadyReplayedOrMissing
+        );
+        let persisted_again: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted_again.0, 1,
+            "a second replay must not double-insert"
+        );
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Replaying an id that was never dead-lettered must not error — the
+    /// same "idempotent, not a hard failure" contract as replaying twice.
+    #[tokio::test]
+    async fn replay_failed_event_missing_id_is_not_an_error() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let outcome = replay_failed_event(&pool, Uuid::new_v4()).await.unwrap();
+        assert_eq!(outcome, ReplayOutcome::AlreadyReplayedOrMissing);
     }
 }

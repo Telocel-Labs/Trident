@@ -16,7 +16,11 @@
 //!   #200). Redis delivery is owned by `redis_stream::relay`, so a crash
 //!   between the commit and the publish cannot drop an event.
 
+mod circuit_breaker;
+
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
@@ -34,9 +38,66 @@ use crate::{
     rpc::{filters::build_event_filters, FilterPlan, RpcClient, RpcHttpSettings},
     token_metadata,
 };
+pub use circuit_breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, Outcome};
+
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
 const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
+
+/// Applies full jitter to a backoff duration (issue #197): without it,
+/// multiple indexer replicas (or a restart storm) computing the same
+/// `ExponentialBackoff` schedule retry in lockstep against the same RPC
+/// endpoint, turning a transient blip into a synchronised thundering herd.
+///
+/// Deliberately dependency-free rather than pulling in `rand`: seeds a small
+/// xorshift generator from process-local sources that vary call to call
+/// (the current instant relative to an epoch fixed at first use, a memory
+/// address, and the duration being jittered), which is enough entropy to
+/// decorrelate concurrent processes without adding a crate whose only other
+/// use in this binary would be here. Scales the input duration by a factor
+/// drawn uniformly from [0.5, 1.0] — "full jitter" per the AWS
+/// backoff-jitter algorithms writeup, which caps the added randomness at the
+/// base delay itself rather than compounding it past `max_delay`.
+fn jitter(duration: Duration) -> Duration {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let epoch = *EPOCH.get_or_init(Instant::now);
+
+    let mut hasher = DefaultHasher::new();
+    Instant::now().duration_since(epoch).hash(&mut hasher);
+    // A monotonic per-process counter guarantees the seed changes even if two
+    // calls land on the same clock tick (coarse timer resolution on some
+    // platforms) or the same stack address (tail-call/inlining).
+    CALL_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .hash(&mut hasher);
+    // A stack address is effectively unpredictable ASLR noise and differs
+    // across concurrent tasks/processes even when called at the same instant.
+    let stack_marker = &hasher as *const _ as usize;
+    stack_marker.hash(&mut hasher);
+    duration.hash(&mut hasher);
+    let seed = hasher.finish();
+
+    // xorshift64* — fast, deterministic given a seed, good enough dispersion
+    // for jitter (this is not security-sensitive).
+    let mut x = seed | 1; // must be non-zero
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    let unit = (x >> 11) as f64 / (1u64 << 53) as f64; // in [0, 1)
+
+    let factor = 0.5 + unit * 0.5; // in [0.5, 1.0)
+    duration.mul_f64(factor)
+}
+/// How often (in poll loop iterations) the gap scan runs (issue #216). Much
+/// less frequent than the filter refresh above: a gap scan reads the whole
+/// `ledger_metadata` table's sequence column via a window function, and a
+/// gap that has existed for one poll interval will still be there in ten
+/// minutes, so there is no correctness reason to run it more often than
+/// this. At the default 5s poll interval this is ~10 minutes.
+const GAP_SCAN_EVERY_N_POLLS: u32 = 120;
 
 pub struct Streamer {
     config: Config,
@@ -72,6 +133,9 @@ pub struct Streamer {
     /// #269) — what bounds storage-snapshot fetching (issue #270) to
     /// contracts we actually know how to read a balance from.
     token_contracts: HashSet<String>,
+    /// Trips after sustained RPC failures so the run loop stops attempting
+    /// polls during an outage instead of retrying every interval (issue #197).
+    rpc_breaker: CircuitBreaker,
 }
 
 /// One contract-storage snapshot change observed during a poll cycle,
@@ -127,6 +191,10 @@ impl Streamer {
             high_watermark: config.lag_high_watermark,
             hysteresis_ledgers: config.poll_hysteresis_ledgers,
         });
+        let rpc_breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: config.rpc_breaker_failure_threshold,
+            cooldown: config.rpc_breaker_cooldown,
+        });
 
         Ok(Self {
             config,
@@ -142,6 +210,7 @@ impl Streamer {
             spec_cache: crate::spec::SpecCache::new(),
             known_code_hashes: std::collections::HashMap::new(),
             token_contracts: HashSet::new(),
+            rpc_breaker,
         })
     }
 
@@ -253,6 +322,66 @@ impl Streamer {
         }
     }
 
+    /// Scan `ledger_metadata` for gaps in the processed range and enqueue a
+    /// `backfill_jobs` row for each, so `crates/backfill --from-queue` can
+    /// re-fetch the missing ledgers (issue #216).
+    ///
+    /// Also reconciles the other direction: any previously-enqueued job whose
+    /// range no longer shows up as a gap has been filled (by the backfill
+    /// worker, or by the poll loop itself catching back up over it) and is
+    /// marked `done`.
+    ///
+    /// Best-effort: a DB failure here is logged and the scan is skipped this
+    /// cycle rather than propagated — this is a periodic maintenance task,
+    /// not part of the ingest path, and the next scheduled scan will retry
+    /// (issue #216 explicitly asks that the scan not compete with or block
+    /// live polling).
+    async fn scan_and_enqueue_gaps(&mut self) {
+        let gaps = match db::scan_ledger_gaps(&self.db, self.config.gap_scan_max_per_run).await {
+            Ok(gaps) => gaps,
+            Err(e) => {
+                tracing::warn!(error = %e, "Gap scan failed; will retry on the next scheduled scan");
+                return;
+            }
+        };
+
+        match db::close_filled_backfill_jobs(&self.db, &self.config.network, &gaps).await {
+            Ok(closed) if closed > 0 => {
+                metrics::record_ledger_gaps_closed(closed);
+                tracing::info!(
+                    closed,
+                    "Gap scan: previously-enqueued backfill jobs confirmed filled"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to reconcile completed backfill jobs");
+            }
+        }
+
+        if gaps.is_empty() {
+            return;
+        }
+
+        metrics::record_ledger_gaps_detected(gaps.len() as u64);
+        tracing::warn!(
+            gap_count = gaps.len(),
+            first_gap = ?gaps.first(),
+            "Gap scan: found holes in the processed ledger range; enqueuing backfill jobs"
+        );
+
+        for gap in &gaps {
+            if let Err(e) = db::enqueue_backfill_job(&self.db, *gap, &self.config.network).await {
+                tracing::warn!(
+                    from_ledger = gap.from_ledger,
+                    to_ledger = gap.to_ledger,
+                    error = %e,
+                    "Failed to enqueue backfill job for a detected gap"
+                );
+            }
+        }
+    }
+
     /// Start the polling loop. Runs until `shutdown` is cancelled, always
     /// finishing the current `poll_once` before stopping (never mid-batch).
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
@@ -296,56 +425,92 @@ impl Streamer {
                 self.sync_contract_specs().await;
             }
 
-            let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
-            match self.poll_once(&mut cursor).instrument(poll_span).await {
-                Ok(events_processed) => {
-                    if events_processed > 0 {
-                        tracing::info!(events_processed, cursor, "Batch processed");
-                    } else {
-                        tracing::debug!(cursor, "No new events");
-                    }
-                }
-                Err(e) => {
-                    metrics::record_poll_error();
-                    // Branch on the structured classification: transient failures
-                    // are retried on the next interval (the cursor is safe), poison
-                    // input is skipped, and fatal errors halt the streamer.
-                    match e.severity() {
-                        Severity::Fatal => {
-                            tracing::error!(error = %e, "Fatal error, halting streamer");
-                            return Err(e);
+            // Periodically scan for gaps in the processed ledger range and
+            // enqueue backfill jobs to close them (issue #216). Runs far less
+            // often than every cycle (see GAP_SCAN_EVERY_N_POLLS) so it never
+            // competes with live ingest for DB time; failures are logged and
+            // skipped rather than propagated, since a missed scan is not a
+            // reason to halt or retry the whole poll cycle — the next
+            // scheduled scan will pick the gap up.
+            if self.poll_count.is_multiple_of(GAP_SCAN_EVERY_N_POLLS) {
+                self.scan_and_enqueue_gaps().await;
+            }
+
+            // Circuit breaker (issue #197): while Open, skip the poll body
+            // entirely and let the loop fall through to the sleep below,
+            // rather than spending an RPC round-trip (and its 5-attempt
+            // retry budget) on an endpoint that has already told us it is
+            // down. should_allow() flips Open -> HalfOpen once the cooldown
+            // has elapsed, letting exactly one probe cycle through.
+            metrics::set_rpc_breaker_state(self.rpc_breaker.state());
+            metrics::set_rpc_breaker_consecutive_failures(self.rpc_breaker.consecutive_failures());
+            if !self.rpc_breaker.should_allow() {
+                tracing::warn!(
+                    consecutive_failures = self.rpc_breaker.consecutive_failures(),
+                    "RPC circuit breaker open; skipping poll cycle"
+                );
+            } else {
+                let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
+                match self.poll_once(&mut cursor).instrument(poll_span).await {
+                    Ok(events_processed) => {
+                        self.rpc_breaker.record(Outcome::Success);
+                        if events_processed > 0 {
+                            tracing::info!(events_processed, cursor, "Batch processed");
+                        } else {
+                            tracing::debug!(cursor, "No new events");
                         }
-                        Severity::Retryable => {
-                            // A fresh index anchors at ledger 1, but the RPC
-                            // prunes old ledgers, so on a network whose retained
-                            // window has moved past 1 every poll is rejected
-                            // identically and the cursor never advances —
-                            // retrying alone can never clear it (issue #388).
-                            // Adopt the floor the error reports so the next poll
-                            // starts inside the retained window.
-                            match parse_retained_floor(&e.to_string()) {
-                                Some(floor) if cursor < floor.saturating_sub(1) => {
-                                    // page_request_params sends `cursor + 1`, so
-                                    // store floor - 1 to make the next request
-                                    // anchor exactly at the oldest retained ledger.
-                                    cursor = floor.saturating_sub(1);
-                                    tracing::warn!(
-                                        error = %e,
-                                        retained_floor = floor,
-                                        cursor,
-                                        "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
-                                    );
-                                }
-                                _ => {
-                                    tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                    }
+                    Err(e) => {
+                        metrics::record_poll_error();
+                        self.rpc_breaker.record(if e.is_rpc() {
+                            Outcome::RpcFailure
+                        } else {
+                            Outcome::Success
+                        });
+                        // Branch on the structured classification: transient failures
+                        // are retried on the next interval (the cursor is safe), poison
+                        // input is skipped, and fatal errors halt the streamer.
+                        match e.severity() {
+                            Severity::Fatal => {
+                                tracing::error!(error = %e, "Fatal error, halting streamer");
+                                return Err(e);
+                            }
+                            Severity::Retryable => {
+                                // A fresh index anchors at ledger 1, but the RPC
+                                // prunes old ledgers, so on a network whose retained
+                                // window has moved past 1 every poll is rejected
+                                // identically and the cursor never advances —
+                                // retrying alone can never clear it (issue #388).
+                                // Adopt the floor the error reports so the next poll
+                                // starts inside the retained window.
+                                match parse_retained_floor(&e.to_string()) {
+                                    Some(floor) if cursor < floor.saturating_sub(1) => {
+                                        // page_request_params sends `cursor + 1`, so
+                                        // store floor - 1 to make the next request
+                                        // anchor exactly at the oldest retained ledger.
+                                        cursor = floor.saturating_sub(1);
+                                        tracing::warn!(
+                                            error = %e,
+                                            retained_floor = floor,
+                                            cursor,
+                                            "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                                    }
                                 }
                             }
-                        }
-                        Severity::Skip => {
-                            tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
+                            Severity::Skip => {
+                                tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
+                            }
                         }
                     }
                 }
+                metrics::set_rpc_breaker_state(self.rpc_breaker.state());
+                metrics::set_rpc_breaker_consecutive_failures(
+                    self.rpc_breaker.consecutive_failures(),
+                );
             }
 
             // Derive the next poll interval from the current chain-tip lag:
@@ -600,6 +765,12 @@ impl Streamer {
         let cursor_at_start = *cursor;
         let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
 
+        // Reorg check (issue #196): before fetching anything new, confirm the
+        // ledgers we already persisted still match what the RPC reports for
+        // those sequences. Run before the partition-ranges query too, since a
+        // reorg can change which range the cursor should resume from.
+        self.check_and_handle_reorg(cursor).await?;
+
         // Query the named partition ranges once per poll cycle so every insert
         // in this cycle can check whether it would fall outside them and land
         // in the DEFAULT catch-all partition (issue #525).
@@ -626,8 +797,12 @@ impl Streamer {
                 )));
             }
         };
+        // Full jitter (issue #197): without it, every indexer replica computes
+        // the identical backoff schedule and retries in lockstep against the
+        // same RPC endpoint on a shared outage.
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
+            .map(jitter)
             .take(5);
 
         // The first page of a poll anchors by ledger (startLedger); every later
@@ -1233,17 +1408,25 @@ fn parse_retained_floor(message: &str) -> Option<u64> {
 ///    failures are transient (a connection blip, a lock wait, a statement
 ///    timeout) and clear well within this budget.
 /// 2. If the whole page still cannot be committed atomically, commit each
-///    event individually instead. This is the mechanism that actually
-///    distinguishes "transient" from "permanent": an event that keeps
-///    failing even in isolation, with nothing else in its transaction that
-///    could be the real cause, is genuinely unpersistable right now. One that
-///    succeeds alone was never the problem — some other row in the original
-///    batch was, and this isolates it without guessing at error strings.
-/// 3. Events that still fail after per-event retries are written to
-///    `failed_events` (a dead-letter queue analogous to `parse_errors`, but
-///    for well-formed events whose storage write failed rather than events
-///    that failed to decode) and skipped, so the page's cursor/ledger
-///    metadata commit — and therefore progress — is never blocked on them.
+///    event individually instead. "An event that keeps failing even in
+///    isolation, with nothing else in its transaction that could be the real
+///    cause, is genuinely unpersistable right now" only holds when the
+///    failure is specific to that event — during a failover, lock storm, or
+///    pool exhaustion, every event fails identically in isolation too. Stage
+///    3 below is what actually tells the two apart, via
+///    `db::classify_storage_failure` rather than guessing at error strings
+///    (issue #573).
+/// 3. An event still failing after per-event retries is classified: a
+///    transient storage failure (the database, not the row, is the problem)
+///    propagates immediately so the whole page is retried on the next poll —
+///    duplicates are already absorbed downstream by the deterministic
+///    UUIDv5 keys and `ON CONFLICT DO NOTHING`, so a retry is safe in a way
+///    dead-lettering healthy events is not. A permanent failure (a
+///    constraint violation, a data-type error) is written to `failed_events`
+///    (a dead-letter queue analogous to `parse_errors`, but for well-formed
+///    events whose storage write failed rather than events that failed to
+///    decode) and skipped, so the page's cursor/ledger metadata commit — and
+///    therefore progress — is never blocked on it.
 ///
 /// `invocation_metrics` and `storage_snapshots` are supplementary projections
 /// keyed by (contract, transaction) rather than by individual event; they are
@@ -1341,6 +1524,27 @@ async fn commit_page_with_fallback(
         .await;
 
         if let Err(e) = result {
+            // Distinguish a poison event from a database that is merely
+            // unavailable right now (issue #573). Per-event isolation's
+            // inference — "an event that fails even alone is unpersistable" —
+            // only holds when the failure is specific to that event. During a
+            // failover, lock storm, or pool exhaustion every event in the
+            // page fails identically in isolation, and without this check the
+            // whole (otherwise healthy) page was dead-lettered wholesale
+            // instead of retried.
+            if db::classify_storage_failure(&e) == db::StorageFailure::Transient {
+                tracing::warn!(
+                    contract_id = %event.contract_id,
+                    tx_hash = %event.transaction_hash,
+                    ledger = event.ledger_sequence,
+                    error = %e,
+                    attempts,
+                    "Event failed to persist after per-event retries with a transient storage \
+                     error; propagating instead of dead-lettering so the whole page retries"
+                );
+                return Err(e);
+            }
+
             tracing::error!(
                 contract_id = %event.contract_id,
                 tx_hash = %event.transaction_hash,
@@ -1509,6 +1713,36 @@ mod tests {
         assert_eq!(page_request_params(floor - 1, None), (Some(7), None));
     }
 
+    // Pure unit tests for jitter (issue #197) — no services required.
+    #[test]
+    fn jitter_stays_within_full_jitter_bounds() {
+        let base = Duration::from_millis(1000);
+        for _ in 0..1000 {
+            let jittered = jitter(base);
+            assert!(
+                jittered >= base.mul_f64(0.5) && jittered <= base,
+                "jittered duration {jittered:?} must stay within [50%, 100%] of {base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_of_zero_is_zero() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_varies_across_calls() {
+        // Not a statistical test — just confirms this isn't a no-op that
+        // always returns the same fraction of the input.
+        let base = Duration::from_millis(1000);
+        let samples: std::collections::HashSet<Duration> = (0..50).map(|_| jitter(base)).collect();
+        assert!(
+            samples.len() > 1,
+            "expected multiple distinct jittered values, got {samples:?}"
+        );
+    }
+
     fn sym_xdr(s: &str) -> String {
         let val = ScVal::Symbol(ScSymbol::try_from(s.to_string()).unwrap());
         let mut buf = vec![];
@@ -1553,6 +1787,37 @@ mod tests {
         })
     }
 
+    /// Like `events_page`, but scoped to a caller-chosen `contract_id` so a
+    /// test can assert on rows for its own contract without colliding with
+    /// `"CTEST"` fixtures elsewhere.
+    fn events_page_for_contract(contract_id: &str, ledger: u64, count: usize) -> serde_json::Value {
+        let events: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": contract_id,
+                    "id": format!("{:016}-{}", ledger, i),
+                    "pagingToken": format!("{}-{}", ledger, i),
+                    "txHash": format!("hash{:x}{}", ledger, i),
+                    "topic": [sym_xdr("transfer")],
+                    "value": void_xdr(),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": ledger
+            }
+        })
+    }
+
     fn error_500() -> ResponseTemplate {
         ResponseTemplate::new(500).set_body_string("Internal Server Error")
     }
@@ -1573,6 +1838,18 @@ mod tests {
 
     async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
         let db = sqlx::PgPool::connect(db_url).await.unwrap();
+        make_streamer_with_pool(db, db_url, redis_url, rpc_url).await
+    }
+
+    /// Like `make_streamer`, but takes an already-built pool so a test can
+    /// configure it first (e.g. a single connection with a fixed
+    /// `statement_timeout`, for `transient_db_outage_retries_the_page_instead_of_dead_lettering_it`).
+    async fn make_streamer_with_pool(
+        db: sqlx::PgPool,
+        db_url: &str,
+        redis_url: &str,
+        rpc_url: String,
+    ) -> Streamer {
         let config = Config {
             stellar_rpc_url: rpc_url.clone(),
             database_url: db_url.to_string(),
@@ -1585,9 +1862,13 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
+            max_reorg_rewind_depth: 50,
+            gap_scan_max_per_run: 100,
             stellar_rpc_urls: vec![rpc_url],
             rpc_failover_threshold: 3,
             rpc_endpoint_cooldown: Duration::from_secs(30),
+            rpc_breaker_failure_threshold: 5,
+            rpc_breaker_cooldown: Duration::from_secs(30),
             rpc_connect_timeout: Duration::from_secs(5),
             rpc_request_timeout: Duration::from_secs(30),
             rpc_pool_idle_timeout: Duration::from_secs(90),
@@ -1663,6 +1944,156 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 3, "expected 3 events in soroban_events");
+    }
+
+    /// A sustained RPC outage (repeated 5xx) must trip the circuit breaker
+    /// after `rpc_breaker_failure_threshold` consecutive failures, and once
+    /// Open, the run loop must stop calling the RPC at all rather than
+    /// retrying every poll interval (issue #197). This drives the same
+    /// should_allow/poll_once/record sequence `run()` uses, since `run()`
+    /// itself loops forever and is not directly testable.
+    #[tokio::test]
+    async fn sustained_rpc_outage_trips_breaker_and_stops_polling() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        // Deterministic threshold/cooldown for this test, independent of the
+        // Config default baked into make_streamer.
+        s.rpc_breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 3,
+            cooldown: Duration::from_secs(3600), // long enough not to elapse mid-test
+        });
+
+        let mut cursor = db::get_cursor(&s.db).await.unwrap();
+
+        for _ in 0..3 {
+            assert!(s.rpc_breaker.should_allow());
+            let result = s.poll_once(&mut cursor).await;
+            let err = result.expect_err("mocked 500 response must surface as an error");
+            assert!(err.is_rpc(), "a getEvents 5xx must classify as RpcError");
+            s.rpc_breaker.record(Outcome::RpcFailure);
+        }
+
+        assert_eq!(s.rpc_breaker.state(), BreakerState::Open);
+        assert_eq!(s.rpc_breaker.consecutive_failures(), 3);
+
+        let hits_at_open = server
+            .received_requests()
+            .await
+            .expect("request recording must be enabled by default")
+            .len();
+        assert!(
+            hits_at_open > 0,
+            "sanity check: the mock must have actually been hit while closed"
+        );
+        assert!(
+            !s.rpc_breaker.should_allow(),
+            "must stay open before cooldown elapses"
+        );
+
+        // Simulate several more loop iterations the way run() would: since
+        // should_allow() is false, poll_once must never be called, so the
+        // mock's hit count must not grow.
+        for _ in 0..3 {
+            if s.rpc_breaker.should_allow() {
+                let _ = s.poll_once(&mut cursor).await;
+            }
+        }
+        let hits_after = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            hits_after, hits_at_open,
+            "an open breaker must not issue any further RPC calls"
+        );
+    }
+
+    /// scan_and_enqueue_gaps must enqueue a backfill_jobs row for a hole in
+    /// ledger_metadata, and a later run — once the hole is filled — must
+    /// close that job rather than leaving it pending forever (issue #216).
+    #[tokio::test]
+    async fn scan_and_enqueue_gaps_enqueues_then_closes() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let base = 7_600_000u64;
+        // A single-ledger hole at base+1: base and base+2 are present.
+        for &seq in &[base, base + 2] {
+            sqlx::query(
+                "INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp) \
+                 VALUES ($1, $2, NOW()) ON CONFLICT (ledger_sequence) DO NOTHING",
+            )
+            .bind(seq as i64)
+            .bind(format!("hash-{seq}"))
+            .execute(&s.db)
+            .await
+            .unwrap();
+        }
+
+        s.scan_and_enqueue_gaps().await;
+
+        let job: (i64, i64, String) = sqlx::query_as(
+            "SELECT from_ledger, to_ledger, status FROM backfill_jobs \
+             WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&s.config.network)
+        .bind((base + 1) as i64)
+        .fetch_one(&s.db)
+        .await
+        .expect("a job for the detected gap must have been enqueued");
+        assert_eq!(
+            job,
+            ((base + 1) as i64, (base + 1) as i64, "pending".to_string())
+        );
+
+        // Fill the hole, as if a backfill worker or the poll loop had caught
+        // it, and re-scan: the job must now be closed.
+        sqlx::query(
+            "INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp) \
+             VALUES ($1, $2, NOW()) ON CONFLICT (ledger_sequence) DO NOTHING",
+        )
+        .bind((base + 1) as i64)
+        .bind("hash-filled")
+        .execute(&s.db)
+        .await
+        .unwrap();
+
+        s.scan_and_enqueue_gaps().await;
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM backfill_jobs WHERE network = $1 AND from_ledger = $2",
+        )
+        .bind(&s.config.network)
+        .bind((base + 1) as i64)
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "done",
+            "the job must be closed once the gap is filled"
+        );
+
+        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
+            .bind(base as i64)
+            .bind((base + 2) as i64)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1 AND from_ledger = $2")
+            .bind(&s.config.network)
+            .bind((base + 1) as i64)
+            .execute(&s.db)
+            .await
+            .unwrap();
     }
 
     /// A single event with an unparseable `ledgerClosedAt` poisons the whole
@@ -1789,6 +2220,144 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+    }
+
+    /// Issue #573's DB-down case: every event in an otherwise-healthy page
+    /// fails identically, in isolation, not because any of them is bad but
+    /// because the database itself is unreachable — here simulated with an
+    /// EXCLUSIVE table lock held by another session plus a short
+    /// `statement_timeout`, so every INSERT attempt fails with a real
+    /// Postgres `57014 query_canceled` (transient) rather than a mocked
+    /// error. Before `classify_storage_failure`, `commit_page_with_fallback`
+    /// could not tell this apart from a poison event and would dead-letter
+    /// every event in the page wholesale. It must instead propagate the
+    /// error so the page is retried, leaving the cursor exactly where it
+    /// was and neither table touched.
+    #[tokio::test]
+    async fn transient_db_outage_retries_the_page_instead_of_dead_lettering_it() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let contract_id = format!("CDBDOWN_{}", uuid::Uuid::new_v4());
+        // Must fall inside a named partition, same constraint as the poison-
+        // event test above: migration 0017 creates 0-6M and 50M-60M with a
+        // gap between, and the #525 exhaustion guard rejects anything the
+        // gap would send to soroban_events_default.
+        let ledger = 5_100_000u64;
+        let page = events_page_for_contract(&contract_id, ledger, 2);
+
+        // Every getEvents call serves the same two-event page: the first
+        // poll fails on the locked table, and the retry once the outage
+        // clears must re-fetch those same events and persist them. A mock
+        // that served an empty page on the retry would prove nothing — the
+        // cursor would stay put and no rows would land, which is exactly
+        // the data loss this test exists to rule out.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(page))
+            .mount(&server)
+            .await;
+        // A single-connection pool with statement_timeout fixed at connect
+        // time (mirroring main.rs's after_connect setup, issue #249): with
+        // only one connection, every query the streamer issues — whole-page
+        // and per-event alike — is guaranteed to run on the connection this
+        // timeout was set on, rather than a `SET` on one pooled connection
+        // that a later query might not reuse.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '200ms'")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&db_url)
+            .await
+            .unwrap();
+        let mut s = make_streamer_with_pool(db, &db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        // Hold an EXCLUSIVE lock on soroban_events from a separate session so
+        // every INSERT the streamer attempts — whole-page and per-event alike
+        // — blocks until it hits the statement_timeout above. The lock is
+        // never committed, so it is released unconditionally when this
+        // connection is dropped, even if an assertion below panics.
+        let locker = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let mut lock_tx = locker.begin().await.unwrap();
+        sqlx::query("LOCK TABLE soroban_events IN EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        let mut cursor = 0u64;
+        let result = s.poll_once(&mut cursor).await;
+
+        // Drop (implicit rollback) before asserting, so a failed assertion
+        // can't leave the lock held for the rest of the test binary.
+        drop(lock_tx);
+        locker.close().await;
+
+        assert!(
+            result.is_err(),
+            "a page that cannot reach the database at all must propagate an error, not report success"
+        );
+        assert_eq!(
+            cursor, 0,
+            "the cursor must not advance past events that were never actually persisted"
+        );
+
+        let persisted: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted.0, 0,
+            "nothing should have been persisted during the outage"
+        );
+
+        let dead_lettered: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            dead_lettered.0, 0,
+            "a transient outage must not dead-letter healthy events — issue #573"
+        );
+
+        // The outage has cleared (the lock was released above): a retry of
+        // the same page must now succeed and persist both events, proving no
+        // data was lost by propagating instead of dead-lettering.
+        sqlx::query("SET statement_timeout = '30s'")
+            .execute(&s.db)
+            .await
+            .unwrap();
+        s.poll_once(&mut cursor)
+            .await
+            .expect("retry after the outage clears must succeed");
+        assert_eq!(cursor, ledger);
+
+        let persisted_after_retry: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted_after_retry.0, 2,
+            "both events must land once the database recovers"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
             .bind(&contract_id)
             .execute(&s.db)
             .await

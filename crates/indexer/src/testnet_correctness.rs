@@ -432,4 +432,3 @@ fn reorg_rollback_handling_rewinds_cursor_and_prunes_orphaned_events() {
     canonical_chain.insert(105);
     assert_eq!(canonical_chain.len(), 5);
 }
-

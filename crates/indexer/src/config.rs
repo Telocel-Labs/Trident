@@ -18,6 +18,12 @@ pub struct Config {
     /// How long a failed endpoint is parked before it is probed again (issue #213).
     #[allow(dead_code)]
     pub rpc_endpoint_cooldown: Duration,
+    /// Consecutive RPC-layer poll failures before the circuit breaker opens
+    /// and the run loop stops attempting polls (issue #197).
+    pub rpc_breaker_failure_threshold: u32,
+    /// How long the breaker stays Open before allowing a single probe poll
+    /// through (issue #197).
+    pub rpc_breaker_cooldown: Duration,
     pub network: String,
     pub poll_interval: Duration,
     /// Shortest adaptive poll interval, applied when lag >= `lag_high_watermark`.
@@ -28,6 +34,16 @@ pub struct Config {
     pub lag_high_watermark: u64,
     /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
     pub poll_hysteresis_ledgers: u64,
+    /// Maximum ledgers a detected reorg is allowed to rewind before the
+    /// streamer halts instead of auto-recovering (issue #196). A deeper
+    /// divergence than this is treated as something an operator should look
+    /// at, not something to silently delete and re-index.
+    pub max_reorg_rewind_depth: u64,
+    /// Maximum gaps enqueued as backfill jobs per gap-scan run (issue #216).
+    /// Bounds one scan's cost and DB write volume when the table is
+    /// pathologically gappy; any gaps beyond this are picked up by the next
+    /// scheduled scan.
+    pub gap_scan_max_per_run: i64,
     /// TCP connect timeout for RPC HTTP requests (issue #214).
     pub rpc_connect_timeout: Duration,
     /// Overall request timeout (connect, headers and body) for RPC calls (issue #214).
@@ -134,7 +150,22 @@ impl Config {
         };
 
         // ── Network ─────────────────────────────────────────────────────────
-        let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into());
+        // NETWORK is written into every row this process indexes (soroban_events,
+        // ledger_metadata, token_events, ...), so a typo here silently creates an
+        // invisible data partition rather than failing loudly. Validated against
+        // the same allowed set the database CHECK constraints enforce (migration
+        // 0029) and the API layer validates (services/api/validation/events.go,
+        // validNetworks) — issue #252. 'pubnet' is accepted as an alias for
+        // 'mainnet', matching default_network_passphrase below.
+        let network =
+            match normalize_network(&std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into()))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    errors.push(e);
+                    String::new() // placeholder; won't be used if errors is non-empty
+                }
+            };
 
         // Network passphrase for SAC contract id derivation (issue #262).
         let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {
@@ -170,6 +201,13 @@ impl Config {
         let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000);
         let poll_hysteresis_ledgers =
             parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000);
+        // Bounded reorg rewind (issue #196): Stellar reorgs in practice are
+        // shallow (a handful of ledgers); a divergence deeper than this
+        // default is far more likely to be an RPC serving inconsistent data
+        // than a genuine consensus rollback, so it halts for an operator
+        // rather than deleting a large swath of history automatically.
+        let max_reorg_rewind_depth = parse_bounded_u64("MAX_REORG_REWIND_DEPTH", 50, 1, 100_000);
+        let gap_scan_max_per_run = parse_bounded_u64("GAP_SCAN_MAX_PER_RUN", 100, 1, 10_000);
         let rpc_connect_timeout_ms =
             parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000);
         let rpc_request_timeout_ms =
@@ -183,6 +221,15 @@ impl Config {
         let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100);
         let rpc_endpoint_cooldown_ms =
             parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
+        // Circuit breaker for sustained RPC outages (issue #197). Distinct
+        // from RPC_FAILOVER_THRESHOLD above: failover picks a different
+        // endpoint from the configured pool, while the breaker stops polling
+        // altogether once the (possibly single) endpoint has failed enough
+        // consecutive times in a row.
+        let rpc_breaker_failure_threshold =
+            parse_bounded_u64("RPC_BREAKER_FAILURE_THRESHOLD", 5, 1, 1_000);
+        let rpc_breaker_cooldown_ms =
+            parse_bounded_u64("RPC_BREAKER_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
         let outbox_poll_interval_ms = parse_bounded_u64("OUTBOX_POLL_INTERVAL_MS", 100, 10, 60_000);
         let outbox_batch_size = parse_bounded_u64("OUTBOX_BATCH_SIZE", 500, 1, 10_000);
         let outbox_backlog_alert_threshold =
@@ -228,6 +275,8 @@ impl Config {
             ),
             ("LAG_HIGH_WATERMARK", lag_high_watermark.as_ref()),
             ("POLL_HYSTERESIS_LEDGERS", poll_hysteresis_ledgers.as_ref()),
+            ("MAX_REORG_REWIND_DEPTH", max_reorg_rewind_depth.as_ref()),
+            ("GAP_SCAN_MAX_PER_RUN", gap_scan_max_per_run.as_ref()),
             ("RPC_CONNECT_TIMEOUT_MS", rpc_connect_timeout_ms.as_ref()),
             ("RPC_REQUEST_TIMEOUT_MS", rpc_request_timeout_ms.as_ref()),
             (
@@ -244,6 +293,11 @@ impl Config {
                 "RPC_ENDPOINT_COOLDOWN_MS",
                 rpc_endpoint_cooldown_ms.as_ref(),
             ),
+            (
+                "RPC_BREAKER_FAILURE_THRESHOLD",
+                rpc_breaker_failure_threshold.as_ref(),
+            ),
+            ("RPC_BREAKER_COOLDOWN_MS", rpc_breaker_cooldown_ms.as_ref()),
             ("OUTBOX_POLL_INTERVAL_MS", outbox_poll_interval_ms.as_ref()),
             ("OUTBOX_BATCH_SIZE", outbox_batch_size.as_ref()),
             (
@@ -339,6 +393,8 @@ impl Config {
         let poll_interval_ceiling_ms = poll_interval_ceiling_ms.unwrap();
         let lag_high_watermark = lag_high_watermark.unwrap();
         let poll_hysteresis_ledgers = poll_hysteresis_ledgers.unwrap();
+        let max_reorg_rewind_depth = max_reorg_rewind_depth.unwrap();
+        let gap_scan_max_per_run = gap_scan_max_per_run.unwrap() as i64;
         let rpc_connect_timeout_ms = rpc_connect_timeout_ms.unwrap();
         let rpc_request_timeout_ms = rpc_request_timeout_ms.unwrap();
         let rpc_pool_idle_timeout_ms = rpc_pool_idle_timeout_ms.unwrap();
@@ -346,6 +402,8 @@ impl Config {
         let rpc_tcp_keepalive_ms = rpc_tcp_keepalive_ms.unwrap();
         let rpc_failover_threshold = rpc_failover_threshold.unwrap() as u32;
         let rpc_endpoint_cooldown_ms = rpc_endpoint_cooldown_ms.unwrap();
+        let rpc_breaker_failure_threshold = rpc_breaker_failure_threshold.unwrap() as u32;
+        let rpc_breaker_cooldown_ms = rpc_breaker_cooldown_ms.unwrap();
         let outbox_poll_interval_ms = outbox_poll_interval_ms.unwrap();
         let outbox_batch_size = outbox_batch_size.unwrap() as i64;
         let outbox_backlog_alert_threshold = outbox_backlog_alert_threshold.unwrap() as i64;
@@ -367,12 +425,16 @@ impl Config {
             stellar_rpc_urls,
             rpc_failover_threshold,
             rpc_endpoint_cooldown: Duration::from_millis(rpc_endpoint_cooldown_ms),
+            rpc_breaker_failure_threshold,
+            rpc_breaker_cooldown: Duration::from_millis(rpc_breaker_cooldown_ms),
             network,
             poll_interval: Duration::from_millis(poll_interval_ms),
             poll_interval_floor: Duration::from_millis(poll_interval_floor_ms),
             poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
             lag_high_watermark,
             poll_hysteresis_ledgers,
+            max_reorg_rewind_depth,
+            gap_scan_max_per_run,
             rpc_connect_timeout: Duration::from_millis(rpc_connect_timeout_ms),
             rpc_request_timeout: Duration::from_millis(rpc_request_timeout_ms),
             rpc_pool_idle_timeout: Duration::from_millis(rpc_pool_idle_timeout_ms),
@@ -423,6 +485,8 @@ impl Config {
             poll_interval_floor_ms = self.poll_interval_floor.as_millis() as u64,
             poll_interval_ceiling_ms = self.poll_interval_ceiling.as_millis() as u64,
             lag_high_watermark = self.lag_high_watermark,
+            max_reorg_rewind_depth = self.max_reorg_rewind_depth,
+            gap_scan_max_per_run = self.gap_scan_max_per_run,
             max_events_per_poll = self.max_events_per_poll,
             db_batch_size = self.db_batch_size,
             db_pool_size = self.db_pool_size,
@@ -437,6 +501,8 @@ impl Config {
             tracked_sac_assets_count = self.tracked_sac_assets.len(),
             statement_timeout_ms = self.statement_timeout_ms,
             idle_in_transaction_timeout_ms = self.idle_in_transaction_timeout_ms,
+            rpc_breaker_failure_threshold = self.rpc_breaker_failure_threshold,
+            rpc_breaker_cooldown_ms = self.rpc_breaker_cooldown.as_millis() as u64,
             "Effective configuration"
         );
     }
@@ -464,6 +530,21 @@ fn redact_url(url: &str) -> String {
     match authority.rfind('@') {
         Some(at) => format!("{scheme}***@{}{tail}", &authority[at + 1..]),
         None => url.to_string(),
+    }
+}
+
+/// Validates `NETWORK` against the allowed set and normalises the `pubnet`
+/// alias to `mainnet` (issue #252). Rejecting unknown values here — rather
+/// than only when a DB write later trips the CHECK constraint — surfaces a
+/// typo like `tesnet` at startup instead of after it has already been used
+/// to derive a passphrase, filter contracts, and tag every indexed row.
+fn normalize_network(network: &str) -> Result<String, String> {
+    match network {
+        "mainnet" | "pubnet" => Ok("mainnet".to_string()),
+        "testnet" => Ok("testnet".to_string()),
+        other => Err(format!(
+            "[trident-indexer] NETWORK={other:?} is not a recognised network; expected one of: mainnet, testnet, pubnet"
+        )),
     }
 }
 
@@ -936,6 +1017,40 @@ mod tests {
     }
 
     #[test]
+    fn breaker_knobs_have_defaults() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("RPC_BREAKER_FAILURE_THRESHOLD");
+            env::remove_var("RPC_BREAKER_COOLDOWN_MS");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_breaker_failure_threshold, 5);
+            assert_eq!(cfg.rpc_breaker_cooldown.as_millis(), 30_000);
+        });
+    }
+
+    #[test]
+    fn breaker_knobs_read_custom_values() {
+        let mut vars = required_vars();
+        vars.push(("RPC_BREAKER_FAILURE_THRESHOLD", "10"));
+        vars.push(("RPC_BREAKER_COOLDOWN_MS", "60000"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_breaker_failure_threshold, 10);
+            assert_eq!(cfg.rpc_breaker_cooldown.as_millis(), 60_000);
+        });
+    }
+
+    #[test]
+    fn breaker_failure_threshold_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("RPC_BREAKER_FAILURE_THRESHOLD", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("RPC_BREAKER_FAILURE_THRESHOLD"));
+        });
+    }
+
+    #[test]
     fn db_batch_size_defaults_to_1000() {
         let vars = required_vars();
         with_env(&vars, || {
@@ -1007,6 +1122,56 @@ mod tests {
         with_env(&vars, || {
             let err = Config::from_env().unwrap_err();
             assert!(err.to_string().contains("OUTBOX_BATCH_SIZE"));
+        });
+    }
+
+    #[test]
+    fn max_reorg_rewind_depth_defaults_to_50() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("MAX_REORG_REWIND_DEPTH");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.max_reorg_rewind_depth, 50);
+        });
+    }
+
+    #[test]
+    fn gap_scan_max_per_run_defaults_to_100() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("GAP_SCAN_MAX_PER_RUN");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.gap_scan_max_per_run, 100);
+        });
+    }
+
+    #[test]
+    fn max_reorg_rewind_depth_reads_custom_value() {
+        let mut vars = required_vars();
+        vars.push(("MAX_REORG_REWIND_DEPTH", "10"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.max_reorg_rewind_depth, 10);
+        });
+    }
+
+    #[test]
+    fn max_reorg_rewind_depth_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("MAX_REORG_REWIND_DEPTH", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("MAX_REORG_REWIND_DEPTH"));
+        });
+    }
+
+    #[test]
+    fn gap_scan_max_per_run_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("GAP_SCAN_MAX_PER_RUN", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("GAP_SCAN_MAX_PER_RUN"));
         });
     }
 
@@ -1227,5 +1392,64 @@ mod tests {
             redact_url("postgres://user:secret@localhost:5432/db?opt=x@y"),
             "postgres://***@localhost:5432/db?opt=x@y"
         );
+    }
+
+    #[test]
+    fn normalize_network_accepts_known_values() {
+        assert_eq!(normalize_network("mainnet").unwrap(), "mainnet");
+        assert_eq!(normalize_network("testnet").unwrap(), "testnet");
+    }
+
+    #[test]
+    fn normalize_network_rejects_futurenet() {
+        // Not yet a supported backend value: no write path (this API or the
+        // indexer) accepts it today, only the SDK's client-side Network enum.
+        let err = normalize_network("futurenet").unwrap_err();
+        assert!(err.contains("futurenet"));
+    }
+
+    #[test]
+    fn normalize_network_maps_pubnet_alias_to_mainnet() {
+        assert_eq!(normalize_network("pubnet").unwrap(), "mainnet");
+    }
+
+    #[test]
+    fn normalize_network_rejects_unknown_value() {
+        let err = normalize_network("tesnet").unwrap_err();
+        assert!(
+            err.contains("tesnet"),
+            "error should name the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_unknown_network() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "tesnet"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("NETWORK"));
+            assert!(err.to_string().contains("tesnet"));
+        });
+    }
+
+    #[test]
+    fn from_env_normalizes_pubnet_to_mainnet() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "pubnet"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.network, "mainnet");
+        });
+    }
+
+    #[test]
+    fn from_env_defaults_network_to_testnet() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("NETWORK");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.network, "testnet");
+        });
     }
 }

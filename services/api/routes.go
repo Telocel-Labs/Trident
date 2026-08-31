@@ -141,14 +141,20 @@ func routeBindings() []routeBinding {
 		documented("GET", "/v1/stats/indexer", func(d routeDeps) http.Handler {
 			return handlers.IndexerStats(d.healthDB)
 		}),
-		// Contract spec/schema change only when a contract is redeployed —
-		// rare, read-only — so they're cached (issue #221) with a TTL well
-		// above the 60s used for stats, invalidated immediately on a new
-		// event for that contract (see StartCacheInvalidator).
+		// ContractEventSchemas is intentionally NOT wrapped in ResponseCache
+		// (issue #571): unlike ContractSpec, it writes to
+		// contract_event_schemas on every call (persistContractSchemas), and
+		// ResponseCache "must never wrap a route with side effects" — a cache
+		// HIT would skip that write for the rest of the TTL. Its queries are
+		// indexed lookups against token_events/soroban_events, cheap enough
+		// that going uncached does not need a cache of its own.
 		documented("GET", "/v1/contracts/{id}/events/schema", func(d routeDeps) http.Handler {
-			return middleware.ResponseCache(d.redisClient, contractMetadataCacheTTL,
-				middleware.DefaultCacheKey)(handlers.ContractEventSchemas(d.schemaRegistryDB))
+			return handlers.ContractEventSchemas(d.schemaRegistryDB)
 		}),
+		// ContractSpec changes only when a contract is redeployed — rare,
+		// read-only, no side effects — so it is cached (issue #221) with a TTL
+		// well above the 60s used for stats, invalidated immediately on a new
+		// event for that contract (see StartCacheInvalidator).
 		documented("GET", "/v1/contracts/{id}/spec", func(d routeDeps) http.Handler {
 			return middleware.ResponseCache(d.redisClient, contractMetadataCacheTTL,
 				middleware.DefaultCacheKey)(handlers.ContractSpec(d.schemaRegistryDB))

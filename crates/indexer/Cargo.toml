@@ -14,6 +14,10 @@ tokio-console = ["dep:console-subscriber"]
 trident-common = { path = "../common" }
 anyhow = "1"
 
+# CLI subcommands (issue #574: `trident-indexer replay ...`). The daemon
+# entrypoint (no subcommand) is unaffected.
+clap = { version = "4", features = ["derive"] }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
