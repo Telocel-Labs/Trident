@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // Issue #271 — Contract liveness / TTL tracking
@@ -136,4 +137,64 @@ pub struct SorobanEvent {
     pub event_index: u32,
     /// Category of event as reported by the Soroban host.
     pub event_type: EventType,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #252 — network as a typed value
+// ---------------------------------------------------------------------------
+
+/// Known Stellar networks supported by Trident.
+///
+/// The string forms are the values stored in the `network` column and enforced
+/// by the CHECK constraints added in migration 0031. Keep the two in sync: a
+/// value accepted here but rejected by the constraint fails at write time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    Mainnet,
+    Testnet,
+    Futurenet,
+    Sandbox,
+}
+
+impl Network {
+    pub const MAINNET: &'static str = "mainnet";
+    pub const TESTNET: &'static str = "testnet";
+    pub const FUTURENET: &'static str = "futurenet";
+    pub const SANDBOX: &'static str = "sandbox";
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Network::Mainnet => Self::MAINNET,
+            Network::Testnet => Self::TESTNET,
+            Network::Futurenet => Self::FUTURENET,
+            Network::Sandbox => Self::SANDBOX,
+        }
+    }
+
+    pub fn all() -> &'static [&'static str] {
+        &[Self::MAINNET, Self::TESTNET, Self::FUTURENET, Self::SANDBOX]
+    }
+}
+
+impl FromStr for Network {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "mainnet" => Ok(Network::Mainnet),
+            "testnet" => Ok(Network::Testnet),
+            "futurenet" => Ok(Network::Futurenet),
+            "sandbox" => Ok(Network::Sandbox),
+            other => Err(anyhow::anyhow!(
+                "invalid network: {other}. Expected one of: mainnet, testnet, futurenet, sandbox"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }

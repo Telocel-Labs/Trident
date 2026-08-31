@@ -99,6 +99,8 @@ pub struct Config {
     /// Operator-configured classic assets to resolve SAC events for (issue
     /// #262). Each is a `code:issuer` pair, or the literal `native` for XLM.
     pub tracked_sac_assets: Vec<crate::parser::sac::TrackedAsset>,
+    /// Maximum allowable reorg depth in ledgers before halting for operator intervention (issue #196).
+    pub max_reorg_depth: u64,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -248,6 +250,7 @@ impl Config {
             60,
             2_592_000,
         );
+        let max_reorg_depth = parse_bounded_u64("MAX_REORG_DEPTH", 128, 1, 10_000);
         let db_pool_size = parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE);
         // #215 names redis_stream_maxlen among the knobs that must be
         // range-checked. These three previously used
@@ -318,6 +321,7 @@ impl Config {
             ("REDIS_STREAM_MAXLEN", redis_stream_maxlen.as_ref()),
             ("METRICS_PORT", metrics_port.as_ref()),
             ("HEALTH_PORT", health_port.as_ref()),
+            ("MAX_REORG_DEPTH", max_reorg_depth.as_ref()),
         ] {
             if let Err(e) = result {
                 errors.push(format!("[indexer] {key}: {e}"));
@@ -460,6 +464,7 @@ impl Config {
             ),
             network_passphrase,
             tracked_sac_assets,
+            max_reorg_depth: max_reorg_depth.unwrap(),
         })
     }
 

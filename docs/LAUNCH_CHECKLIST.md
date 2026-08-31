@@ -1,4 +1,4 @@
-# Pre-launch verification checklist
+# Pre-launch verification checklist (MVP go/no-go gate)
 
 **Status: template — not yet executed.** This is the checklist structure
 issue #459 asks for; running it against production configuration with
@@ -7,10 +7,31 @@ infrastructure access and team availability, which this pass doesn't have.
 Filling in "Evidence" and "Signed off by" for each row, against production
 config, is what turns this from a template into a completed launch gate.
 
+## Enforcement
+
+This table is the blocking set for testnet launch (issue #503) — every row
+below is a launch blocker, distinct from the ~50 other open launch issues that
+are not. Each row's Pass/Fail column is meant to be an objective, checkable
+fact rather than an opinion, and `scripts/check-launch-gate.sh` enforces that
+mechanically instead of relying on someone reading the table carefully:
+
+```bash
+scripts/check-launch-gate.sh              # checks docs/LAUNCH_CHECKLIST.md
+scripts/check-launch-gate.sh path/to.md   # or an explicit path
+```
+
+It fails (exit 1) if any row's Pass/Fail column is blank, unrecognized, or
+`Fail`, if a row marked `Pass` is missing Evidence or a Signed-off-by name, or
+if the rollback rehearsal (row 9) has no dated evidence or is older than the
+30-day limit below. It exits 0 only when the table itself says every gate is
+satisfied. Run it locally before any go/no-go call; see the script's header
+comment for what it deliberately does not check (truthfulness of the Evidence
+text, and open P1/P2 incidents — both still require a human).
+
 | # | Gate | Pass/Fail | Evidence | Signed off by |
 |---|------|-----------|----------|----------------|
 | 1 | Alerts verified firing (trigger each alert deliberately, confirm on-call receives it) | | | |
-| 2 | Backup restore performed end-to-end (see `scripts/backup.sh`/`restore.sh` if present, or the DB's documented procedure) | | | |
+| 2 | Backup restore performed end-to-end — see [`scripts/backup.sh`](../scripts/backup.sh), [`scripts/restore.sh`](../scripts/restore.sh), and [`docs/runbooks/postgres-backup-restore.md`](./runbooks/postgres-backup-restore.md) | | | |
 | 3 | Soak test passed (sustained load for the documented duration with no leaks/degradation) | | | |
 | 4 | Chaos test passed (kill a pod/dependency mid-traffic, confirm recovery) | | | |
 | 5 | Core user journey test green against production configuration | | | |
@@ -18,6 +39,7 @@ config, is what turns this from a template into a completed launch gate.
 | 7 | Docs quickstart walked by someone who hasn't seen the codebase, start to finish | | | |
 | 8 | On-call schedule confirmed and reachable | | | |
 | 9 | Rollback rehearsed — see `docs/ROLLBACK_RUNBOOK.md` | | | |
+| 10 | Testnet cutover runbook walked through — see `docs/runbooks/testnet-cutover.md` | | | |
 
 ## No-go criteria
 

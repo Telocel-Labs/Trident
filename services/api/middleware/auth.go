@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -36,7 +37,12 @@ const authCacheTTL = 5 * time.Minute
 const authDBQueryTimeout = 2 * time.Second
 
 // ParseKeyHashes parses a comma-separated list of HMAC-SHA256 hex digests
-// (as stored in API_KEY_HASHES) into a set for O(1) lookup.
+// (as stored in API_KEY_HASHES) into a set for lookup.
+//
+// It reads only its argument. Falling back to API_KEY here would make a parse
+// function depend on the environment and would quietly widen the auth surface:
+// API_KEY holds a plaintext key, not a digest, so such a value could never
+// match anyway and would fail as a silent no-match rather than an error.
 func ParseKeyHashes(raw string) map[string]struct{} {
 	out := map[string]struct{}{}
 	for _, h := range strings.Split(raw, ",") {
@@ -46,6 +52,18 @@ func ParseKeyHashes(raw string) map[string]struct{} {
 		}
 	}
 	return out
+}
+
+// ConstantTimeContains checks whether target matches any hash in validHashes in
+// constant time using crypto/subtle.ConstantTimeCompare to avoid timing side-channel attacks.
+func ConstantTimeContains(validHashes map[string]struct{}, target string) bool {
+	var match int
+	for hash := range validHashes {
+		if len(hash) == len(target) {
+			match |= subtle.ConstantTimeCompare([]byte(hash), []byte(target))
+		}
+	}
+	return match == 1
 }
 
 // hmacKeyHash computes HMAC-SHA256 of key using API_KEY_SALT — used for the
@@ -167,7 +185,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 			// ── 3. Legacy env-var fallback (API_KEY_HASHES) ────────────────
 			validHashes := ParseKeyHashes(os.Getenv("API_KEY_HASHES"))
 			if len(validHashes) > 0 {
-				if _, ok := validHashes[hmacKeyHash(key)]; ok {
+				if ConstantTimeContains(validHashes, hmacKeyHash(key)) {
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -179,12 +197,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 }
 
 // Validator returns a func(string) bool that checks whether the HMAC-SHA256
-// of the provided key is in the given valid hashes set. Used by the GraphQL
-// WebSocket handler which needs a standalone key-check function.
+// of the provided key is in the given valid hashes set in constant time. Used
+// by the GraphQL WebSocket handler which needs a standalone key-check function.
 func Validator(hashes map[string]struct{}) func(string) bool {
 	return func(key string) bool {
-		_, ok := hashes[hmacKeyHash(key)]
-		return ok
+		return ConstantTimeContains(hashes, hmacKeyHash(key))
 	}
 }
 
@@ -215,7 +232,7 @@ func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 			return
 		}
 
-		if _, ok := validHashes[hmacKeyHash(key)]; !ok {
+		if !ConstantTimeContains(validHashes, hmacKeyHash(key)) {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 			return
 		}

@@ -4,7 +4,10 @@ One section per alert in [`monitoring/alerts.yml`](../../monitoring/alerts.yml).
 Each section covers what the alert means, why its threshold was picked, and
 the first steps to take when it fires. See
 [`docs/metrics-catalog.md`](../metrics-catalog.md) for what every metric
-referenced here actually measures.
+referenced here actually measures. Routing (which severity/service pages
+whom) is configured in [`monitoring/alertmanager.yml`](../../monitoring/alertmanager.yml) —
+"page on-call" below means whatever's wired into that file's
+`on-call-critical`/`on-call-warning` receivers.
 
 **Related runbooks:**
 - [`incident-response.md`](incident-response.md) — severity classification (SEV-1/2/3), on-call owner, escalation path, and user communication channel.

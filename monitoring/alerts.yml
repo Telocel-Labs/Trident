@@ -135,6 +135,12 @@ groups:
       # emitting contract deserves a look.
       - alert: TridentIndexerUnexpectedScValVariant
         expr: increase(trident_scval_unexpected_variant_total[1h]) > 0
+      # A non-empty persist dead-letter queue is data missing from
+      # soroban_events until someone replays it — a silently growing DLQ is
+      # the same as data loss. Rows leave the pending state only through the
+      # documented replay procedure, so this fires for as long as any exist.
+      - alert: TridentIndexerPersistDeadLetterBacklog
+        expr: trident_indexer_persist_dead_letter_backlog > 0
         for: 5m
         labels:
           severity: warning
@@ -148,26 +154,6 @@ groups:
             indexer logs name the variant and context. Identify the emitting
             contract from the logs and review what it is publishing.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
-      # A non-empty persist dead-letter queue is data missing from
-      # soroban_events until someone replays it — a silently growing DLQ is
-      # the same as data loss. Rows leave the pending state only through the
-      # documented replay procedure, so this fires for as long as any exist.
-      - alert: TridentIndexerPersistDeadLetterBacklog
-        expr: trident_indexer_persist_dead_letter_backlog > 0
-        for: 5m
-        labels:
-          severity: warning
-          service: indexer
-        annotations:
-          summary: "Trident dead-letter queue holds {{ $value }} event(s) that failed to persist"
-          description: >
-            failed_events has pending rows: at least one event exhausted the
-            persist retry budget and was captured with its payload and error
-            message instead of being indexed. Ingestion has advanced past it,
-            but the data is missing from soroban_events until it is replayed.
-            Diagnose error_message, fix the underlying cause, then run the
-            replay procedure in the runbook and mark the rows replayed_at.
-          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
 
   # ---------------------------------------------------------------------------
   # Ledger-range reconciliation against the RPC source (#511).
@@ -417,6 +403,56 @@ groups:
           runbook_url: "docs/runbooks/alerts.md#tridentdiskspacelow"
 
   # ---------------------------------------------------------------------------
+  # Container resource saturation & OOM killer (#444)
+  # ---------------------------------------------------------------------------
+  - name: trident.container.resources
+    rules:
+      - alert: TridentContainerOOMKilled
+        expr: increase(kube_pod_container_status_terminated_reason{reason="OOMKilled"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} in pod {{ $labels.pod }} was OOM killed"
+          description: >
+            Container {{ $labels.container }} exceeded its memory limit and was terminated
+            by the kernel OOM killer. Check memory headroom and increase memory limits or tune GOMEMLIMIT.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontaineroomkilled"
+
+      - alert: TridentContainerMemoryHigh
+        expr: >
+          container_memory_working_set_bytes{container=~"api|grpc-api|indexer"}
+            / container_spec_memory_limit_bytes{container=~"api|grpc-api|indexer"}
+            > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} memory usage > 85% of limit"
+          description: >
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is at {{ $value | humanizePercentage }}
+            of its configured memory limit.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontainermemoryhigh"
+
+      - alert: TridentContainerCPUThrottling
+        expr: >
+          increase(container_cpu_cfs_throttled_periods_total{container=~"api|grpc-api|indexer"}[5m])
+            / increase(container_cpu_cfs_periods_total{container=~"api|grpc-api|indexer"}[5m])
+            > 0.25
+        for: 10m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} CPU throttled > 25%"
+          description: >
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is experiencing significant CPU throttling
+            under CFS quotas. Consider raising CPU limits or scaling out replicas.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontainercputhrottling"
+
+  # ---------------------------------------------------------------------------
   # Partition coverage — soroban_events named partitions (issue #525).
   #
   # soroban_events is RANGE-partitioned by ledger_sequence. Named partitions
@@ -478,3 +514,4 @@ groups:
             immediately: `SELECT create_soroban_partition(<last_upper>,
             <last_upper + 2000000>);` — see the runbook for the exact values.
           runbook_url: "docs/runbooks/alerts.md#tridentpartitionexhausted"
+

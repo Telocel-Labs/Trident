@@ -88,8 +88,11 @@ async function runTests() {
   });
 
   if (eventId) {
+    // Bind to a const so the type narrows inside the async closure below;
+    // TypeScript cannot keep the narrowing on a let assigned from a callback.
+    const detailEventId: string = eventId;
     const eventLatency = await time('  /v1/events/:id', async () => {
-      const res = await fetch(`${apiUrl}/v1/events/${encodeURIComponent(eventId)}`, {
+      const res = await fetch(`${apiUrl}/v1/events/${encodeURIComponent(detailEventId)}`, {
         headers: apiKey ? { 'X-API-Key': apiKey } : {},
       });
       if (!res.ok) throw new Error(`API ${res.status}`);

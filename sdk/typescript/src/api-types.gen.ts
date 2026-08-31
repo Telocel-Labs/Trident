@@ -195,6 +195,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/contracts/{id}/metadata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get SEP-41 token metadata for a contract
+         * @description Returns the token name, symbol, and decimals for a contract that implements the SEP-41 read interface (issue #263).
+         *     Served from the `token_metadata` table, which the indexer populates and refreshes; this endpoint never calls the Stellar RPC itself.
+         *     Always answers 200 for a well-formed contract id, never 404. A contract that has not been resolved yet and one that was resolved and is not a token both return `is_token: false` with the remaining fields null — the two cases are indistinguishable from this endpoint, matching the resolver's own cached negative result.
+         */
+        get: operations["getTokenMetadata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/contracts/{id}/storage": {
         parameters: {
             query?: never;
@@ -293,6 +315,26 @@ export interface paths {
          * @description Generate a new API key for authentication
          */
         post: operations["createApiKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/api-keys/{id}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate an API key
+         * @description Mint a replacement key that inherits the label, network, and rate-limit tier of the key identified by `id` (admin only). The plaintext key is returned once, in this response, and cannot be retrieved again. The existing key is not revoked by this call — revoke it with DELETE /v1/api-keys/{id} once callers have moved over, which evicts it from the auth cache immediately.
+         */
+        post: operations["rotateApiKey"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1540,6 +1582,33 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    getTokenMetadata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Token metadata, or is_token false when not a resolved token */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenMetadataResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     getContractStorageLatest: {
         parameters: {
             query?: never;
@@ -1743,6 +1812,46 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             409: components["responses"]["Conflict"];
             429: components["responses"]["TooManyRequestsIPOnly"];
+        };
+    };
+    rotateApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the active key to rotate */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Replacement key created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIKeyResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description No active API key with that id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Rotation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     deleteApiKey: {

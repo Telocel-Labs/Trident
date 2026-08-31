@@ -212,7 +212,6 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
         ))),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

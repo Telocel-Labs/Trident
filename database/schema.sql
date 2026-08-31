@@ -45,11 +45,6 @@ ALTER TABLE soroban_events
     ADD CONSTRAINT uq_soroban_events_tx_index_network
     UNIQUE (ledger_sequence, transaction_hash, event_index, network);
 
--- network enum (migration 0031)
-ALTER TABLE soroban_events
-    ADD CONSTRAINT chk_soroban_events_network
-    CHECK (network IN ('mainnet', 'testnet'));
-
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_ledger  ON soroban_events (contract_id, ledger_sequence DESC);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic0  ON soroban_events (contract_id, topic_0)
     WHERE topic_0 IS NOT NULL;
@@ -98,10 +93,6 @@ CREATE TABLE IF NOT EXISTS indexed_contracts (
     CONSTRAINT uq_indexed_contracts_id_network UNIQUE (contract_id, network)
 );
 
-ALTER TABLE indexed_contracts
-    ADD CONSTRAINT chk_indexed_contracts_network
-    CHECK (network IS NULL OR network IN ('mainnet', 'testnet'));
-
 CREATE INDEX IF NOT EXISTS idx_indexed_contracts_contract_id ON indexed_contracts (contract_id);
 
 -- ---------------------------------------------------------------------------
@@ -138,10 +129,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE api_keys
-    ADD CONSTRAINT chk_api_keys_network
-    CHECK (network IN ('mainnet', 'testnet'));
-
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (key_hash)
     WHERE revoked_at IS NULL;
@@ -164,10 +151,6 @@ CREATE TABLE IF NOT EXISTS audit_log (
     network      TEXT,
     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-ALTER TABLE audit_log
-    ADD CONSTRAINT chk_audit_log_network
-    CHECK (network IS NULL OR network IN ('mainnet', 'testnet'));
 
 -- Covers the admin analytics queries (migration 0029). The INCLUDE columns
 -- are read but never seeked on, so they live only in the leaves and make
@@ -290,10 +273,6 @@ CREATE TRIGGER trg_webhook_subscriptions_updated_at
     BEFORE UPDATE ON webhook_subscriptions
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
-ALTER TABLE webhook_subscriptions
-    ADD CONSTRAINT chk_webhook_subscriptions_network
-    CHECK (network IN ('mainnet', 'testnet'));
-
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract_id ON webhook_subscriptions (contract_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_paused_at ON webhook_subscriptions (paused_at);
 -- Partial index over rows in a rotation overlap window, used by the cleanup
@@ -361,7 +340,6 @@ CREATE TABLE IF NOT EXISTS token_events (
 );
 
 ALTER TABLE token_events ADD CONSTRAINT token_events_pkey PRIMARY KEY (event_id);
-ALTER TABLE token_events ADD CONSTRAINT chk_token_events_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE INDEX IF NOT EXISTS idx_token_events_asset_code ON token_events USING btree (asset_code, ledger_sequence DESC) WHERE (asset_code IS NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_token_events_contract_ledger ON token_events USING btree (contract_id, ledger_sequence DESC);
@@ -392,7 +370,6 @@ CREATE TABLE IF NOT EXISTS contract_invocation_metrics (
 
 ALTER TABLE contract_invocation_metrics ADD CONSTRAINT contract_invocation_metrics_pkey PRIMARY KEY (id);
 ALTER TABLE contract_invocation_metrics ADD CONSTRAINT uq_contract_invocation_metrics UNIQUE (contract_id, transaction_hash);
-ALTER TABLE contract_invocation_metrics ADD CONSTRAINT chk_contract_invocation_metrics_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE INDEX IF NOT EXISTS idx_contract_invocation_metrics_contract_ledger ON contract_invocation_metrics USING btree (contract_id, ledger_sequence DESC);
 CREATE INDEX IF NOT EXISTS idx_contract_invocation_metrics_tx_hash ON contract_invocation_metrics USING btree (transaction_hash);
@@ -416,7 +393,6 @@ CREATE TABLE IF NOT EXISTS contract_liveness (
 
 ALTER TABLE contract_liveness ADD CONSTRAINT contract_liveness_contract_id_network_key UNIQUE (contract_id, network);
 ALTER TABLE contract_liveness ADD CONSTRAINT contract_liveness_pkey PRIMARY KEY (id);
-ALTER TABLE contract_liveness ADD CONSTRAINT chk_contract_liveness_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_liveness_contract_id_network_key ON contract_liveness USING btree (contract_id, network);
 CREATE INDEX IF NOT EXISTS idx_contract_liveness_near_archival ON contract_liveness USING btree (ledgers_until_archive) WHERE (status = 'live'::text);
@@ -445,7 +421,6 @@ CREATE TABLE IF NOT EXISTS contract_verification (
 
 ALTER TABLE contract_verification ADD CONSTRAINT contract_verification_contract_id_network_key UNIQUE (contract_id, network);
 ALTER TABLE contract_verification ADD CONSTRAINT contract_verification_pkey PRIMARY KEY (id);
-ALTER TABLE contract_verification ADD CONSTRAINT chk_contract_verification_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_verification_contract_id_network_key ON contract_verification USING btree (contract_id, network);
 CREATE INDEX IF NOT EXISTS idx_contract_verification_contract_id ON contract_verification USING btree (contract_id);
@@ -470,7 +445,6 @@ CREATE TABLE IF NOT EXISTS contract_specs (
 
 ALTER TABLE contract_specs ADD CONSTRAINT contract_specs_contract_id_network_key UNIQUE (contract_id, network);
 ALTER TABLE contract_specs ADD CONSTRAINT contract_specs_pkey PRIMARY KEY (id);
-ALTER TABLE contract_specs ADD CONSTRAINT chk_contract_specs_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_specs_contract_id_network_key ON contract_specs USING btree (contract_id, network);
 CREATE INDEX IF NOT EXISTS idx_contract_specs_code_hash ON contract_specs USING btree (code_hash);
@@ -494,7 +468,6 @@ CREATE TABLE IF NOT EXISTS contract_stats_rollup (
 );
 
 ALTER TABLE contract_stats_rollup ADD CONSTRAINT contract_stats_rollup_pkey PRIMARY KEY (contract_id, network);
-ALTER TABLE contract_stats_rollup ADD CONSTRAINT chk_contract_stats_rollup_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE INDEX IF NOT EXISTS idx_contract_stats_rollup_network_count ON contract_stats_rollup USING btree (network, event_count DESC);
 
@@ -516,7 +489,6 @@ CREATE TABLE IF NOT EXISTS contract_event_schemas (
 
 ALTER TABLE contract_event_schemas ADD CONSTRAINT contract_event_schemas_contract_id_network_event_name_code__key UNIQUE (contract_id, network, event_name, code_hash);
 ALTER TABLE contract_event_schemas ADD CONSTRAINT contract_event_schemas_pkey PRIMARY KEY (id);
-ALTER TABLE contract_event_schemas ADD CONSTRAINT chk_contract_event_schemas_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_event_schemas_contract_id_network_event_name_code__key ON contract_event_schemas USING btree (contract_id, network, event_name, code_hash);
 CREATE INDEX IF NOT EXISTS idx_contract_event_schemas_contract ON contract_event_schemas USING btree (contract_id, network, code_hash);
@@ -540,7 +512,6 @@ CREATE TABLE IF NOT EXISTS token_metadata (
 
 ALTER TABLE token_metadata ADD CONSTRAINT token_metadata_contract_id_network_key UNIQUE (contract_id, network);
 ALTER TABLE token_metadata ADD CONSTRAINT token_metadata_pkey PRIMARY KEY (id);
-ALTER TABLE token_metadata ADD CONSTRAINT chk_token_metadata_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE INDEX IF NOT EXISTS idx_token_metadata_contract ON token_metadata USING btree (contract_id, network);
 CREATE UNIQUE INDEX IF NOT EXISTS token_metadata_contract_id_network_key ON token_metadata USING btree (contract_id, network);
@@ -562,7 +533,6 @@ CREATE TABLE IF NOT EXISTS contract_storage_snapshots (
 
 ALTER TABLE contract_storage_snapshots ADD CONSTRAINT contract_storage_snapshots_contract_id_network_storage_key__key UNIQUE (contract_id, network, storage_key, ledger_sequence);
 ALTER TABLE contract_storage_snapshots ADD CONSTRAINT contract_storage_snapshots_pkey PRIMARY KEY (id);
-ALTER TABLE contract_storage_snapshots ADD CONSTRAINT chk_contract_storage_snapshots_network CHECK (network IN ('mainnet', 'testnet'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_storage_snapshots_contract_id_network_storage_key__key ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence);
 CREATE INDEX IF NOT EXISTS idx_contract_storage_snapshots_latest ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence DESC);
@@ -594,31 +564,66 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_events_pending
     ON failed_events (contract_id, ledger_sequence, event_index)
     WHERE replayed_at IS NULL;
 
--- ---------------------------------------------------------------------------
--- backfill_jobs  (migration 0032)
--- Queue of ledger-range backfills enqueued by the indexer's gap scan and
--- executed by `crates/backfill --from-queue` (issue #216).
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS backfill_jobs (
-    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    from_ledger      BIGINT      NOT NULL,
-    to_ledger        BIGINT      NOT NULL,
-    network          TEXT        NOT NULL,
-    status           TEXT        NOT NULL DEFAULT 'pending'
-                                  CHECK (status IN ('pending', 'running', 'done', 'failed')),
-    claimed_at       TIMESTAMPTZ,
-    completed_at     TIMESTAMPTZ,
-    error            TEXT,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT chk_backfill_jobs_range CHECK (to_ledger >= from_ledger)
-);
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_backfill_jobs_pending_range
-    ON backfill_jobs (network, from_ledger, to_ledger)
-    WHERE status IN ('pending', 'running');
-CREATE INDEX IF NOT EXISTS idx_backfill_jobs_pending
-    ON backfill_jobs (created_at)
-    WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS idx_backfill_jobs_stale
-    ON backfill_jobs (claimed_at)
-    WHERE status = 'running';
+-- ---------------------------------------------------------------------------
+-- Network value constraints  (migration 0031, issue #252)
+-- A typo such as 'testnett' silently splits the dataset in two: every query
+-- filtered on network misses those rows, and nothing errors. These CHECKs turn
+-- that into a write-time failure. Values match what the code writes -- see
+-- crates/common/src/types.rs Network.
+-- ---------------------------------------------------------------------------
+ALTER TABLE soroban_events
+    ADD CONSTRAINT chk_soroban_events_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE indexed_contracts
+    ADD CONSTRAINT chk_indexed_contracts_network
+    CHECK (network IS NULL OR network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE api_keys
+    ADD CONSTRAINT chk_api_keys_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE audit_log
+    ADD CONSTRAINT chk_audit_log_network
+    CHECK (network IS NULL OR network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE webhook_subscriptions
+    ADD CONSTRAINT chk_webhook_subscriptions_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE token_events
+    ADD CONSTRAINT chk_token_events_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_invocation_metrics
+    ADD CONSTRAINT chk_contract_invocation_metrics_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_liveness
+    ADD CONSTRAINT chk_contract_liveness_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_verification
+    ADD CONSTRAINT chk_contract_verification_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_specs
+    ADD CONSTRAINT chk_contract_specs_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_stats_rollup
+    ADD CONSTRAINT chk_contract_stats_rollup_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_event_schemas
+    ADD CONSTRAINT chk_contract_event_schemas_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE token_metadata
+    ADD CONSTRAINT chk_token_metadata_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_storage_snapshots
+    ADD CONSTRAINT chk_contract_storage_snapshots_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));

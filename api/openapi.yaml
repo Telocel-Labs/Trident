@@ -4,6 +4,10 @@ info:
   description: |
     Real-time indexing and event querying for Soroban contract events.
 
+    ## API Stability & Compatibility Promise
+
+    The `/v1/` REST API surface is **frozen and stable**. For the complete backward-compatibility guarantees, deprecation lifecycle, and versioning rules, see the [API Stability Policy](https://github.com/Telocel-Labs/Trident/blob/dev/docs/API_STABILITY.md).
+
     ## Request validation
 
     Every endpoint validates its parameters before doing any work and answers a
@@ -497,6 +501,48 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /v1/contracts/{id}/metadata:
+    get:
+      summary: Get SEP-41 token metadata for a contract
+      description: >-
+        Returns the token name, symbol, and decimals for a contract that
+        implements the SEP-41 read interface (issue #263).
+
+        Served from the `token_metadata` table, which the indexer populates
+        and refreshes; this endpoint never calls the Stellar RPC itself.
+
+        Always answers 200 for a well-formed contract id, never 404. A
+        contract that has not been resolved yet and one that was resolved and
+        is not a token both return `is_token: false` with the remaining
+        fields null — the two cases are indistinguishable from this endpoint,
+        matching the resolver's own cached negative result.
+      operationId: getTokenMetadata
+      tags:
+        - Contracts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+      responses:
+        "200":
+          description: Token metadata, or is_token false when not a resolved token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenMetadataResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /v1/contracts/{id}/storage:
     get:
       summary: Get a contract's latest storage snapshot values
@@ -774,6 +820,45 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequestsIPOnly"
+
+  /v1/api-keys/{id}/rotate:
+    post:
+      summary: Rotate an API key
+      description: >-
+        Mint a replacement key that inherits the label, network, and
+        rate-limit tier of the key identified by `id` (admin only). The
+        plaintext key is returned once, in this response, and cannot be
+        retrieved again. The existing key is not revoked by this call —
+        revoke it with DELETE /v1/api-keys/{id} once callers have moved
+        over, which evicts it from the auth cache immediately.
+      operationId: rotateApiKey
+      tags:
+        - API Keys
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: ID of the active key to rotate
+      responses:
+        "201":
+          description: Replacement key created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active API key with that id
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "500":
+          description: Rotation failed
 
   /v1/api-keys/{id}:
     patch:

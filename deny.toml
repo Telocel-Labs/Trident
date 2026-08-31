@@ -46,10 +46,22 @@ yanked = "deny"
 # { id = "RUSTSEC-2023-0001", reason = "Affects unused feature flag in transitive dep; no fix available; mitigated by not calling affected API. Triaged 2026-08-26 (#401)" }
 
 ignore = [
-    # Add triaged advisories here after review.
-    # Each of the 10 advisories from issue #373 must be evaluated and either:
-    #   1. Fixed by upgrading the affected dependency, OR
-    #   2. Added here with a documented acceptance rationale
+    # The 11 advisories from issue #373 plus RUSTSEC-2026-0258, all triaged
+    # 2026-08-30 into .cargo/audit.toml. See that file for full rationale
+    # per advisory. Keep both lists in sync: cargo audit reads audit.toml,
+    # cargo deny reads this file, and the two use different entry syntax.
+    { id = "RUSTSEC-2026-0204", reason = "Transitive; fmt::Display only. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2023-0071", reason = "Transitive; no RSA ops. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0049", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0098", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0099", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0104", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0190", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2024-0363", reason = "sqlx 0.7; needs dedicated upgrade PR. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2024-0436", reason = "Unmaintained build-time macro; no runtime impact. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2025-0119", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2025-0134", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.4.x upgraded to 0.4.19; remaining hit is h2 0.3.27 via tonic 0.11, which has no patched 0.3 release. Triaged 2026-08-30." },
 ]
 
 [licenses]

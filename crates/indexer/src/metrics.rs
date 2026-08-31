@@ -217,6 +217,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_FAILOVERS_TOTAL,
         "Times the indexer failed over to another RPC endpoint (issue #213)"
     );
+    describe_counter!(
+        REORGS_TOTAL,
+        "Total number of ledger reorganisations / rollbacks detected and reconciled (issue #196)"
+    );
     describe_gauge!(
         RPC_BREAKER_STATE,
         "RPC circuit breaker state: 0=Closed, 1=Open, 2=HalfOpen (issue #197)"
@@ -329,15 +333,15 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(LEDGER_GAPS_DETECTED_TOTAL).increment(0);
     counter!(LEDGER_GAPS_CLOSED_TOTAL).increment(0);
     counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
+    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(0);
+    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(0.0);
+    counter!(DEAD_LETTERED_TOTAL).increment(0);
     counter!(RECONCILE_PASSES_TOTAL).increment(0);
     counter!(RECONCILE_PASS_FAILURES_TOTAL).increment(0);
     counter!(RECONCILE_MISSING_EVENTS_TOTAL).increment(0);
     counter!(RECONCILE_EXTRA_EVENTS_TOTAL).increment(0);
     gauge!(RECONCILE_DISCREPANT_LEDGERS).set(0.0);
     gauge!(RECONCILE_WINDOW_END_LEDGER).set(0.0);
-    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(0);
-    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(0.0);
-    counter!(DEAD_LETTERED_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(RPC_BREAKER_STATE).set(0.0);
     gauge!(RPC_CONSECUTIVE_FAILURES).set(0.0);

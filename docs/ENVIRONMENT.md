@@ -124,6 +124,7 @@ description is accurate. Keep this file honest by hand.
 | `ADMIN_API_KEY` | Optional | empty (admin endpoints disabled) | Shared secret for `X-Admin-Key`, gating `/v1/admin/*`. |
 | `INTERNAL_API_KEY` | Required to use `/internal/status` (fails closed) | empty | Shared secret for `X-Internal-Key`, gating `GET /internal/status` (issue #316). **Unset means the endpoint rejects every request** — never treat empty as "no auth needed". Compared with `crypto/subtle.ConstantTimeCompare`. |
 | `API_KEY_HASHES` | Optional | empty | Comma-separated HMAC-SHA256 hashes of accepted API keys, salted with `API_KEY_SALT`. |
+| `API_KEY` | Optional | empty | Single accepted HMAC-SHA256 API key hash, salted with `API_KEY_SALT`. |
 | `API_KEY_SALT` | Optional but should be changed | `change-this-to-a-random-string` | Salt for API key hashing. |
 | `ALLOWED_ORIGINS` | Required in production | — (dev mode allows any origin) | Comma-separated CORS allow-list (`https://` origins, or `http://localhost*`). |
 | `REQUEST_TIMEOUT_MS` | Optional | `30000` | Per-request timeout middleware; excludes `/ws` and `/v1/events/stream`. |

@@ -295,6 +295,37 @@ jobs:
         run: sccache --show-stats
 
   # ---------------------------------------------------------------------------
+  # Explorer — build and type-check (issue #387).
+  #
+  # The explorer had no CI job, so an astro regression could land without
+  # any automated signal. This catches build failures and type errors.
+  # ---------------------------------------------------------------------------
+  explorer:
+    name: Explorer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: explorer
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: explorer/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Type check
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
   # Contracts — reference Soroban contracts (issue #258).
   #
   # A separate Cargo workspace (contracts/), not a member of the root one:
@@ -409,6 +440,70 @@ jobs:
 
       - name: Validate observability/rpc-alerts.yml
         run: ./promtool check rules observability/rpc-alerts.yml
+
+      - name: Download amtool
+        run: |
+          AM_VERSION="0.27.0"
+          curl -sSfL \
+            "https://github.com/prometheus/alertmanager/releases/download/v${AM_VERSION}/alertmanager-${AM_VERSION}.linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 "alertmanager-${AM_VERSION}.linux-amd64/amtool"
+          chmod +x amtool
+          ./amtool --version
+
+      # Issue #526: the routing tree is only half the requirement — an alert
+      # must actually reach a person. These checks fail the build on the two
+      # ways that silently breaks: a receiver that resolves nowhere, and a
+      # receiver defined with no delivery integration at all (which
+      # Alertmanager accepts and then discards every notification through).
+      - name: Validate monitoring/alertmanager.yml
+        env:
+          # Deploy-time values. Alertmanager only requires a well-formed URL
+          # and a non-empty routing key to validate, so these are deliberately
+          # not shaped like real credentials: a hooks.slack.com placeholder
+          # trips GitHub push protection, which is the correct behaviour for
+          # anything matching that pattern.
+          PAGERDUTY_ROUTING_KEY: example-routing-key-not-a-real-credential
+          SLACK_WEBHOOK_URL: https://alertmanager-config-check.invalid/webhook-placeholder
+        run: |
+          set -euo pipefail
+          envsubst < monitoring/alertmanager.yml > /tmp/alertmanager.rendered.yml
+          ./amtool check-config /tmp/alertmanager.rendered.yml
+
+          # Every alert severity/service combination alerts.yml can emit must
+          # resolve to the on-call receiver, not the null sink.
+          for args in \
+            "service=indexer severity=critical on-call-critical" \
+            "service=indexer severity=warning on-call-warning" \
+            "service=api severity=critical on-call-critical"; do
+            set -- $args
+            actual=$(./amtool config routes test \
+              --config.file=/tmp/alertmanager.rendered.yml "$1" "$2")
+            if [ "$actual" != "$3" ]; then
+              echo "::error::$1 $2 routed to '$actual', expected '$3'"
+              exit 1
+            fi
+            echo "OK: $1 $2 -> $actual"
+          done
+
+          # A receiver with no *_configs is valid YAML and a silent black
+          # hole. Assert the two on-call receivers each define at least one.
+          python3 - <<'PY'
+          import sys, yaml
+          cfg = yaml.safe_load(open("/tmp/alertmanager.rendered.yml"))
+          failed = False
+          for r in cfg.get("receivers", []):
+              name = r.get("name")
+              if name == "default-null":
+                  continue
+              integrations = [k for k in r if k.endswith("_configs") and r[k]]
+              if not integrations:
+                  print(f"::error::receiver '{name}' has no delivery integration — "
+                        "it would accept and discard every alert")
+                  failed = True
+              else:
+                  print(f"OK: receiver '{name}' delivers via {', '.join(integrations)}")
+          sys.exit(1 if failed else 0)
+          PY
 
   # ---------------------------------------------------------------------------
   # Rust integration tests — real Postgres + Redis
@@ -1037,6 +1132,72 @@ jobs:
   # Environment reference — fails if code reads an env var undocumented in
   # docs/ENVIRONMENT.md (issue #312).
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Launch gate (issue #503) — keeps the go/no-go check mechanical.
+  #
+  # This deliberately does NOT fail the build on a NO-GO verdict. The gate is
+  # unexecuted (every Pass/Fail cell blank) and correctly reports NO-GO today,
+  # so enforcing the verdict here would red every PR until launch day and get
+  # the job disabled. What IS enforced is that the checker keeps working: the
+  # table stays parseable, and the script's own GO/NO-GO branches still behave.
+  # A gate that silently stopped parsing its own table would otherwise report
+  # a clean NO-GO for the wrong reason.
+  #
+  # Run `bash scripts/check-launch-gate.sh` for the real verdict at launch.
+  # ---------------------------------------------------------------------------
+  launch-gate:
+    name: Launch gate checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Shell syntax
+        run: bash -n scripts/check-launch-gate.sh
+
+      - name: Checklist table is still parseable
+        run: |
+          set -euo pipefail
+          # 2>&1 matters: the NO-GO verdict is written to stderr (it is the
+          # failure path), so capturing stdout alone loses the RESULT line the
+          # assertions below look for.
+          out=$(bash scripts/check-launch-gate.sh 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -q "no gate rows found"; then
+            echo "::error::the launch checklist table is no longer parseable by check-launch-gate.sh"
+            exit 1
+          fi
+          if echo "$out" | grep -q "no gate row matching 'Rollback rehearsed'"; then
+            echo "::error::the rollback rehearsal row was renamed; update the match in check-launch-gate.sh"
+            exit 1
+          fi
+          echo "$out" | grep -qE '^RESULT: (GO|NO-GO)' \
+            || { echo "::error::script produced no GO/NO-GO verdict"; exit 1; }
+
+      # Exercises both verdicts against synthetic checklists so a regression in
+      # the parser cannot pass by always answering NO-GO.
+      - name: Verdict branches behave
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          hdr=$'| # | Gate | Pass/Fail | Evidence | Signed off by |\n|---|---|---|---|---|'
+          today=$(date +%Y-%m-%d)
+          stale=$(date -d '60 days ago' +%Y-%m-%d)
+
+          printf '%s\n| 1 | Alerts | Pass | ev | carol |\n| 2 | Rollback rehearsed | Pass | drill %s | dave |\n' \
+            "$hdr" "$today" > "$tmp/pass.md"
+          printf '%s\n| 1 | Alerts | Fail | ev | carol |\n| 2 | Rollback rehearsed | Pass | drill %s | dave |\n' \
+            "$hdr" "$today" > "$tmp/fail.md"
+          printf '%s\n| 1 | Alerts | Pass | ev | carol |\n| 2 | Rollback rehearsed | Pass | drill %s | dave |\n' \
+            "$hdr" "$stale" > "$tmp/stale.md"
+
+          bash scripts/check-launch-gate.sh "$tmp/pass.md" \
+            || { echo "::error::a fully-passing checklist must exit 0"; exit 1; }
+          ! bash scripts/check-launch-gate.sh "$tmp/fail.md" \
+            || { echo "::error::an explicit Fail row must exit non-zero"; exit 1; }
+          ! bash scripts/check-launch-gate.sh "$tmp/stale.md" \
+            || { echo "::error::a >30-day-old rollback rehearsal must exit non-zero"; exit 1; }
+          echo "All verdict branches behaved as expected."
+
   env-reference:
     name: Env reference
     runs-on: ubuntu-latest
@@ -1272,8 +1433,20 @@ jobs:
           go-version: "1.25"
           cache-dependency-path: services/api/go.sum
 
+      # Issue #516: the API-key lifecycle tests (issue/rotate/revoke against a
+      # real Redis-cached auth path) skip themselves unless these are set —
+      # this job is the only one with Postgres and Redis attached, so without
+      # them the lifecycle suite silently never runs anywhere in CI.
+      # REQUIRE_TEST_SERVICES turns a missing service into a hard failure
+      # rather than a green run that tested nothing.
       - name: Go coverage
         working-directory: services/api
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
         run: |
           go test ./... -coverprofile=coverage.out
           go tool cover -func=coverage.out | tee go-coverage.txt
@@ -1284,6 +1457,12 @@ jobs:
       # variation does not flap the build.
       - name: Enforce Go critical-package floors
         working-directory: services/api
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
         run: |
           set -euo pipefail
           check() {

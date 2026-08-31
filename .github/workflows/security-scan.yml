@@ -142,17 +142,17 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      # Reports but does not block. #466 removed this on the grounds that the
-      # advisories were triaged in deny.toml, but that file's `ignore` list is
-      # still empty placeholders and nothing here runs `cargo deny` — the
-      # rustsec action runs `cargo audit`, which does not read deny.toml at
-      # all. Blocking now would fail on the pre-existing #373 backlog rather
-      # than on anything new. Restore blocking once those 10 are triaged into
-      # .cargo/audit.toml (which cargo audit does read) or a cargo-deny step
-      # is added.
+      # audit-check installs cargo-audit itself without --locked, which
+      # resolves its dependencies to their newest releases. kstring 2.0.4 now
+      # requires rustc 1.96 while the stable runner is on 1.94, so that
+      # unpinned build fails before the audit ever runs. Installing it here
+      # with --locked uses cargo-audit's own lockfile, which builds on
+      # stable; the action reuses the binary it finds on PATH.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
       - name: cargo audit (Rust workspace)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 

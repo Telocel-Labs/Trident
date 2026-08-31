@@ -7,7 +7,7 @@
  */
 
 import { chromium } from '@playwright/test';
-import { injectAxe, checkA11y } from 'axe-playwright';
+import { injectAxe, getViolations } from 'axe-playwright';
 
 interface A11yResult {
   page: string;
@@ -28,19 +28,16 @@ async function testPage(browser: any, url: string, name: string) {
   try {
     await page.goto(url, { waitUntil: 'networkidle' });
     await injectAxe(page);
-    const violations = await checkA11y(page, null, {
-      detailedReport: true,
-      detailedReportOptions: {
-        html: false,
-      },
-    });
+    // getViolations returns the violation list; checkA11y returns void and
+    // throws instead, so it cannot be used to collect results.
+    const violations = await getViolations(page);
 
-    if (violations) {
+    if (violations.length > 0) {
       console.log(`  ✗ Found accessibility violations`);
       results.push({
         page: name,
         passed: false,
-        violations: violations.violations.map((v: any) => ({
+        violations: violations.map((v: any) => ({
           id: v.id,
           impact: v.impact,
           nodes: v.nodes.length,

@@ -366,6 +366,74 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 	}
 }
 
+// RotateAPIKey handles POST /v1/api-keys/{id}/rotate (admin-only).
+//
+// Creates a new replacement key inheriting the network, rate_limit_tier, and label
+// of the existing active key, allowing seamless zero-downtime key rotation with an overlap window.
+// The old key remains active until explicitly revoked.
+func RotateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(cfg, w, r) {
+			return
+		}
+
+		id := r.PathValue("id")
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
+		defer cancel()
+
+		var oldLabel, oldNetwork, oldTier string
+		var oldCreatedBy *string
+		err := cfg.DB.QueryRow(ctx,
+			`SELECT label, network, rate_limit_tier, created_by
+			 FROM api_keys
+			 WHERE id = $1 AND revoked_at IS NULL`,
+			id,
+		).Scan(&oldLabel, &oldNetwork, &oldTier, &oldCreatedBy)
+		if err == pgx.ErrNoRows {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "active api key not found for rotation")
+			return
+		}
+		if err != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to query api key")
+			return
+		}
+
+		// Generate new key: "trident_" + 32 random hex bytes
+		rawBytes := make([]byte, 32)
+		if _, err := rand.Read(rawBytes); err != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to generate key entropy")
+			return
+		}
+		plainKey := "trident_" + hex.EncodeToString(rawBytes)
+		keyHash := sha256hex(plainKey)
+		keyPrefix := plainKey[:16]
+
+		newLabel := fmt.Sprintf("%s (rotated %s)", oldLabel, time.Now().UTC().Format("2006-01-02"))
+
+		var resp APIKeyResponse
+		var createdAt time.Time
+		err = cfg.DB.QueryRow(ctx,
+			`INSERT INTO api_keys (key_hash, key_prefix, label, network, rate_limit_tier, created_by)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 RETURNING id, key_prefix, label, network, rate_limit_tier, created_by, request_count, created_at`,
+			keyHash, keyPrefix, newLabel, oldNetwork, oldTier, oldCreatedBy,
+		).Scan(&resp.ID, &resp.KeyPrefix, &resp.Label, &resp.Network, &resp.RateLimitTier, &resp.CreatedBy, &resp.RequestCount, &createdAt)
+		if err != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to store rotated api key")
+			return
+		}
+
+		resp.Key = &plainKey
+		resp.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+		writeJSON(w, http.StatusCreated, resp)
+	}
+}
+
 // DeleteAPIKey handles DELETE /v1/api-keys/{id} (admin-only).
 //
 // Soft-deletes the key by setting revoked_at. The key is immediately removed

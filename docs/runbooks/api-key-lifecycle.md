@@ -72,8 +72,23 @@ reuse the newly issued consumer key as the admin secret.
 
 ## Planned rotation with an overlap window
 
-Rotation is create-first and revoke-last. Creating a key does not alter the
+Rotation is create-first and revoke-last. Creating or rotating a key does not alter the
 old row, so both credentials remain valid during the overlap window.
+
+### Option A: Dedicated Rotate Endpoint (`POST /v1/api-keys/{id}/rotate`)
+
+Trident provides a native atomic rotation endpoint that clones the old key's network,
+rate-limit tier, and metadata, creating a new plaintext credential in one operation:
+
+```bash
+curl --fail-with-body -X POST \
+  "$TRIDENT_URL/v1/api-keys/$OLD_KEY_ID/rotate" \
+  -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+The response returns the new plaintext key and prefix while the old key remains fully active for zero-downtime cutover.
+
+### Option B: Manual Issuance Workflow
 
 1. List keys and record the old key's UUID and prefix. Confirm its consumer,
    network, and tier.

@@ -140,6 +140,15 @@ The script exits non-zero if any assertion fails and prints the failure count in
 `summary.txt`, so it can gate a launch checklist. Still treat data loss, cursor
 corruption, or unbounded retry loops seen in the logs as follow-up issues — those
 are not asserted automatically.
+
+**Running it against staging** (issue #499): the harness as written targets
+`docker compose` service names, so it cannot run unmodified against a
+Kubernetes-deployed staging environment — see
+[`docs/runbooks/chaos-drill-findings.md`](../docs/runbooks/chaos-drill-findings.md)
+for the exact adaptation needed, a full static verification of the harness's
+assertions against the real `/v1/ready` contract, and two coverage gaps found
+during that review (PgBouncer faults are never induced directly, and the
+default `RECOVERY_SECONDS` was never measured against actual recovery time).
 ## Interpreting Results
 
 ### k6 scripts (`events-load.js`, `batch-load.js`, `stats-load.js`, `stream-load.js`)

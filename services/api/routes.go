@@ -127,6 +127,11 @@ func routeBindings() []routeBinding {
 		documented("GET", "/v1/api-keys", func(d routeDeps) http.Handler {
 			return handlers.ListAPIKeys(d.apiKeyCfg)
 		}),
+		// Atomic rotation: mints a replacement key and evicts the old one's
+		// auth cache entry in the same request (issue #516).
+		documented("POST", "/v1/api-keys/{id}/rotate", func(d routeDeps) http.Handler {
+			return handlers.RotateAPIKey(d.apiKeyCfg)
+		}),
 		documented("PATCH", "/v1/api-keys/{id}", func(d routeDeps) http.Handler {
 			return handlers.UpdateAPIKey(d.apiKeyCfg)
 		}),
@@ -153,6 +158,13 @@ func routeBindings() []routeBinding {
 		documented("GET", "/v1/contracts/{id}/spec", func(d routeDeps) http.Handler {
 			return middleware.ResponseCache(d.redisClient, contractMetadataCacheTTL,
 				middleware.DefaultCacheKey)(handlers.ContractSpec(d.schemaRegistryDB))
+		}),
+		// SEP-41 token metadata resolved by the indexer (issue #263). Its
+		// registration was dropped when routes moved out of main.go, leaving
+		// the handler unreachable and TokenMetadataResponse unused in the spec.
+		documented("GET", "/v1/contracts/{id}/metadata", func(d routeDeps) http.Handler {
+			return middleware.ResponseCache(d.redisClient, contractMetadataCacheTTL,
+				middleware.DefaultCacheKey)(handlers.TokenMetadata(d.pool))
 		}),
 		documented("GET", "/v1/contracts/{id}/storage", func(d routeDeps) http.Handler {
 			return handlers.ContractStorageLatest(d.schemaRegistryDB)

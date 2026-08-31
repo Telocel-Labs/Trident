@@ -806,103 +806,6 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     Ok(())
 }
 
-/// The most recently processed ledgers, newest first, as `(sequence, hash)`
-/// pairs (issue #196). Used to detect a reorg: the streamer compares each
-/// stored hash against what the RPC currently reports for that sequence via
-/// `getLedgers`, walking backward from the cursor until either a match is
-/// found (the divergence point) or `limit` is exhausted (a rewind deeper
-/// than the caller's configured bound).
-pub async fn recent_ledger_hashes(
-    pool: &PgPool,
-    limit: i64,
-) -> Result<Vec<(i64, String)>, TridentError> {
-    let rows: Vec<(i64, String)> = sqlx::query_as(
-        r#"
-        SELECT ledger_sequence, ledger_hash
-        FROM ledger_metadata
-        ORDER BY ledger_sequence DESC
-        LIMIT $1
-        "#,
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("recent_ledger_hashes")))?;
-
-    Ok(rows)
-}
-
-/// Atomically delete every row derived from ledgers `>= from_sequence` and
-/// rewind the cursor to `from_sequence - 1`, so the next poll re-fetches and
-/// re-indexes the divergent range from the RPC's current (post-reorg)
-/// history (issue #196).
-///
-/// Deletes across every table keyed by `ledger_sequence`, not only
-/// `soroban_events` + `ledger_metadata` as named in the issue: leaving
-/// `token_events`, `contract_invocation_metrics`, or
-/// `contract_storage_snapshots` rows for a reorged-away ledger would be
-/// exactly the "stale rows" this exists to prevent, just in a projection
-/// table instead of the primary one. `parse_errors` and `failed_events` are
-/// deliberately left alone — they record an ingest attempt, not chain state,
-/// so they stay historically accurate even after the ledger they refer to is
-/// superseded.
-///
-/// One transaction: either the whole rewind (deletes + cursor) lands, or
-/// none of it does, so a crash mid-rewind can never leave the cursor ahead
-/// of data that no longer exists.
-pub async fn rewind_for_reorg(pool: &PgPool, from_sequence: u64) -> Result<(), TridentError> {
-    let from = from_sequence as i64;
-
-    let mut tx = pool.begin().await.map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("rewind_for_reorg begin"))
-    })?;
-
-    for table in [
-        "soroban_events",
-        "token_events",
-        "contract_invocation_metrics",
-        "contract_storage_snapshots",
-        "ledger_metadata",
-    ] {
-        // Table names are a fixed internal list, never user input, so this is
-        // not building a query from untrusted data.
-        let sql = format!("DELETE FROM {table} WHERE ledger_sequence >= $1");
-        sqlx::query(&sql)
-            .bind(from)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                TridentError::storage(
-                    anyhow::Error::new(e).context(format!("rewind_for_reorg delete {table}")),
-                )
-            })?;
-    }
-
-    // Unlike commit_page's cursor advance, this write has no monotonic
-    // "only move forward" guard — rewinding backward is the entire point of
-    // a reorg recovery, so an unconditional SET is correct here, not a bug.
-    let new_cursor = from_sequence.saturating_sub(1);
-    sqlx::query(
-        r#"
-        UPDATE system_state
-        SET value = $1, updated_at = NOW()
-        WHERE key = 'latest_ledger_cursor'
-        "#,
-    )
-    .bind(new_cursor.to_string())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("rewind_for_reorg set_cursor"))
-    })?;
-
-    tx.commit().await.map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("rewind_for_reorg commit"))
-    })?;
-
-    Ok(())
-}
-
 /// A contiguous run of missing ledger sequences in `ledger_metadata`
 /// (issue #216): every ledger in `[from_ledger, to_ledger]` (inclusive) is
 /// absent, while the sequences immediately outside that range are present.
@@ -1062,6 +965,111 @@ pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
     row.0
         .parse::<u64>()
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("cursor parse")))
+}
+
+/// Fetch recent ledger sequences and hashes from `ledger_metadata` ordered by sequence descending.
+/// Used for reorg detection (issue #196).
+pub async fn get_recent_ledger_metadata(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(u64, String)>, TridentError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT ledger_sequence, ledger_hash
+        FROM ledger_metadata
+        ORDER BY ledger_sequence DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("get_recent_ledger_metadata"))
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(seq, hash)| (seq as u64, hash))
+        .collect())
+}
+
+/// Atomically remove all indexed data from `from_sequence` onwards and rewind the cursor to `new_cursor` (issue #196).
+pub async fn handle_reorg_rollback(
+    pool: &PgPool,
+    from_sequence: u64,
+    new_cursor: u64,
+) -> Result<(), TridentError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg begin tx")))?;
+
+    let seq_i64 = from_sequence as i64;
+
+    // Delete token projections first (foreign key / dependent rows)
+    sqlx::query("DELETE FROM token_events WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete token_events"))
+        })?;
+
+    // Delete invocation metrics
+    sqlx::query("DELETE FROM contract_invocation_metrics WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_invocation_metrics"),
+            )
+        })?;
+
+    // Delete storage snapshots
+    sqlx::query("DELETE FROM contract_storage_snapshots WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_storage_snapshots"),
+            )
+        })?;
+
+    // Delete primary soroban events
+    sqlx::query("DELETE FROM soroban_events WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete soroban_events"))
+        })?;
+
+    // Delete ledger metadata
+    sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete ledger_metadata"))
+        })?;
+
+    // Rewind cursor in system_state
+    sqlx::query(
+        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+    )
+    .bind(new_cursor.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg rewind cursor")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg commit tx")))?;
+
+    Ok(())
 }
 
 /// Write indexer health metrics into the `system_state` health columns after
@@ -1945,159 +1953,6 @@ mod tests {
 
         sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
             .bind(&contract_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-
-    /// recent_ledger_hashes must return stored (sequence, hash) pairs newest
-    /// first, and respect its limit (issue #196).
-    #[tokio::test]
-    async fn recent_ledger_hashes_returns_newest_first_bounded_by_limit() {
-        let db_url = match std::env::var("TEST_DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
-                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
-            }
-            Err(_) => {
-                eprintln!("SKIP: TEST_DATABASE_URL not set");
-                return;
-            }
-        };
-        let pool = PgPool::connect(&db_url).await.unwrap();
-
-        // A distinct, unlikely-to-collide sequence range for this test.
-        let base = 7_200_000u64;
-        for i in 0..5u64 {
-            let seq = base + i;
-            sqlx::query(
-                "INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp) \
-                 VALUES ($1, $2, NOW()) ON CONFLICT (ledger_sequence) DO UPDATE SET ledger_hash = EXCLUDED.ledger_hash",
-            )
-            .bind(seq as i64)
-            .bind(format!("hash-{seq}"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-
-        let rows = recent_ledger_hashes(&pool, 3).await.unwrap();
-        assert_eq!(rows.len(), 3, "must respect the limit");
-        assert_eq!(
-            rows,
-            vec![
-                ((base + 4) as i64, format!("hash-{}", base + 4)),
-                ((base + 3) as i64, format!("hash-{}", base + 3)),
-                ((base + 2) as i64, format!("hash-{}", base + 2)),
-            ],
-            "must be ordered newest (highest sequence) first"
-        );
-
-        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence >= $1")
-            .bind(base as i64)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-
-    /// rewind_for_reorg must delete every row for ledgers >= from_sequence
-    /// across every table it touches, rewind the cursor to from_sequence - 1,
-    /// and leave rows below that sequence untouched (issue #196).
-    #[tokio::test]
-    async fn rewind_for_reorg_deletes_affected_range_and_rewinds_cursor() {
-        let db_url = match std::env::var("TEST_DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
-                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
-            }
-            Err(_) => {
-                eprintln!("SKIP: TEST_DATABASE_URL not set");
-                return;
-            }
-        };
-        let pool = PgPool::connect(&db_url).await.unwrap();
-
-        let contract_id = format!("CREORG_{}", Uuid::new_v4());
-        let base = 7_300_000u64;
-        // Two ledgers below the rewind point (must survive) and two at/above
-        // it (must be deleted).
-        let kept = [make_event(&contract_id, base, 0)];
-        let removed = [
-            make_event(&contract_id, base + 1, 0),
-            make_event(&contract_id, base + 2, 0),
-        ];
-
-        fn page(events: &[SorobanEvent], seq: u64, cursor: u64) -> PageCommit<'_> {
-            PageCommit {
-                events,
-                token_events: &[],
-                invocation_metrics: &[],
-                storage_snapshots: &[],
-                network: "testnet",
-                cursor: Some(cursor),
-                ledger: Some(LedgerMeta {
-                    sequence: seq,
-                    hash: "prereorg",
-                    timestamp: "2024-01-01T00:00:00Z",
-                    event_count: 1,
-                }),
-                batch_size: 10,
-            }
-        }
-
-        commit_page(&pool, page(&kept, base, base)).await.unwrap();
-        commit_page(&pool, page(&[removed[0].clone()], base + 1, base + 1))
-            .await
-            .unwrap();
-        commit_page(&pool, page(&[removed[1].clone()], base + 2, base + 2))
-            .await
-            .unwrap();
-        assert_eq!(get_cursor(&pool).await.unwrap(), base + 2);
-
-        rewind_for_reorg(&pool, base + 1)
-            .await
-            .expect("rewind failed");
-
-        assert_eq!(
-            get_cursor(&pool).await.unwrap(),
-            base,
-            "cursor must rewind to from_sequence - 1"
-        );
-
-        let remaining: Vec<i64> = sqlx::query_scalar(
-            "SELECT ledger_sequence FROM soroban_events WHERE contract_id = $1 ORDER BY ledger_sequence",
-        )
-        .bind(&contract_id)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            remaining,
-            vec![base as i64],
-            "only the ledger below the rewind point may remain"
-        );
-
-        let remaining_meta: Vec<i64> = sqlx::query_scalar(
-            "SELECT ledger_sequence FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2 ORDER BY ledger_sequence",
-        )
-        .bind(base as i64)
-        .bind((base + 2) as i64)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            remaining_meta,
-            vec![base as i64],
-            "ledger_metadata rows at/above from_sequence must be deleted too"
-        );
-
-        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
-            .bind(&contract_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence = $1")
-            .bind(base as i64)
             .execute(&pool)
             .await
             .unwrap();

@@ -80,7 +80,9 @@ sdk-build:
 test:
 	cargo test --all
 	cd services/api && go test ./...
-	cd sdk/typescript && npm install && npm run test
+	cd sdk/go && go test ./...
+	cd sdk/python && pip install -e ".[dev]" && pytest -q
+	cd sdk/typescript && npm install && npm run build && npm run test
 	cd sdk/react && npm install && npm run test
 
 deploy: ## Deploy all services to Fly.io in dependency order (requires flyctl)
