@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
+# Usage: ./scripts/restore.sh <backup_file> <target_db_url>
 set -euo pipefail
 
-# Usage: ./scripts/restore.sh <backup_file> <target_db_url>
-BACKUP_FILE=${1:?"Missing backup file argument"}
-TARGET_URL=${2:?"Missing target database URL"}
+BACKUP_FILE=$1
+TARGET_DB_URL=$2
 
-# Verify checksum
-CHECKSUM_FILE="${BACKUP_FILE}.sha256"
-if [ -f "$CHECKSUM_FILE" ]; then
-    sha256sum -c "$CHECKSUM_FILE"
-else
-    echo "Warning: No checksum file found for ${BACKUP_FILE}"
+if [ ! -f "$BACKUP_FILE" ]; then
+    echo "Backup file not found: $BACKUP_FILE"
+    exit 1
 fi
 
-# Restore into target database
-pg_restore --clean --if-exists --no-owner --no-privileges -d "$TARGET_URL" "$BACKUP_FILE"
+if [ ! -f "$BACKUP_FILE.sha256" ]; then
+    echo "Checksum file not found: $BACKUP_FILE.sha256"
+    exit 1
+fi
+
+echo "Verifying checksum..."
+sha256sum -c "$BACKUP_FILE.sha256"
+
+echo "Restoring database from $BACKUP_FILE to $TARGET_DB_URL..."
+pg_restore --clean --if-exists --no-owner --no-privileges -d "$TARGET_DB_URL" "$BACKUP_FILE"
 
 echo "Restore completed successfully."
