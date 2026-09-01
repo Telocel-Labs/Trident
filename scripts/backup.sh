@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
-# Usage: DATABASE_URL=... ./scripts/backup.sh <output_dir>
 set -euo pipefail
 
-OUTPUT_DIR=${1:-./backups}
-mkdir -p "$OUTPUT_DIR"
-
+# Usage: ./scripts/backup.sh ./backups
+BACKUP_DIR=${1:-./backups}
 TIMESTAMP=$(date -u +%Y%m%d_%H%M%SZ)
-FILENAME="trident_db_backup_$TIMESTAMP.dump"
-OUTPUT_PATH="$OUTPUT_DIR/$FILENAME"
+FILENAME="trident_db_backup_${TIMESTAMP}.dump"
 
-# Perform pg_dump in custom format (-Fc)
-pg_dump -Fc "$DATABASE_URL" > "$OUTPUT_PATH"
+mkdir -p "$BACKUP_DIR"
 
-# Create checksum
-sha256sum "$OUTPUT_PATH" > "$OUTPUT_PATH.sha256"
+# Perform pg_dump in custom format (-Fc) for restore flexibility
+pg_dump -Fc -f "${BACKUP_DIR}/${FILENAME}"
 
-echo "Backup created at $OUTPUT_PATH"
-echo "Integrity checksum created at $OUTPUT_PATH.sha256"
+# Generate SHA256 checksum for integrity
+sha256sum "${BACKUP_DIR}/${FILENAME}" > "${BACKUP_DIR}/${FILENAME}.sha256"
+
+echo "Backup created: ${BACKUP_DIR}/${FILENAME}"
