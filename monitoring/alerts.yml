@@ -1,20 +1,22 @@
 groups:
-  - name: trident-partitions
+  - name: TridentPartitions
     rules:
       - alert: TridentPartitionExhaustionSoon
-        expr: trident_indexer_partition_days_remaining < 7
+        expr: | 
+          (select count(*) from pg_partition_meta where partition_name like 'events_%' and upper_bound < now() + interval '7 days') > 0
         for: 1h
         labels:
           severity: warning
         annotations:
-          summary: "Events table partition is running out of future bounds"
-          description: "The newest events table partition ends in less than 7 days. Ensure automated partition management is running or manually run the partition creation script."
+          summary: "Newest partition is within 7 days of its bound"
+          description: "The events table is nearing its partition bound. Ensure ensure_future_event_partitions(3) is running."
 
       - alert: TridentPartitionExhaustionCritical
-        expr: trident_indexer_partition_days_remaining < 2
-        for: 15m
+        expr: | 
+          (select count(*) from pg_partition_meta where partition_name like 'events_%' and upper_bound < now() + interval '2 days') > 0
+        for: 10m
         labels:
           severity: critical
         annotations:
-          summary: "Events table partition exhausting imminently"
-          description: "The newest events table partition ends in less than 2 days. Inserts will fail once bounds are reached."
+          summary: "Newest partition is within 2 days of its bound"
+          description: "Partition exhaustion is imminent. Hard ingestion failure will occur shortly."
