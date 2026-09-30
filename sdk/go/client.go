@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/Depo-dev/trident/sdk/go/openapi"
 )
 
 // Client is the Trident Go Client.
@@ -211,6 +213,148 @@ func (c *Client) GetIndexerStats(ctx context.Context, opts ...RequestOption) (*I
 	return &res, nil
 }
 
+// ---------------------------------------------------------------------
+// Webhook subscription management (issue #677)
+//
+// Signature verification for INCOMING deliveries is VerifyWebhookSignature
+// in webhook.go, deliberately separate from these methods — these manage
+// the subscription resource itself via the /v1/webhooks API. Request and
+// response shapes are the generated OpenAPI models in the openapi package;
+// do not hand-edit those, they are regenerated from api/openapi.yaml by
+// scripts/generate_sdk_models.py.
+// ---------------------------------------------------------------------
+
+// CreateWebhook creates a webhook subscription for a contract's events.
+//
+// The returned WebhookCreateResponse.Secret is shown only once — store it
+// to verify incoming deliveries with VerifyWebhookSignature.
+func (c *Client) CreateWebhook(ctx context.Context, req openapi.WebhookCreateRequest, opts ...RequestOption) (*openapi.WebhookCreateResponse, error) {
+	reqURL, err := url.Parse(c.config.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid BaseURL: %w", err)
+	}
+	reqURL.Path = "/v1/webhooks"
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode webhook create request: %w", err)
+	}
+
+	bodyBytes, err := c.do(ctx, http.MethodPost, reqURL.String(), reqBody, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var res openapi.WebhookCreateResponse
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
+		return nil, fmt.Errorf("decode webhook create response: %w", err)
+	}
+	return &res, nil
+}
+
+// ListWebhooks lists webhook subscriptions for the caller's API key,
+// cursor-paginated. Pass limit <= 0 to use the server default, and an empty
+// cursor for the first page.
+func (c *Client) ListWebhooks(ctx context.Context, limit int, cursor string, opts ...RequestOption) (*openapi.ListWebhooksResponse, error) {
+	reqURL, err := url.Parse(c.config.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid BaseURL: %w", err)
+	}
+	reqURL.Path = "/v1/webhooks"
+
+	q := reqURL.Query()
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	reqURL.RawQuery = q.Encode()
+
+	bodyBytes, err := c.do(ctx, http.MethodGet, reqURL.String(), nil, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var res openapi.ListWebhooksResponse
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
+		return nil, fmt.Errorf("decode webhook list response: %w", err)
+	}
+	return &res, nil
+}
+
+// DeleteWebhook permanently deletes a webhook subscription.
+//
+// A subscription owned by a different API key returns the same "not found"
+// error as one that doesn't exist at all — the API deliberately does not
+// distinguish the two.
+func (c *Client) DeleteWebhook(ctx context.Context, id string, opts ...RequestOption) error {
+	reqURL, err := url.Parse(c.config.BaseURL)
+	if err != nil {
+		return fmt.Errorf("invalid BaseURL: %w", err)
+	}
+	reqURL.Path = "/v1/webhooks/" + id
+
+	_, err = c.do(ctx, http.MethodDelete, reqURL.String(), nil, opts)
+	return err
+}
+
+// PauseWebhook pauses deliveries for a webhook subscription without
+// deleting it.
+func (c *Client) PauseWebhook(ctx context.Context, id string, opts ...RequestOption) (*openapi.WebhookStatusResponse, error) {
+	return c.setWebhookPauseState(ctx, id, "pause", opts)
+}
+
+// ResumeWebhook resumes deliveries for a previously paused webhook
+// subscription.
+func (c *Client) ResumeWebhook(ctx context.Context, id string, opts ...RequestOption) (*openapi.WebhookStatusResponse, error) {
+	return c.setWebhookPauseState(ctx, id, "resume", opts)
+}
+
+func (c *Client) setWebhookPauseState(ctx context.Context, id, action string, opts []RequestOption) (*openapi.WebhookStatusResponse, error) {
+	reqURL, err := url.Parse(c.config.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid BaseURL: %w", err)
+	}
+	reqURL.Path = "/v1/webhooks/" + id + "/" + action
+
+	bodyBytes, err := c.do(ctx, http.MethodPatch, reqURL.String(), nil, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var res openapi.WebhookStatusResponse
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
+		return nil, fmt.Errorf("decode webhook status response: %w", err)
+	}
+	return &res, nil
+}
+
+// RotateWebhookSecret rotates a webhook subscription's signing secret.
+//
+// The previous secret remains valid for the overlap window described by
+// VerifyWebhookSignature's multi-token header handling — update your
+// receiver to the new WebhookRotateSecretResponse.Secret before the old one
+// is fully retired.
+func (c *Client) RotateWebhookSecret(ctx context.Context, id string, opts ...RequestOption) (*openapi.WebhookRotateSecretResponse, error) {
+	reqURL, err := url.Parse(c.config.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid BaseURL: %w", err)
+	}
+	reqURL.Path = "/v1/webhooks/" + id + "/rotate-secret"
+
+	bodyBytes, err := c.do(ctx, http.MethodPost, reqURL.String(), nil, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var res openapi.WebhookRotateSecretResponse
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
+		return nil, fmt.Errorf("decode webhook rotate-secret response: %w", err)
+	}
+	return &res, nil
+}
+
 // do issues an HTTP request, retrying according to the effective retry
 // policy (client-level config merged with any per-call opts). Retries apply
 // uniformly regardless of method here because every endpoint wrapped by this
@@ -262,7 +406,12 @@ func (c *Client) do(ctx context.Context, method, reqURL string, body []byte, opt
 			return nil, &RequestError{Attempts: attempt, Err: err}
 		}
 
-		if resp.StatusCode != http.StatusOK {
+		// Every existing caller's endpoint returns 200, so this was
+		// previously hardcoded to StatusOK; the webhook management
+		// endpoints (issue #677) return 201 (create) and 204 (delete), so
+		// the check is widened to any 2xx rather than adding a second
+		// request path just for those two status codes.
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 

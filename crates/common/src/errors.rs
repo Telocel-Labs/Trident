@@ -8,6 +8,26 @@ use thiserror::Error;
 /// [`TridentError::severity`] classifiers let the streamer decide whether a
 /// failure should be retried, the offending item skipped, or the process
 /// halted.
+/// Coarse, typed classification of an RPC failure, attached at the point the
+/// error is constructed (where the real signal — `reqwest::Error::is_timeout()`,
+/// an HTTP status code, a JSON-RPC error body — is still available) rather
+/// than re-derived later by substring-matching the formatted `Display` text
+/// (issue #658). A wording change in the error message can no longer change
+/// which health-scoring deduction is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcErrorKind {
+    /// The request exceeded the configured timeout.
+    Timeout,
+    /// The endpoint returned HTTP 429.
+    RateLimited,
+    /// The endpoint returned a non-2xx, non-429 HTTP status.
+    NonSuccessStatus,
+    /// The JSON-RPC response body carried an `error` object.
+    JsonRpcError,
+    /// The transport failed to establish a connection to the endpoint.
+    ConnectionRefused,
+}
+
 #[derive(Debug, Error)]
 pub enum TridentError {
     /// Failure communicating with or parsing a response from Stellar RPC.
@@ -24,6 +44,11 @@ pub enum TridentError {
         source: anyhow::Error,
         /// The ledger sequence being fetched when the failure occurred, if known.
         ledger: Option<u64>,
+        /// Typed classification of the failure, if known at construction time
+        /// (issue #658). `None` for RPC errors constructed without a specific
+        /// classification (e.g. via `TridentError::rpc` from call sites that
+        /// don't distinguish failure kinds).
+        kind: Option<RpcErrorKind>,
     },
 
     /// Failure decoding or normalising raw XDR event data. A poison message —
@@ -68,6 +93,7 @@ impl TridentError {
         TridentError::RpcError {
             source: source.into(),
             ledger: None,
+            kind: None,
         }
     }
 
@@ -77,6 +103,27 @@ impl TridentError {
         TridentError::RpcError {
             source: source.into(),
             ledger: Some(ledger),
+            kind: None,
+        }
+    }
+
+    /// Construct an [`RpcError`](TridentError::RpcError) tagged with a typed
+    /// failure classification (issue #658), so callers can react to the
+    /// failure kind without inspecting the formatted message text.
+    pub fn rpc_kind(source: impl Into<anyhow::Error>, kind: RpcErrorKind) -> Self {
+        TridentError::RpcError {
+            source: source.into(),
+            ledger: None,
+            kind: Some(kind),
+        }
+    }
+
+    /// The typed RPC failure classification, if this is an
+    /// [`RpcError`](TridentError::RpcError) constructed with one (issue #658).
+    pub fn rpc_error_kind(&self) -> Option<RpcErrorKind> {
+        match self {
+            TridentError::RpcError { kind, .. } => *kind,
+            _ => None,
         }
     }
 
