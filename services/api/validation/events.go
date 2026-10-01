@@ -14,6 +14,18 @@ const (
 	LimitDefault = 50
 )
 
+// MaxLedgerRange caps the width of an explicit ledger range on every
+// range-filtered list endpoint (GET /v1/events, GET /v1/stats/contracts, and
+// their GraphQL counterparts): without a cap, a caller requesting the full
+// historical range forces a scan proportional to total chain history rather
+// than to the caller's actual need, a cost that only grows with the chain's
+// age (issue #686). Originally introduced as StatsMaxLedgerRange for the
+// stats endpoint alone (issue #654, where an explicit range bypasses the
+// maintained rollup and falls back to a live aggregation over
+// soroban_events); the same reasoning and the same ~7-day-at-Stellar's-~5s-
+// ledger-close-time width applies anywhere a ledger range drives a scan.
+const MaxLedgerRange = 120_000
+
 // validEventTypes holds the accepted values for the ?event_type filter.
 var validEventTypes = map[string]bool{
 	"contract":   true,
@@ -61,6 +73,13 @@ type QueryEventsParams struct {
 //   - contractId: valid Stellar contract strkey (C…, 56 chars) if present
 //   - cursor:     non-empty string if present (opaque; no further validation)
 //   - eventType:  one of "contract", "system", "diagnostic" (case-insensitive) if present
+//
+// A one-sided or absent range is left unbounded, matching the gRPC backend's
+// own treatment of ledgerFrom=0/ledgerTo=0 as "no bound" -- unlike
+// ValidateQueryStats, an unbounded events query is always served from an
+// indexed, paginated scan, not a live aggregation, so there is no reason to
+// force both bounds just to apply the width cap. The cap in MaxLedgerRange
+// applies only once both bounds are given (issue #686).
 func ValidateQueryEvents(
 	limitStr, ledgerFromStr, ledgerToStr, contractID, cursor, eventTypeStr string,
 ) (*QueryEventsParams, *ValidationError) {
@@ -78,6 +97,9 @@ func ValidateQueryEvents(
 	from, to, verr := ValidateLedgerRange("ledgerFrom", "ledgerTo", ledgerFromStr, ledgerToStr)
 	if verr != nil {
 		return nil, verr
+	}
+	if from != nil && to != nil && *to-*from > MaxLedgerRange {
+		return nil, Errorf("ledgerTo", "range (ledgerTo - ledgerFrom) must not exceed %d ledgers", MaxLedgerRange)
 	}
 	p.LedgerFrom, p.LedgerTo = from, to
 
@@ -109,14 +131,6 @@ const (
 	StatsLimitMin     = 1
 	StatsLimitMax     = 100
 	StatsLimitDefault = 50
-
-	// StatsMaxLedgerRange caps the width of an explicit from_ledger/to_ledger
-	// window on GET /v1/stats/contracts. Any explicit range bypasses the
-	// maintained rollup and falls back to a live aggregation over
-	// soroban_events (issue #654); without a cap that live scan grows
-	// unbounded with total historical event count. ~7 days at Stellar's
-	// ~5s ledger close time.
-	StatsMaxLedgerRange = 120_000
 )
 
 // validNetworks holds the accepted values for the ?network filter.
@@ -178,8 +192,8 @@ func ValidateQueryStats(
 		if from == nil || to == nil {
 			return nil, Errorf("from_ledger", "from_ledger and to_ledger must both be set when either is provided")
 		}
-		if *to-*from > StatsMaxLedgerRange {
-			return nil, Errorf("to_ledger", "range (to_ledger - from_ledger) must not exceed %d ledgers", StatsMaxLedgerRange)
+		if *to-*from > MaxLedgerRange {
+			return nil, Errorf("to_ledger", "range (to_ledger - from_ledger) must not exceed %d ledgers", MaxLedgerRange)
 		}
 	}
 

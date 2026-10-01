@@ -111,7 +111,7 @@ func TestValidateQueryStats_OneSidedRange_ToOnly_Rejected(t *testing.T) {
 
 func TestValidateQueryStats_RangeAtCap_Accepted(t *testing.T) {
 	from := int64(1000)
-	to := from + StatsMaxLedgerRange
+	to := from + MaxLedgerRange
 	params, err := ValidateQueryStats("1000", strconv.FormatInt(to, 10), "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -121,7 +121,7 @@ func TestValidateQueryStats_RangeAtCap_Accepted(t *testing.T) {
 
 func TestValidateQueryStats_RangeOverCap_Rejected(t *testing.T) {
 	from := int64(1000)
-	to := from + StatsMaxLedgerRange + 1
+	to := from + MaxLedgerRange + 1
 	_, err := ValidateQueryStats("1000", strconv.FormatInt(to, 10), "")
 	if assert.Error(t, err) {
 		assert.Equal(t, "to_ledger", err.Field)

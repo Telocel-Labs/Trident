@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 )
 
 // Resolver and transport tests for GraphQL query parity (issue #223).
@@ -139,6 +140,42 @@ func TestGQLResolve_EventsPassesRESTFilters(t *testing.T) {
 	}
 }
 
+// TestGQLResolve_EventsRejectsOverWideLedgerRange matches GET /v1/events' own
+// REST validation (issue #686): without this cap GraphQL could request the
+// full historical range even though the REST endpoint cannot.
+func TestGQLResolve_EventsRejectsOverWideLedgerRange(t *testing.T) {
+	backend := &fakeBackend{}
+	op, err := gqlParseQuery(payload(t, `query { events { events { id } } }`, map[string]any{
+		"ledgerFrom": 0,
+		"ledgerTo":   validation.MaxLedgerRange + 1,
+	}))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := gqlResolveQuery(context.Background(), backend, op, "mainnet"); err == nil {
+		t.Fatal("expected a validation error for a range one ledger over the cap")
+	}
+	if backend.calls != 0 {
+		t.Error("backend must not be called when the range is rejected")
+	}
+}
+
+// At the cap is still accepted; this is the width check's boundary, mirrored
+// from ValidateQueryEvents' own RangeAtCap test.
+func TestGQLResolve_EventsAcceptsLedgerRangeAtCap(t *testing.T) {
+	backend := &fakeBackend{}
+	op, err := gqlParseQuery(payload(t, `query { events { events { id } } }`, map[string]any{
+		"ledgerFrom": 0,
+		"ledgerTo":   validation.MaxLedgerRange,
+	}))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := gqlResolveQuery(context.Background(), backend, op, "mainnet"); err != nil {
+		t.Fatalf("unexpected error for a range exactly at the cap: %v", err)
+	}
+}
+
 // TestGQLResolve_NetworkComesFromConnection is the security-relevant half of
 // parity: the network is taken from the authenticated key, never from the
 // query, exactly as the REST handlers enforce it.
@@ -217,6 +254,25 @@ func TestGQLResolve_ContractStats(t *testing.T) {
 	}
 	if backend.gotStats.Network != "mainnet" || backend.gotStats.Limit != 5 {
 		t.Errorf("stats query = %+v", backend.gotStats)
+	}
+}
+
+// TestGQLResolve_ContractStatsRejectsOverWideLedgerRange matches GET
+// /v1/stats/contracts' own REST validation (issue #686): an explicit range
+// this wide bypasses the maintained rollup and falls back to a live
+// aggregation over soroban_events.
+func TestGQLResolve_ContractStatsRejectsOverWideLedgerRange(t *testing.T) {
+	backend := &fakeBackend{}
+	op, err := gqlParseQuery(payload(t,
+		`query { contractStats(fromLedger: 0, toLedger: 999999999) { contractId } }`, nil))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := gqlResolveQuery(context.Background(), backend, op, "mainnet"); err == nil {
+		t.Fatal("expected a validation error for a range far over the cap")
+	}
+	if backend.calls != 0 {
+		t.Error("backend must not be called when the range is rejected")
 	}
 }
 
