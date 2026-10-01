@@ -111,15 +111,27 @@ and consider a second endpoint for failover via `STELLAR_RPC_URLS` (see below).
 | `RPC_POOL_IDLE_TIMEOUT_MS` | How long an idle pooled connection is kept (default: `90000`) |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Idle keep-alive connections retained per RPC host (default: `8`) |
 | `RPC_TCP_KEEPALIVE_MS` | TCP keep-alive probe interval (default: `60000`) |
-| `RPC_FAILOVER_THRESHOLD` | Consecutive failures before the active endpoint is parked (default: `3`) |
-| `RPC_ENDPOINT_COOLDOWN_MS` | How long a parked endpoint waits before it is tried again (default: `30000`) |
+| `RPC_FAILOVER_THRESHOLD` | Parsed but currently unused — see note below (default: `3`) |
+| `RPC_ENDPOINT_COOLDOWN_MS` | Parsed but currently unused — see note below (default: `30000`) |
 | `RPC_BREAKER_FAILURE_THRESHOLD` | Consecutive RPC-layer poll failures before the circuit breaker opens (default: `5`) |
 | `RPC_BREAKER_COOLDOWN_MS` | How long the breaker stays open before allowing a probe poll (default: `30000`) |
 
 Without an explicit request timeout a stalled RPC connection blocks a poll
 indefinitely: the retry wrapper only reacts to returned errors, never to a call
-that never returns. Timeouts are classified retryable, so they engage backoff
-and count toward the failover threshold.
+that never returns. Timeouts are classified retryable, so they engage backoff.
+
+**Note on `RPC_FAILOVER_THRESHOLD`/`RPC_ENDPOINT_COOLDOWN_MS`**: these two
+values are parsed into config but the cooldown-based endpoint pool that
+would read them (`crates/indexer/src/rpc/endpoints.rs`) is dead code. The
+indexer's actual failover is per-call health-scored routing
+(`crates/indexer/src/rpc/health.rs`), which has no concept of a parked
+endpoint or a cooldown window. Found while writing
+[`runbooks/rpc-provider-rotation.md`](runbooks/rpc-provider-rotation.md)
+(issue #684); fixing the gap itself is tracked separately.
+
+See [`runbooks/rpc-provider-rotation.md`](runbooks/rpc-provider-rotation.md)
+for the tested procedure to change `STELLAR_RPC_URLS` on a running indexer
+without losing data or extended downtime.
 
 #### Indexer replica count — single-writer by design
 
