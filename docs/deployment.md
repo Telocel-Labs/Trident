@@ -267,7 +267,16 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d
 ```
 
-### 7. Verify health
+### 7. Verify mainnet configuration (mainnet deployments)
+
+`NETWORK` defaults to `testnet` if unset, so confirm the target explicitly.
+Complete rows M1–M5 of [LAUNCH_CHECKLIST.md](LAUNCH_CHECKLIST.md): `NETWORK=mainnet`
+is set, every RPC URL reports the mainnet passphrase, `TRACKED_SAC_ASSETS` matches
+[mainnet-sac-assets.md](mainnet-sac-assets.md), and partitions cover the current
+ledger height. The indexer refuses to start if `NETWORK` is unset with a
+mainnet-looking RPC URL, or if the two contradict.
+
+### 8. Verify health
 
 ```bash
 curl https://your-domain.com/v1/ready
@@ -319,6 +328,9 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
 ```
 
 ### 4. Verify deployment
+
+For mainnet, re-confirm `NETWORK=mainnet` and RPC reachability (rows M1–M2 of
+[LAUNCH_CHECKLIST.md](LAUNCH_CHECKLIST.md)) before and after the update.
 
 ```bash
 curl https://your-domain.com/v1/ready
