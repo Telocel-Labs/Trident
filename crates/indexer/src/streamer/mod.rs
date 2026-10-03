@@ -122,6 +122,34 @@ impl Streamer {
             primary = %config.stellar_rpc_url,
             "RPC endpoint pool configured with health scoring"
         );
+
+        // Verify at least one configured endpoint is actually reachable
+        // before the poll loop starts (issue #687). Config validation only
+        // bounds-checks the shape of the URL list; a misconfigured or
+        // unreachable endpoint (wrong URL, blocked egress, an expired API
+        // key) would otherwise only surface once polling begins failing.
+        if config.rpc_startup_check_enabled {
+            match rpc.check_connectivity().await {
+                Ok(tip) => {
+                    tracing::info!(chain_tip = tip, "RPC connectivity check passed");
+                }
+                Err(e) => {
+                    return Err(TridentError::config(anyhow::anyhow!(
+                        "[trident-indexer] startup RPC connectivity check failed against all \
+                         {} configured endpoint(s) ({:?}): {e}. Set \
+                         RPC_STARTUP_CHECK_ENABLED=false to skip this check (not recommended).",
+                        config.stellar_rpc_urls.len(),
+                        config.stellar_rpc_urls,
+                    )));
+                }
+            }
+        } else {
+            tracing::warn!(
+                "RPC_STARTUP_CHECK_ENABLED=false: an unreachable RPC endpoint will not be \
+                 detected until the poll loop starts failing"
+            );
+        }
+
         let sac_registry = crate::parser::sac::SacRegistry::build(
             &config.tracked_sac_assets,
             &config.network_passphrase,
@@ -1979,13 +2007,13 @@ mod tests {
     /// Like `make_streamer`, but takes an already-built pool so a test can
     /// configure it first (e.g. a single connection with a fixed
     /// `statement_timeout`, for `transient_db_outage_retries_the_page_instead_of_dead_lettering_it`).
-    async fn make_streamer_with_pool(
-        db: sqlx::PgPool,
-        db_url: &str,
-        redis_url: &str,
-        rpc_url: String,
-    ) -> Streamer {
-        let config = Config {
+    /// A fully-populated Config for streamer tests, with every field set to
+    /// a value safe for an in-process test against a mock RPC server. Tests
+    /// needing a non-default field (e.g. index_diagnostic,
+    /// rpc_startup_check_enabled) use `Config { field: value,
+    /// ..test_config(...) }` rather than duplicating the whole literal.
+    fn test_config(db_url: &str, redis_url: &str, rpc_url: String) -> Config {
+        Config {
             stellar_rpc_url: rpc_url.clone(),
             database_url: db_url.to_string(),
             db_pool_size: 3,
@@ -2009,6 +2037,7 @@ mod tests {
             rpc_pool_max_idle_per_host: 8,
             rpc_tcp_keepalive: Duration::from_secs(60),
             rpc_max_calls_per_sec: 50,
+            rpc_startup_check_enabled: false,
             index_diagnostic: false,
             topic_filters: Vec::new(),
             max_events_per_poll: 200,
@@ -2031,8 +2060,16 @@ mod tests {
             token_metadata_refresh_interval: Duration::from_secs(86_400),
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
             tracked_sac_assets: Vec::new(),
-        };
+        }
+    }
 
+    async fn make_streamer_with_pool(
+        db: sqlx::PgPool,
+        db_url: &str,
+        redis_url: &str,
+        rpc_url: String,
+    ) -> Streamer {
+        let config = test_config(db_url, redis_url, rpc_url);
         Streamer::new(config, db).await.unwrap()
     }
 
@@ -3635,5 +3672,346 @@ mod tests {
         );
 
         pool.close().await;
+    }
+
+    /// Streamer::new must fail fast when the startup connectivity check is
+    /// enabled and no configured endpoint is reachable, rather than
+    /// constructing successfully and only failing once the poll loop starts
+    /// (issue #687). make_streamer_with_pool hardcodes
+    /// rpc_startup_check_enabled: false for every other test here, so this
+    /// builds its own Config with the check turned on to exercise the real
+    /// wiring in Streamer::new rather than only the config/RPC layers in
+    /// isolation (covered separately in config::tests and rpc::tests).
+    #[tokio::test]
+    async fn new_fails_fast_when_startup_rpc_check_is_enabled_and_unreachable() {
+        let (db_url, redis_url) = require_services!();
+        let db = sqlx::PgPool::connect(&db_url).await.unwrap();
+
+        // Deliberately not pointed at a mock server: an address nothing is
+        // listening on, so the connect itself fails fast rather than relying
+        // on a 5xx response the mock would have to be configured to send.
+        let unreachable_rpc_url = "http://127.0.0.1:1".to_string();
+
+        let config = Config {
+            stellar_rpc_url: unreachable_rpc_url.clone(),
+            stellar_rpc_urls: vec![unreachable_rpc_url],
+            rpc_connect_timeout: Duration::from_millis(200),
+            rpc_request_timeout: Duration::from_millis(500),
+            rpc_startup_check_enabled: true,
+            ..test_config(&db_url, &redis_url, "http://127.0.0.1:1".to_string())
+        };
+
+        let result = Streamer::new(config, db).await;
+        assert!(
+            result.is_err(),
+            "Streamer::new must fail when the startup RPC check is enabled \
+             and no configured endpoint is reachable"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Mixed-composition page (issue #691)
+    // -------------------------------------------------------------------
+    //
+    // Every other test in this module exercises one event type or one
+    // contract at a time. Real mainnet pages mix token transfers, plain
+    // contract invocations, and diagnostic events across distinct
+    // contracts in the same page, and several of the per-page fan-out
+    // code paths (invocation metering, token metadata resolution) only
+    // run when a page actually contains the trigger condition -- testing
+    // event types in isolation never exercises more than one of them at
+    // once. This builds one page with all three and asserts the full
+    // commit path handled the mix correctly: every event type persisted
+    // to soroban_events, the token transfer alone also projected into
+    // token_events, and the invocation alone also metered into
+    // contract_invocation_metrics.
+    //
+    // Storage snapshot fetching (also named in the issue) is deliberately
+    // not exercised here: it only runs for a contract classification
+    // produced by sync_contract_specs's own WASM-spec-parsing path, which
+    // has no test-mocking infrastructure anywhere in this suite yet (see
+    // spec::tests for what building a classifiable fixture WASM actually
+    // requires). Scoped out as a named follow-up rather than built under
+    // this issue.
+
+    /// Build one getEvents page mixing a token transfer (2 events, same
+    /// contract), a plain contract invocation (1 event, a different
+    /// contract), and a diagnostic event (1 event, a third contract) --
+    /// three distinct contracts and three distinct event shapes in one
+    /// page, all at the same ledger so this is genuinely one page commit,
+    /// not three serialized ones.
+    fn mixed_composition_page(ledger: u64) -> serde_json::Value {
+        use stellar_xdr::curr::{AccountId, Int128Parts, PublicKey, ScAddress, Uint256};
+
+        let addr = |seed: u8| {
+            let val = ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])),
+            )));
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+        let amount = |v: i64| {
+            let val = ScVal::I128(Int128Parts {
+                hi: 0,
+                lo: v as u64,
+            });
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+
+        let token_transfer = |idx: usize, amt: i64| {
+            serde_json::json!({
+                "type": "contract",
+                "ledger": ledger.to_string(),
+                "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                "contractId": "CTOKEN_MIX",
+                "id": format!("{:016}-{}", ledger, idx),
+                "pagingToken": format!("{}-{}", ledger, idx),
+                "txHash": format!("mixtokenhash{}", idx),
+                "topic": [sym_xdr("transfer"), addr(1), addr(2)],
+                "value": amount(amt),
+                "inSuccessfulContractCall": true,
+            })
+        };
+
+        let invocation = serde_json::json!({
+            "type": "contract",
+            "ledger": ledger.to_string(),
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "contractId": "CINVOKE_MIX",
+            "id": format!("{:016}-2", ledger),
+            "pagingToken": format!("{}-2", ledger),
+            "txHash": "mixinvokehash",
+            "topic": [sym_xdr("swap")],
+            "value": void_xdr(),
+            "inSuccessfulContractCall": true,
+        });
+
+        let diagnostic = serde_json::json!({
+            "type": "diagnostic",
+            "ledger": ledger.to_string(),
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "contractId": "CDIAG_MIX",
+            "id": format!("{:016}-3", ledger),
+            "pagingToken": format!("{}-3", ledger),
+            "txHash": "mixdiaghash",
+            "topic": [sym_xdr("debug")],
+            "value": void_xdr(),
+            "inSuccessfulContractCall": true,
+        });
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": [
+                    token_transfer(0, 1_000),
+                    token_transfer(1, 2_000),
+                    invocation,
+                    diagnostic,
+                ],
+                "latestLedger": ledger,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn mixed_composition_page_is_fully_committed_in_one_pass() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(mixed_composition_page(900)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page(900, 0)))
+            .mount(&server)
+            .await;
+
+        // Only the invocation event needs getTransaction -- token-transfer
+        // and diagnostic events are parsed entirely from the event itself.
+        let (envelope_xdr, result_xdr) =
+            invocation_transaction_xdr(3_000_000, 1_024, 256, 9_000, 909_000);
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getTransaction", "params": { "hash": "mixinvokehash" } }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "status": "SUCCESS",
+                    "envelopeXdr": envelope_xdr,
+                    "resultXdr": result_xdr,
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            index_diagnostic: true,
+            ..test_config(&db_url, &redis_url, server.uri())
+        };
+        let db = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let mut s = Streamer::new(config, db).await.unwrap();
+        reset_db(&s.db).await;
+        for contract_id in ["CTOKEN_MIX", "CINVOKE_MIX", "CDIAG_MIX"] {
+            sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+                .bind(contract_id)
+                .execute(&s.db)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM token_events WHERE contract_id = $1")
+                .bind(contract_id)
+                .execute(&s.db)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM contract_invocation_metrics WHERE contract_id = $1")
+                .bind(contract_id)
+                .execute(&s.db)
+                .await
+                .unwrap();
+        }
+        set_allowlist(&s.db, &["CTOKEN_MIX", "CINVOKE_MIX", "CDIAG_MIX"]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        let committed = s.poll_once(&mut cursor).await.unwrap();
+        assert_eq!(
+            committed, 4,
+            "all four events across the three contracts must commit in this one page"
+        );
+
+        // Every event type reached soroban_events, regardless of type.
+        let event_type_counts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT event_type, COUNT(*) FROM soroban_events
+             WHERE contract_id IN ('CTOKEN_MIX', 'CINVOKE_MIX', 'CDIAG_MIX')
+             GROUP BY event_type ORDER BY event_type",
+        )
+        .fetch_all(&s.db)
+        .await
+        .unwrap();
+        let counts: std::collections::HashMap<String, i64> =
+            event_type_counts.into_iter().collect();
+        assert_eq!(
+            counts.get("contract").copied().unwrap_or(0),
+            3,
+            "2 token-transfer events + 1 invocation event, both type=contract"
+        );
+        assert_eq!(
+            counts.get("diagnostic").copied().unwrap_or(0),
+            1,
+            "the diagnostic event must persist too, since index_diagnostic=true for this test"
+        );
+
+        // Only the token contract's events were projected into token_events.
+        let token_event_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM token_events WHERE contract_id = 'CTOKEN_MIX'")
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            token_event_count.0, 2,
+            "both transfer events for the token contract must be projected"
+        );
+        let non_token_projected: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM token_events WHERE contract_id IN ('CINVOKE_MIX', 'CDIAG_MIX')",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            non_token_projected.0, 0,
+            "the invocation and diagnostic contracts must not be projected as token transfers"
+        );
+
+        // Only the invocation contract's transaction was metered.
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT fee_charged, cpu_instructions FROM contract_invocation_metrics
+             WHERE contract_id = 'CINVOKE_MIX' AND transaction_hash = 'mixinvokehash'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .expect("invocation metrics row must be persisted for the invocation contract");
+        assert_eq!(row.0, 909_000, "fee_charged");
+        assert_eq!(row.1, Some(3_000_000), "cpu_instructions");
+
+        let non_invocation_metered: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM contract_invocation_metrics
+             WHERE contract_id IN ('CTOKEN_MIX', 'CDIAG_MIX')",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            non_invocation_metered.0, 0,
+            "the token and diagnostic contracts' transactions must not be metered as invocations"
+        );
+
+        // Replaying the same page must not duplicate anything across any
+        // of the three projections -- the mix must stay idempotent
+        // together, not just type by type in isolation.
+        let mut replay_cursor = 0u64;
+        let _ = s.poll_once(&mut replay_cursor).await;
+        let (events_after, tokens_after, metrics_after): (i64, i64, i64) = {
+            let e: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM soroban_events WHERE contract_id IN ('CTOKEN_MIX', 'CINVOKE_MIX', 'CDIAG_MIX')",
+            )
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+            let t: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM token_events WHERE contract_id = 'CTOKEN_MIX'",
+            )
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+            let m: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_MIX'",
+            )
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+            (e.0, t.0, m.0)
+        };
+        assert_eq!(
+            events_after, 4,
+            "replay must not duplicate soroban_events rows"
+        );
+        assert_eq!(
+            tokens_after, 2,
+            "replay must not duplicate token_events rows"
+        );
+        assert_eq!(
+            metrics_after, 1,
+            "replay must not duplicate invocation metrics rows"
+        );
     }
 }

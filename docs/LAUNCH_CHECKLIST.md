@@ -78,6 +78,7 @@ instead of only at the summary-table level.
 | 8 | On-call schedule confirmed and reachable | | | |
 | 9 | Rollback rehearsed — see `docs/ROLLBACK_RUNBOOK.md` | | | |
 | 10 | Testnet cutover runbook walked through — see `docs/runbooks/testnet-cutover.md` | | | |
+| 11 | Post-cutover data verification passed (network tag, transaction spot-check, ledger continuity) — see [`docs/runbooks/post-cutover-data-verification.md`](./runbooks/post-cutover-data-verification.md) | | | |
 
 ## No-go criteria
 

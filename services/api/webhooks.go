@@ -1368,9 +1368,7 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 		if result.Success {
 			status = "success"
 		}
-		replayAttempt := prevAttempts + 1
 		if err := recordWebhookDelivery(r.Context(), db, subID, eventID, replayAttempt, status, result, nil); err != nil {
-		if err := recordWebhookDelivery(r.Context(), db, subID, eventID, replayAttempt, status, result); err != nil {
 			slog.Warn("failed to record replay delivery", "err", err)
 		}
 
