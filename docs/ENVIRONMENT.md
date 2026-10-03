@@ -92,8 +92,8 @@ guessing would silently derive wrong SAC contract ids.
 | `RPC_POOL_IDLE_TIMEOUT_MS` | Optional | `90000` (min `1000`, max `600000`) | Idle pooled-connection lifetime. |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Optional | `8` (min `1`, max `1024`) | Idle keep-alive connections retained per RPC host. |
 | `RPC_TCP_KEEPALIVE_MS` | Optional | `60000` (min `1000`, max `600000`) | TCP keep-alive probe interval. |
-| `RPC_FAILOVER_THRESHOLD` | Optional | `3` (min `1`, max `100`) | Consecutive failures before an endpoint is parked. |
-| `RPC_ENDPOINT_COOLDOWN_MS` | Optional | `30000` (min `1000`, max `3600000`) | Cooldown before a parked endpoint is retried. |
+| `RPC_FAILOVER_THRESHOLD` | Optional | `3` (min `1`, max `100`) | Parsed but currently unused in the running indexer — see [`deployment.md`'s note](deployment.md#indexer-rpc-transport-and-failover). |
+| `RPC_ENDPOINT_COOLDOWN_MS` | Optional | `30000` (min `1000`, max `3600000`) | Parsed but currently unused in the running indexer — see [`deployment.md`'s note](deployment.md#indexer-rpc-transport-and-failover). |
 | `RPC_BREAKER_FAILURE_THRESHOLD` | Optional | `5` (min `1`, max `1000`) | Consecutive RPC-layer poll failures before the circuit breaker opens and the run loop stops attempting polls (issue #197). |
 | `RPC_BREAKER_COOLDOWN_MS` | Optional | `30000` (min `1000`, max `3600000`) | How long the breaker stays open before allowing a single probe poll through. |
 

@@ -1,6 +1,7 @@
 package validation_test
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/validation"
@@ -69,6 +70,39 @@ func TestValidateQueryEvents_LedgerFromGreaterThanLedgerTo(t *testing.T) {
 	_, err := validation.ValidateQueryEvents("", "500", "100", "", "", "")
 	if err == nil {
 		t.Fatal("expected validation error for ledgerFrom > ledgerTo")
+	}
+	if err.Field != "ledgerTo" {
+		t.Errorf("wrong field %q, want \"ledgerTo\"", err.Field)
+	}
+}
+
+// A one-sided range stays unbounded -- unlike ValidateQueryStats, an events
+// query is always served from an indexed, paginated scan rather than a live
+// aggregation, so there is no reason to force both bounds just to apply the
+// width cap.
+func TestValidateQueryEvents_OneSidedRangeIsNotWidthChecked(t *testing.T) {
+	p, err := validation.ValidateQueryEvents("", "0", "", "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error for a one-sided range: %v", err)
+	}
+	if p.LedgerFrom == nil || *p.LedgerFrom != 0 || p.LedgerTo != nil {
+		t.Errorf("want ledgerFrom=0, ledgerTo=nil, got %v..%v", p.LedgerFrom, p.LedgerTo)
+	}
+}
+
+func TestValidateQueryEvents_RangeAtCap_Accepted(t *testing.T) {
+	to := strconv.Itoa(validation.MaxLedgerRange)
+	_, err := validation.ValidateQueryEvents("", "0", to, "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error for a range exactly at the cap: %v", err)
+	}
+}
+
+func TestValidateQueryEvents_RangeOverCap_Rejected(t *testing.T) {
+	to := strconv.Itoa(validation.MaxLedgerRange + 1)
+	_, err := validation.ValidateQueryEvents("", "0", to, "", "", "")
+	if err == nil {
+		t.Fatal("expected validation error for a range one ledger over the cap")
 	}
 	if err.Field != "ledgerTo" {
 		t.Errorf("wrong field %q, want \"ledgerTo\"", err.Field)
