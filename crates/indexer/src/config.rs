@@ -150,23 +150,11 @@ impl Config {
             }
         };
 
-        // ── Network ─────────────────────────────────────────────────────────
-        // NETWORK is written into every row this process indexes (soroban_events,
-        // ledger_metadata, token_events, ...), so a typo here silently creates an
-        // invisible data partition rather than failing loudly. Validated against
-        // the same allowed set the database CHECK constraints enforce (migration
-        // 0029) and the API layer validates (services/api/validation/events.go,
-        // validNetworks) — issue #252. 'pubnet' is accepted as an alias for
-        // 'mainnet', matching default_network_passphrase below.
-        let network =
-            match normalize_network(&std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into()))
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    errors.push(e);
-                    String::new() // placeholder; won't be used if errors is non-empty
-                }
-            };
+        let explicit_network = std::env::var("NETWORK").ok().filter(|v| !v.trim().is_empty());
+        let network = explicit_network
+            .clone()
+            .unwrap_or_else(|| "testnet".into());
+        validate_network_against_rpc(explicit_network.as_deref(), &stellar_rpc_urls)?;
 
         // Network passphrase for SAC contract id derivation (issue #262).
         let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {
@@ -689,6 +677,74 @@ fn collect_required(key: &str, errors: &mut Vec<String>) -> Option<String> {
     }
 }
 
+/// Classify an RPC URL as pointing at a well-known network, by hostname hints.
+/// Returns `Some("mainnet")`, `Some("testnet")`, or `None` when unknown.
+fn rpc_url_network_hint(url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    let host = lower
+        .split("://")
+        .nth(1)
+        .unwrap_or(&lower)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    if host.contains("testnet") || host.contains("futurenet") {
+        Some("testnet")
+    } else if host.contains("mainnet") || host.contains("pubnet") {
+        Some("mainnet")
+    } else {
+        None
+    }
+}
+
+/// Cross-validate `NETWORK` against the RPC endpoints so a copy-paste error
+/// cannot silently derive SAC contract ids with the wrong passphrase.
+///
+/// - `NETWORK` unset + any mainnet-looking URL: startup failure.
+/// - `NETWORK` unset otherwise: loud warning that testnet is being assumed.
+/// - `NETWORK` explicitly set but contradicting a URL hint: startup failure.
+fn validate_network_against_rpc(
+    explicit_network: Option<&str>,
+    urls: &[String],
+) -> Result<(), TridentError> {
+    let hints: Vec<&'static str> = urls.iter().filter_map(|u| rpc_url_network_hint(u)).collect();
+    let looks_mainnet = hints.contains(&"mainnet");
+    let looks_testnet = hints.contains(&"testnet");
+
+    match explicit_network {
+        None if looks_mainnet => Err(TridentError::config(anyhow::anyhow!(
+            "[trident-indexer] NETWORK is not set but STELLAR_RPC_URL(S) looks like mainnet; \
+             refusing to default to the testnet passphrase. Set NETWORK=mainnet (or testnet) explicitly"
+        ))),
+        None => {
+            tracing::warn!(
+                "!!! NETWORK is not set — DEFAULTING TO TESTNET (passphrase \"Test SDF Network ; \
+                 September 2015\"). SAC contract ids will be wrong on mainnet. Set NETWORK explicitly !!!"
+            );
+            eprintln!(
+                "[trident-indexer] WARNING: NETWORK is not set; defaulting to testnet. \
+                 Set NETWORK=mainnet for mainnet deployments."
+            );
+            Ok(())
+        }
+        Some("testnet") | Some("futurenet") if looks_mainnet => {
+            Err(TridentError::config(anyhow::anyhow!(
+                "[trident-indexer] NETWORK={} conflicts with a mainnet-looking STELLAR_RPC_URL(S); \
+                 fix NETWORK or the RPC endpoints",
+                explicit_network.unwrap_or_default()
+            )))
+        }
+        Some("mainnet") | Some("pubnet") if looks_testnet => {
+            Err(TridentError::config(anyhow::anyhow!(
+                "[trident-indexer] NETWORK={} conflicts with a testnet-looking STELLAR_RPC_URL(S); \
+                 fix NETWORK or the RPC endpoints",
+                explicit_network.unwrap_or_default()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Build the prioritised endpoint list from `STELLAR_RPC_URLS` (comma-separated)
 /// falling back to the single-value `STELLAR_RPC_URL` alias (issue #213).
 ///
@@ -759,6 +815,27 @@ fn parse_pool_size(key: &str, default: u32) -> Result<u32, TridentError> {
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn unset_network_with_mainnet_url_fails() {
+        let urls = vec!["https://mainnet.sorobanrpc.com".to_string()];
+        assert!(validate_network_against_rpc(None, &urls).is_err());
+    }
+
+    #[test]
+    fn unset_network_with_testnet_url_only_warns() {
+        let urls = vec!["https://soroban-testnet.stellar.org".to_string()];
+        assert!(validate_network_against_rpc(None, &urls).is_ok());
+    }
+
+    #[test]
+    fn explicit_network_conflicting_with_url_fails() {
+        let main = vec!["https://mainnet.sorobanrpc.com".to_string()];
+        let test = vec!["https://soroban-testnet.stellar.org".to_string()];
+        assert!(validate_network_against_rpc(Some("testnet"), &main).is_err());
+        assert!(validate_network_against_rpc(Some("mainnet"), &test).is_err());
+        assert!(validate_network_against_rpc(Some("mainnet"), &main).is_ok());
+    }
 
     /// Process environment is global state shared by every test thread, so all
     /// env-mutating tests serialise on this lock. Without it one test clearing
