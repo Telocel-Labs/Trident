@@ -248,8 +248,9 @@ impl Streamer {
                         self.token_contracts.remove(&contract_id);
                     }
 
+                    let previous_hash = self.known_code_hashes.get(&contract_id).cloned();
                     let changed =
-                        self.known_code_hashes.get(&contract_id) != Some(&contract_spec.code_hash);
+                        previous_hash.as_deref() != Some(contract_spec.code_hash.as_str());
                     if changed {
                         match db::upsert_contract_spec(
                             &self.db,
@@ -262,6 +263,26 @@ impl Streamer {
                             Ok(()) => {
                                 self.known_code_hashes
                                     .insert(contract_id.clone(), contract_spec.code_hash.clone());
+
+                                // A redeploy, not just this contract's first
+                                // sighting (issue #685): a code-hash change
+                                // against a previously known hash is a real
+                                // Soroban redeployment at this address, and
+                                // its token metadata was resolved against the
+                                // old code. A never-before-seen contract has
+                                // no cached row to invalidate, so there is
+                                // nothing to do on that path.
+                                if previous_hash.is_some() {
+                                    if let Err(e) = db::delete_token_metadata(
+                                        &self.db,
+                                        &contract_id,
+                                        &self.config.network,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(contract_id = %contract_id, error = %e, "Failed to invalidate token metadata on redeploy");
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(contract_id = %contract_id, error = %e, "Failed to persist contract spec");

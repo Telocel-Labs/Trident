@@ -1676,6 +1676,32 @@ pub async fn upsert_token_metadata(
     Ok(())
 }
 
+/// Evict a contract's cached token metadata when its WASM code hash changes
+/// (issue #685): `token_metadata` has no code-hash column of its own and no
+/// other signal that the contract behind an address has been redeployed, so
+/// a cached name/symbol/decimals for the old code could otherwise serve
+/// indefinitely for the new one. Deleting the row rather than updating it
+/// lets `resolve_stale_token_metadata`'s own freshness check
+/// (`fresh_token_metadata_contract_ids`) treat it as absent and re-resolve
+/// from scratch on its next sighting, the same path a never-before-seen
+/// contract already takes.
+pub async fn delete_token_metadata(
+    pool: &PgPool,
+    contract_id: &str,
+    network: &str,
+) -> Result<(), TridentError> {
+    sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1 AND network = $2")
+        .bind(contract_id)
+        .bind(network)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("delete_token_metadata"))
+        })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1948,10 +1974,10 @@ mod tests {
         second_run_event.transaction_hash = tx_hash.clone();
         second_run_event.raw_event_index = 0;
 
-        insert_events_batch(&pool, &[first_run_event])
+        insert_events_batch(&pool, "testnet", &[first_run_event])
             .await
             .expect("first run insert failed");
-        insert_events_batch(&pool, &[second_run_event])
+        insert_events_batch(&pool, "testnet", &[second_run_event])
             .await
             .expect("second run insert must not error");
 
@@ -2009,7 +2035,7 @@ mod tests {
         event_b.transaction_hash = tx_hash_b.clone();
         event_b.raw_event_index = 0;
 
-        insert_events_batch(&pool, &[event_a.clone(), event_b.clone()])
+        insert_events_batch(&pool, "testnet", &[event_a.clone(), event_b.clone()])
             .await
             .expect("insert failed");
 
@@ -2033,7 +2059,7 @@ mod tests {
 
         // Re-run the exact same insert (simulating a re-index of the same
         // page): must still collapse to the same two rows, not four.
-        insert_events_batch(&pool, &[event_a, event_b])
+        insert_events_batch(&pool, "testnet", &[event_a, event_b])
             .await
             .expect("re-insert must not error");
 
@@ -2674,6 +2700,131 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!is_token.0);
+
+        sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// delete_token_metadata must evict a cached row so a redeployed
+    /// contract's next sighting re-resolves from scratch (issue #685).
+    #[tokio::test]
+    async fn delete_token_metadata_evicts_the_cached_row() {
+        let Some(db_url) = test_db_url("delete_token_metadata_evicts_the_cached_row") else {
+            return;
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CREDEPLOY_{}", Uuid::new_v4());
+        let network = "testnet";
+
+        sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let token = crate::token_metadata::TokenMetadataResolution::Token(
+            crate::token_metadata::TokenMetadata {
+                name: "Old Code's Token".to_string(),
+                symbol: "OLD".to_string(),
+                decimals: 7,
+            },
+        );
+        upsert_token_metadata(&pool, &contract_id, network, &token)
+            .await
+            .expect("upsert failed");
+
+        // Resolved and fresh before the simulated redeploy.
+        let fresh = fresh_token_metadata_contract_ids(
+            &pool,
+            std::slice::from_ref(&contract_id),
+            network,
+            Utc::now() - chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        assert!(fresh.contains(&contract_id));
+
+        delete_token_metadata(&pool, &contract_id, network)
+            .await
+            .expect("delete failed");
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM token_metadata WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "redeploy invalidation must remove the stale row"
+        );
+
+        // Absent from the fresh set after eviction, exactly like a
+        // never-before-seen contract -- the new code's name/symbol/decimals
+        // must be re-resolved rather than silently continuing to serve the
+        // deleted row's cached values.
+        let fresh_after = fresh_token_metadata_contract_ids(
+            &pool,
+            std::slice::from_ref(&contract_id),
+            network,
+            Utc::now() - chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        assert!(!fresh_after.contains(&contract_id));
+    }
+
+    /// Deleting a contract's metadata on one network must not touch the same
+    /// contract id's row on a different network -- the two are unrelated
+    /// deployments that happen to share an address.
+    #[tokio::test]
+    async fn delete_token_metadata_is_scoped_to_one_network() {
+        let Some(db_url) = test_db_url("delete_token_metadata_is_scoped_to_one_network") else {
+            return;
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CMULTINET_{}", Uuid::new_v4());
+
+        for network in ["testnet", "mainnet"] {
+            sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1 AND network = $2")
+                .bind(&contract_id)
+                .bind(network)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let token = crate::token_metadata::TokenMetadataResolution::Token(
+                crate::token_metadata::TokenMetadata {
+                    name: format!("{network} token"),
+                    symbol: "MN".to_string(),
+                    decimals: 7,
+                },
+            );
+            upsert_token_metadata(&pool, &contract_id, network, &token)
+                .await
+                .expect("upsert failed");
+        }
+
+        delete_token_metadata(&pool, &contract_id, "testnet")
+            .await
+            .expect("delete failed");
+
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM token_metadata WHERE contract_id = $1 AND network = 'mainnet'",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining.0, 1,
+            "deleting testnet's row must leave mainnet's row untouched"
+        );
 
         sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
             .bind(&contract_id)
