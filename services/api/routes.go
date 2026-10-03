@@ -145,9 +145,14 @@ func routeBindings() []routeBinding {
 			return handlers.ListAPIKeys(d.apiKeyCfg)
 		}),
 		// Atomic rotation: mints a replacement key and evicts the old one's
-		// auth cache entry in the same request (issue #516).
+		// auth cache entry in the same request (issue #516). Wrapped in the
+		// same idempotency middleware as creation (issue #683): a retried
+		// rotate is an equally sensitive key-minting operation, and without
+		// this a client timeout or double-click mints a second replacement
+		// key instead of returning the original one.
 		documented("POST", "/v1/api-keys/{id}/rotate", func(d routeDeps) http.Handler {
-			return handlers.RotateAPIKey(d.apiKeyCfg)
+			return middleware.Idempotency(d.redisClient, middleware.DefaultIdempotencyTTL)(
+				handlers.RotateAPIKey(d.apiKeyCfg))
 		}),
 		documented("PATCH", "/v1/api-keys/{id}", func(d routeDeps) http.Handler {
 			return handlers.UpdateAPIKey(d.apiKeyCfg)
@@ -204,7 +209,12 @@ func routeBindings() []routeBinding {
 				createWebhookHandler(d.webhookDB))
 		}),
 		documented("POST", "/v1/webhooks/{id}/rotate-secret", func(d routeDeps) http.Handler {
-			return rotateWebhookSecretHandler(d.webhookDB)
+			// Wrapped the same way as creation (issue #683): rotation mints
+			// a new primary secret, demoting the current one to secondary --
+			// an equally sensitive, side-effecting operation that a retried
+			// request must not perform twice.
+			return middleware.Idempotency(d.redisClient, middleware.DefaultIdempotencyTTL)(
+				rotateWebhookSecretHandler(d.webhookDB))
 		}),
 		documented("DELETE", "/v1/webhooks/{id}", func(d routeDeps) http.Handler {
 			return deleteWebhookHandler(d.webhookDB)

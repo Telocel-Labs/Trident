@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 )
 
 // GraphQL query support for the graphql-transport-ws transport (issue #223).
@@ -410,8 +411,18 @@ func gqlResolveEvents(ctx context.Context, backend EventsBackend, op *gqlOperati
 		}
 		req.LedgerTo = &n
 	}
-	if req.LedgerFrom != nil && req.LedgerTo != nil && *req.LedgerTo < *req.LedgerFrom {
-		return nil, gqlErrf(httputil.INVALID_ARGUMENT, "ledgerTo must be greater than or equal to ledgerFrom")
+	if req.LedgerFrom != nil && req.LedgerTo != nil {
+		if *req.LedgerTo < *req.LedgerFrom {
+			return nil, gqlErrf(httputil.INVALID_ARGUMENT, "ledgerTo must be greater than or equal to ledgerFrom")
+		}
+		// Matches GET /v1/events' REST validation (issue #686): without this
+		// cap a caller could request the full historical range, forcing a
+		// scan proportional to total chain history rather than to actual
+		// need.
+		if *req.LedgerTo-*req.LedgerFrom > validation.MaxLedgerRange {
+			return nil, gqlErrf(httputil.INVALID_ARGUMENT,
+				"range (ledgerTo - ledgerFrom) must not exceed %d ledgers", validation.MaxLedgerRange)
+		}
 	}
 
 	page, err := backend.ListEvents(ctx, req)
@@ -488,6 +499,14 @@ func gqlResolveContractStats(ctx context.Context, backend EventsBackend, op *gql
 	}
 	if req.ToLedger != 0 && req.ToLedger < req.FromLedger {
 		return nil, gqlErrf(httputil.INVALID_ARGUMENT, "toLedger must be greater than or equal to fromLedger")
+	}
+	// Matches GET /v1/stats/contracts' REST validation (issue #686): an
+	// explicit range this wide bypasses the maintained rollup and falls back
+	// to a live aggregation over soroban_events, which grows unbounded with
+	// total historical event count without this cap.
+	if req.ToLedger != 0 && req.ToLedger-req.FromLedger > validation.MaxLedgerRange {
+		return nil, gqlErrf(httputil.INVALID_ARGUMENT,
+			"range (toLedger - fromLedger) must not exceed %d ledgers", validation.MaxLedgerRange)
 	}
 
 	rows, err := backend.ContractStats(ctx, req)
