@@ -25,7 +25,6 @@ pub struct Config {
     /// through (issue #197).
     pub rpc_breaker_cooldown: Duration,
     pub network: String,
-    pub poll_interval: Duration,
     /// Shortest adaptive poll interval, applied when lag >= `lag_high_watermark`.
     pub poll_interval_floor: Duration,
     /// Longest adaptive poll interval, applied when the indexer is caught up.
@@ -193,8 +192,22 @@ impl Config {
             _ => Vec::new(),
         };
 
+        // POLL_INTERVAL_MS used to be validated, logged, and stored — but the
+        // poll loop never actually slept on it; only AdaptivePoll's floor/
+        // ceiling/high-watermark (below) drive the real interval. Rather than
+        // continue silently ignoring an operator-set value that has no
+        // effect, fail startup so the mistake is visible immediately instead
+        // of costing a debugging session.
+        if std::env::var("POLL_INTERVAL_MS").is_ok() {
+            errors.push(
+                "[indexer] POLL_INTERVAL_MS is no longer used — the poll interval is \
+                 controlled by POLL_INTERVAL_FLOOR_MS / POLL_INTERVAL_CEILING_MS / \
+                 LAG_HIGH_WATERMARK instead. Remove POLL_INTERVAL_MS from your environment."
+                    .to_string(),
+            );
+        }
+
         // ── Numeric ranges (all validated in one pass) ───────────────────────
-        let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000);
         let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000);
         let db_batch_size = parse_bounded_u64("DB_BATCH_SIZE", 1_000, 1, 10_000);
         let poll_interval_floor_ms = parse_bounded_u64("POLL_INTERVAL_FLOOR_MS", 250, 50, 60_000);
@@ -210,10 +223,27 @@ impl Config {
         // rather than deleting a large swath of history automatically.
         let max_reorg_rewind_depth = parse_bounded_u64("MAX_REORG_REWIND_DEPTH", 50, 1, 100_000);
         let gap_scan_max_per_run = parse_bounded_u64("GAP_SCAN_MAX_PER_RUN", 100, 1, 10_000);
-        let rpc_connect_timeout_ms =
-            parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000);
-        let rpc_request_timeout_ms =
-            parse_bounded_u64("RPC_REQUEST_TIMEOUT_MS", 30_000, 500, 600_000);
+        // Mainnet RPC providers see materially higher p99 latency than
+        // testnet for large getEvents pages under real contract/event
+        // volume, especially shared-capacity third-party providers — the
+        // testnet-tuned defaults below risk spurious timeouts (and
+        // unnecessary failover) against mainnet. See "Mainnet RPC timeout
+        // tuning" in docs/deployment.md for the measurement methodology
+        // behind these numbers; both remain fully overridable per deployment.
+        let (rpc_connect_timeout_default_ms, rpc_request_timeout_default_ms) =
+            default_rpc_timeouts_ms(&network);
+        let rpc_connect_timeout_ms = parse_bounded_u64(
+            "RPC_CONNECT_TIMEOUT_MS",
+            rpc_connect_timeout_default_ms,
+            100,
+            60_000,
+        );
+        let rpc_request_timeout_ms = parse_bounded_u64(
+            "RPC_REQUEST_TIMEOUT_MS",
+            rpc_request_timeout_default_ms,
+            500,
+            600_000,
+        );
         let rpc_pool_idle_timeout_ms =
             parse_bounded_u64("RPC_POOL_IDLE_TIMEOUT_MS", 90_000, 1_000, 600_000);
         let rpc_pool_max_idle_per_host =
@@ -221,10 +251,10 @@ impl Config {
         let rpc_tcp_keepalive_ms =
             parse_bounded_u64("RPC_TCP_KEEPALIVE_MS", 60_000, 1_000, 600_000);
         // Self-imposed outbound rate limit (issue #661), tunable independently
-        // of POLL_INTERVAL_MS: without it a catch-up cycle can burst hundreds
-        // of getEvents pages, or one getTransaction/getLedgerEntries call per
-        // transaction/contract touched in a page, back-to-back with zero
-        // delay, since poll_interval only sleeps between cycles.
+        // of the adaptive poll interval: without it a catch-up cycle can burst
+        // hundreds of getEvents pages, or one getTransaction/getLedgerEntries
+        // call per transaction/contract touched in a page, back-to-back with
+        // zero delay, since the poll interval only sleeps between cycles.
         let rpc_max_calls_per_sec = parse_bounded_u64("RPC_MAX_CALLS_PER_SEC", 50, 1, 10_000);
         let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100);
         let rpc_endpoint_cooldown_ms =
@@ -273,7 +303,6 @@ impl Config {
 
         // Collect all parse/range errors at once.
         for (key, result) in [
-            ("POLL_INTERVAL_MS", poll_interval_ms.as_ref()),
             ("MAX_EVENTS_PER_POLL", max_events_per_poll.as_ref()),
             ("DB_BATCH_SIZE", db_batch_size.as_ref()),
             ("POLL_INTERVAL_FLOOR_MS", poll_interval_floor_ms.as_ref()),
@@ -395,7 +424,6 @@ impl Config {
         let redis_stream_maxlen = redis_stream_maxlen.unwrap();
         let metrics_port = metrics_port.unwrap() as u16;
         let health_port = health_port.unwrap() as u16;
-        let poll_interval_ms = poll_interval_ms.unwrap();
         let max_events_per_poll = max_events_per_poll.unwrap();
         let db_batch_size = db_batch_size.unwrap();
         let poll_interval_floor_ms = poll_interval_floor_ms.unwrap();
@@ -438,7 +466,6 @@ impl Config {
             rpc_breaker_failure_threshold,
             rpc_breaker_cooldown: Duration::from_millis(rpc_breaker_cooldown_ms),
             network,
-            poll_interval: Duration::from_millis(poll_interval_ms),
             poll_interval_floor: Duration::from_millis(poll_interval_floor_ms),
             poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
             lag_high_watermark,
@@ -492,7 +519,6 @@ impl Config {
             stellar_rpc_urls = ?self.stellar_rpc_urls,
             network = %self.network,
             network_passphrase_configured = !self.network_passphrase.is_empty(),
-            poll_interval_ms = self.poll_interval.as_millis() as u64,
             poll_interval_floor_ms = self.poll_interval_floor.as_millis() as u64,
             poll_interval_ceiling_ms = self.poll_interval_ceiling.as_millis() as u64,
             lag_high_watermark = self.lag_high_watermark,
@@ -574,6 +600,27 @@ fn default_network_passphrase(network: &str) -> Result<String, TridentError> {
         other => Err(TridentError::config(anyhow::anyhow!(
             "[indexer] NETWORK={other:?} has no well-known passphrase; set NETWORK_PASSPHRASE explicitly"
         ))),
+    }
+}
+
+/// Environment-aware defaults for `RPC_CONNECT_TIMEOUT_MS` /
+/// `RPC_REQUEST_TIMEOUT_MS`, returned as `(connect_ms, request_ms)`.
+///
+/// The original static defaults (5000ms / 30000ms) were tuned against
+/// testnet latency characteristics and applied identically regardless of
+/// `NETWORK`. Mainnet RPC providers under real contract and event volume —
+/// especially shared-capacity third-party providers — commonly see
+/// materially higher p99 latency for large `getEvents` pages, so those
+/// defaults risk spurious timeouts (misread as provider failures, triggering
+/// unnecessary failover) on mainnet. See "Mainnet RPC timeout tuning" in
+/// `docs/deployment.md` for the measurement methodology and recommended
+/// starting points this derives from; both values stay fully overridable via
+/// `RPC_CONNECT_TIMEOUT_MS` / `RPC_REQUEST_TIMEOUT_MS` regardless of network.
+fn default_rpc_timeouts_ms(network: &str) -> (u64, u64) {
+    if network == "mainnet" {
+        (10_000, 45_000)
+    } else {
+        (5_000, 30_000)
     }
 }
 
@@ -791,7 +838,7 @@ mod tests {
         env::remove_var("DATABASE_URL");
         env::remove_var("REDIS_URL");
         env::remove_var("STELLAR_RPC_URL");
-        env::set_var("POLL_INTERVAL_MS", "50"); // below minimum
+        env::set_var("POLL_INTERVAL_MS", "50"); // now unconditionally rejected
         env::set_var("MAX_EVENTS_PER_POLL", "99999"); // above maximum
 
         let err = Config::from_env().unwrap_err();
@@ -800,10 +847,10 @@ mod tests {
         assert!(msg.contains("DATABASE_URL"), "missing DATABASE_URL");
         assert!(msg.contains("REDIS_URL"), "missing REDIS_URL");
         assert!(msg.contains("STELLAR_RPC_URL"), "missing STELLAR_RPC_URL");
-        // Out-of-range numeric vars should also appear.
+        // POLL_INTERVAL_MS being set at all should also appear.
         assert!(
             msg.contains("POLL_INTERVAL_MS"),
-            "missing POLL_INTERVAL_MS range error"
+            "missing POLL_INTERVAL_MS removal error"
         );
         assert!(
             msg.contains("MAX_EVENTS_PER_POLL"),
@@ -815,79 +862,48 @@ mod tests {
     }
 
     #[test]
-    fn poll_interval_default_is_1000ms() {
+    fn poll_interval_ms_absent_is_fine() {
         let vars = required_vars();
         with_env(&vars, || {
             env::remove_var("POLL_INTERVAL_MS");
             env::remove_var("MAX_EVENTS_PER_POLL");
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.poll_interval.as_millis(), 1000);
+            let cfg = Config::from_env();
+            assert!(
+                cfg.is_ok(),
+                "config must succeed when POLL_INTERVAL_MS is unset: {:?}",
+                cfg.err()
+            );
         });
     }
 
+    /// POLL_INTERVAL_MS was validated, logged, and stored, but the poll loop
+    /// never actually slept on it — only AdaptivePoll's floor/ceiling/
+    /// high-watermark drive the real interval. Setting it must now fail
+    /// startup with a clear message rather than being silently ignored.
     #[test]
-    fn poll_interval_custom_value() {
+    fn poll_interval_ms_set_fails_startup_with_a_clear_message() {
         let mut vars = required_vars();
         vars.push(("POLL_INTERVAL_MS", "500"));
         with_env(&vars, || {
             env::remove_var("MAX_EVENTS_PER_POLL");
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.poll_interval.as_millis(), 500);
+            let err = Config::from_env().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("POLL_INTERVAL_MS"));
+            assert!(
+                msg.contains("POLL_INTERVAL_FLOOR_MS") && msg.contains("POLL_INTERVAL_CEILING_MS"),
+                "error should point at the knobs that now control pacing: {msg}"
+            );
         });
     }
 
     #[test]
-    fn poll_interval_below_minimum_is_rejected() {
+    fn poll_interval_ms_any_value_is_rejected_even_a_previously_valid_one() {
         let mut vars = required_vars();
-        vars.push(("POLL_INTERVAL_MS", "50"));
+        vars.push(("POLL_INTERVAL_MS", "1000")); // previously the accepted default
         with_env(&vars, || {
             env::remove_var("MAX_EVENTS_PER_POLL");
             let err = Config::from_env().unwrap_err();
             assert!(err.to_string().contains("POLL_INTERVAL_MS"));
-        });
-    }
-
-    #[test]
-    fn poll_interval_above_maximum_is_rejected() {
-        let mut vars = required_vars();
-        vars.push(("POLL_INTERVAL_MS", "90000"));
-        with_env(&vars, || {
-            env::remove_var("MAX_EVENTS_PER_POLL");
-            let err = Config::from_env().unwrap_err();
-            assert!(err.to_string().contains("POLL_INTERVAL_MS"));
-        });
-    }
-
-    #[test]
-    fn poll_interval_non_integer_is_rejected() {
-        let mut vars = required_vars();
-        vars.push(("POLL_INTERVAL_MS", "abc"));
-        with_env(&vars, || {
-            env::remove_var("MAX_EVENTS_PER_POLL");
-            let err = Config::from_env().unwrap_err();
-            assert!(err.to_string().contains("POLL_INTERVAL_MS"));
-        });
-    }
-
-    #[test]
-    fn poll_interval_boundary_min_accepted() {
-        let mut vars = required_vars();
-        vars.push(("POLL_INTERVAL_MS", "100"));
-        with_env(&vars, || {
-            env::remove_var("MAX_EVENTS_PER_POLL");
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.poll_interval.as_millis(), 100);
-        });
-    }
-
-    #[test]
-    fn poll_interval_boundary_max_accepted() {
-        let mut vars = required_vars();
-        vars.push(("POLL_INTERVAL_MS", "60000"));
-        with_env(&vars, || {
-            env::remove_var("MAX_EVENTS_PER_POLL");
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.poll_interval.as_millis(), 60000);
         });
     }
 
@@ -1210,6 +1226,33 @@ mod tests {
             assert_eq!(cfg.rpc_pool_idle_timeout.as_millis(), 90_000);
             assert_eq!(cfg.rpc_pool_max_idle_per_host, 8);
             assert_eq!(cfg.rpc_tcp_keepalive.as_millis(), 60_000);
+        });
+    }
+
+    #[test]
+    fn rpc_timeouts_use_higher_mainnet_defaults() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "mainnet"));
+        with_env(&vars, || {
+            for key in ["RPC_CONNECT_TIMEOUT_MS", "RPC_REQUEST_TIMEOUT_MS"] {
+                env::remove_var(key);
+            }
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_connect_timeout.as_millis(), 10_000);
+            assert_eq!(cfg.rpc_request_timeout.as_millis(), 45_000);
+        });
+    }
+
+    #[test]
+    fn rpc_timeout_mainnet_default_is_still_overridable() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "mainnet"));
+        vars.push(("RPC_CONNECT_TIMEOUT_MS", "2000"));
+        vars.push(("RPC_REQUEST_TIMEOUT_MS", "8000"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_connect_timeout.as_millis(), 2_000);
+            assert_eq!(cfg.rpc_request_timeout.as_millis(), 8_000);
         });
     }
 

@@ -5,9 +5,10 @@
 //! - Maintaining the ledger cursor: reading the last processed sequence from
 //!   `system_state` on startup, advancing it after each successful batch, and
 //!   persisting it atomically with the events it covers.
-//! - Calling `getEvents` on the Stellar Soroban RPC node on a configurable
-//!   interval (`POLL_INTERVAL_MS`), following the `pagingToken` cursor field
-//!   to paginate across large ledger ranges within a single poll cycle.
+//! - Calling `getEvents` on the Stellar Soroban RPC node on an adaptive
+//!   interval (`POLL_INTERVAL_FLOOR_MS`..`POLL_INTERVAL_CEILING_MS`, driven by
+//!   chain-tip lag — see `crate::poll`), following the `pagingToken` cursor
+//!   field to paginate across large ledger ranges within a single poll cycle.
 //! - Fault tolerance and retry logic: transient RPC failures are retried with
 //!   exponential backoff; persistent failures are logged without crashing the
 //!   process or losing cursor position so the next poll cycle can recover.
@@ -32,7 +33,7 @@ use crate::{
     config::Config,
     db, metrics,
     parser::Parser,
-    poll::{AdaptivePoll, AdaptivePollConfig},
+    poll::{apply_degraded_backoff, AdaptivePoll, AdaptivePollConfig},
     rpc::{filters::build_event_filters, retry_strategy, FilterPlan, RpcClient, RpcHttpSettings},
     token_metadata,
 };
@@ -393,8 +394,9 @@ impl Streamer {
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
         tracing::info!(network = %self.config.network, "Streamer started");
         tracing::info!(
-            "[indexer] poll interval: {}ms",
-            self.config.poll_interval.as_millis()
+            poll_interval_floor_ms = self.config.poll_interval_floor.as_millis() as u64,
+            poll_interval_ceiling_ms = self.config.poll_interval_ceiling.as_millis() as u64,
+            "[indexer] adaptive poll interval bounds"
         );
         tracing::info!(
             "[indexer] max events per poll: {}",
@@ -521,6 +523,20 @@ impl Streamer {
             // poll fast while behind, back off once caught up (issue #198).
             let lag = self.last_chain_tip.saturating_sub(cursor);
             let interval = self.adaptive_poll.next_interval(lag);
+
+            // Lag alone says nothing about RPC health: a fully degraded
+            // endpoint set must not keep being hammered at the same request
+            // rate that likely caused the degradation. Widening here (rather
+            // than only surfacing `all_degraded` for alerting, as before)
+            // measurably reduces call volume against a degraded provider set.
+            let all_degraded = self.rpc.health_scorer().all_degraded();
+            let interval = apply_degraded_backoff(interval, all_degraded);
+            if all_degraded {
+                tracing::warn!(
+                    interval_ms = interval.as_millis() as u64,
+                    "All configured RPC endpoints critically degraded; widening poll interval"
+                );
+            }
             metrics::set_effective_poll_interval(interval.as_millis() as u64);
 
             // Stamp the heartbeat after every cycle — even failed ones — so the
@@ -1976,7 +1992,6 @@ mod tests {
             redis_url: redis_url.to_string(),
             network: "testnet".to_string(),
             max_reorg_depth: 128,
-            poll_interval: Duration::from_millis(50),
             poll_interval_floor: Duration::from_millis(50),
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,

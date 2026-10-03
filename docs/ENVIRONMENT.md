@@ -46,7 +46,7 @@ description is accurate. Keep this file honest by hand.
 | `STELLAR_RPC_URLS` | Optional | — | Prioritised, comma-separated RPC endpoints for failover; overrides `STELLAR_RPC_URL` (which stays valid as a single-value alias). |
 | `NETWORK` | Optional | `testnet` | One of `mainnet` \| `testnet` \| `futurenet`. |
 | `NETWORK_PASSPHRASE` | Required for non-standard networks | inferred for testnet/mainnet/pubnet (see below) | Stellar network passphrase, used to derive SAC contract ids for `TRACKED_SAC_ASSETS`. |
-| `POLL_INTERVAL_MS` | Optional | `1000` (min `100`, max `60000`) | Ledger poll interval. |
+| `POLL_INTERVAL_MS` | Removed | — | No longer read by the poll loop (it never actually was — only the adaptive floor/ceiling/watermark below control pacing). Setting it is a hard startup error naming `POLL_INTERVAL_FLOOR_MS`/`POLL_INTERVAL_CEILING_MS` instead of being silently ignored. |
 | `POLL_INTERVAL_FLOOR_MS` | Optional | `250` (min `50`, max `60000`) | Adaptive-poll floor (issue #198): fastest interval, used when lag is high. |
 | `POLL_INTERVAL_CEILING_MS` | Optional | `5000` (min `100`, max `600000`) | Adaptive-poll ceiling: slowest interval, used when caught up. |
 | `LAG_HIGH_WATERMARK` | Optional | `100` (min `1`, max `100000000`) | Ledger lag at/above which the floor interval applies. |
@@ -86,8 +86,8 @@ guessing would silently derive wrong SAC contract ids.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `RPC_CONNECT_TIMEOUT_MS` | Optional | `5000` (min `100`, max `60000`) | TCP connect timeout. |
-| `RPC_REQUEST_TIMEOUT_MS` | Optional | `30000` (min `500`, max `600000`) | Overall RPC request timeout; must be >= the connect timeout. |
+| `RPC_CONNECT_TIMEOUT_MS` | Optional | `5000` testnet / `10000` mainnet (min `100`, max `60000`) | TCP connect timeout. Mainnet's higher default accounts for materially higher p99 latency under real contract/event volume; see "Mainnet RPC timeout tuning" in `deployment.md`. |
+| `RPC_REQUEST_TIMEOUT_MS` | Optional | `30000` testnet / `45000` mainnet (min `500`, max `600000`) | Overall RPC request timeout; must be >= the connect timeout. |
 | `RPC_POOL_IDLE_TIMEOUT_MS` | Optional | `90000` (min `1000`, max `600000`) | Idle pooled-connection lifetime. |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Optional | `8` (min `1`, max `1024`) | Idle keep-alive connections retained per RPC host. |
 | `RPC_TCP_KEEPALIVE_MS` | Optional | `60000` (min `1000`, max `600000`) | TCP keep-alive probe interval. |
