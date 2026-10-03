@@ -55,6 +55,13 @@ pub struct Config {
     pub rpc_tcp_keepalive: Duration,
     /// Self-imposed maximum outbound RPC calls per second (issue #661).
     pub rpc_max_calls_per_sec: u32,
+    /// Whether to verify at least one configured RPC endpoint is reachable
+    /// before the poll loop starts (issue #687). Config validation only
+    /// bounds-checks the shape of `STELLAR_RPC_URLS`/`STELLAR_RPC_URL`; this
+    /// governs a separate, actual connectivity probe run at streamer
+    /// startup so an unreachable or misconfigured endpoint fails fast and
+    /// loudly instead of surfacing only once the poll loop starts failing.
+    pub rpc_startup_check_enabled: bool,
     /// How often the outbox relay scans for unpublished events (issue #200).
     pub outbox_poll_interval: Duration,
     /// Maximum events published per relay pass (issue #200).
@@ -385,6 +392,13 @@ impl Config {
             .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
+        // Enabled unless explicitly turned off: an unreachable RPC endpoint
+        // should fail startup loudly rather than surface only once the poll
+        // loop starts failing silently (issue #687).
+        let rpc_startup_check_enabled = std::env::var("RPC_STARTUP_CHECK_ENABLED")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
         let topic_filters = match std::env::var("INDEX_TOPIC_FILTERS") {
             Ok(spec) => match crate::rpc::filters::parse_topic_filters(&spec) {
                 Ok(f) => f,
@@ -466,6 +480,7 @@ impl Config {
             rpc_pool_max_idle_per_host,
             rpc_tcp_keepalive: Duration::from_millis(rpc_tcp_keepalive_ms),
             rpc_max_calls_per_sec,
+            rpc_startup_check_enabled,
             outbox_poll_interval: Duration::from_millis(outbox_poll_interval_ms),
             outbox_batch_size,
             outbox_backlog_alert_threshold,
@@ -529,6 +544,7 @@ impl Config {
             rpc_breaker_failure_threshold = self.rpc_breaker_failure_threshold,
             rpc_breaker_cooldown_ms = self.rpc_breaker_cooldown.as_millis() as u64,
             rpc_max_calls_per_sec = self.rpc_max_calls_per_sec,
+            rpc_startup_check_enabled = self.rpc_startup_check_enabled,
             "Effective configuration"
         );
     }
@@ -1191,6 +1207,38 @@ mod tests {
             );
             assert_eq!(cfg.reconcile_ledger_span, 400);
             assert_eq!(cfg.reconcile_tip_margin, 100);
+        });
+    }
+
+    #[test]
+    fn rpc_startup_check_defaults_to_enabled() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("RPC_STARTUP_CHECK_ENABLED");
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.rpc_startup_check_enabled);
+        });
+    }
+
+    #[test]
+    fn rpc_startup_check_can_be_disabled() {
+        let mut vars = required_vars();
+        vars.push(("RPC_STARTUP_CHECK_ENABLED", "false"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.rpc_startup_check_enabled);
+        });
+    }
+
+    #[test]
+    fn rpc_startup_check_rejects_only_exact_false() {
+        // Same relaxed-truthy convention as RECONCILE_ENABLED: anything other
+        // than a case-insensitive "false" is treated as enabled.
+        let mut vars = required_vars();
+        vars.push(("RPC_STARTUP_CHECK_ENABLED", "no"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.rpc_startup_check_enabled);
         });
     }
 

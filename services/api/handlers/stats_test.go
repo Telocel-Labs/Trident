@@ -217,6 +217,121 @@ func TestIndexerStats_DBError_Returns503(t *testing.T) {
 	}
 }
 
+// TestIndexerStats_PoolExhausted_DegradesGracefully is the acceptance test
+// for issue #690: a real pgxpool with every connection already held must
+// make a request that can't acquire one fail with a clear, bounded-time
+// error, not hang or panic. mockStatsDB above proves the handler's generic
+// query-error-to-503 path works, but says nothing about what actually
+// happens against a real exhausted pgxpool.Pool, which is the gap this
+// issue names.
+//
+// pgxpool has no AcquireTimeout setting (confirmed against the pinned pgx
+// v5.10.0): Pool.Acquire blocks until its context is cancelled, so how long
+// a caller waits on a full pool is bounded only by the context deadline the
+// caller supplies. IndexerStats derives its own 5s timeout from the
+// request's context (stats.go), so a request whose own context is already
+// nearly expired is bounded by that shorter deadline instead -- this test
+// uses that path so it completes in well under a second rather than
+// actually waiting out the handler's 5s timeout.
+//
+// Opt-in like this file's other TEST_DATABASE_URL tests: skipped unless set,
+// since the `go` CI job does not run a Postgres service for every job.
+func TestIndexerStats_PoolExhausted_DegradesGracefully(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	resetChainTipCache()
+
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	// The one slot this pool will ever have, so acquiring it once below
+	// deterministically exhausts the pool -- no concurrency or timing race
+	// needed to reproduce "every connection is in use".
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+
+	held, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire the pool's only connection: %v", err)
+	}
+	if got := pool.Stat().AcquiredConns(); got != 1 {
+		t.Fatalf("pool must report exactly 1 acquired connection, got %d", got)
+	}
+
+	// A request whose own context is already almost expired: IndexerStats'
+	// internal context.WithTimeout(r.Context(), 5*time.Second) only shortens
+	// an already-longer deadline, it cannot extend this one, so the pool
+	// acquire inside queryIndexerStats fails once this deadline passes
+	// rather than after the handler's full 5s.
+	reqCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	req := statsReq().WithContext(reqCtx)
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	IndexerStats(pool).ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("pool exhausted: want 503, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("pool exhaustion must fail fast (bounded by the request's own deadline), took %v", elapsed)
+	}
+
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body.Error.Code != "UNAVAILABLE" {
+		t.Errorf("error.code = %q, want UNAVAILABLE", body.Error.Code)
+	}
+
+	// Releasing the held connection must let a subsequent request through:
+	// this proves the earlier 503 was pool exhaustion recovering normally,
+	// not the pool or the handler left in some broken state. Seed a fresh
+	// last_poll_at first -- IndexerStats separately 503s on a stale/absent
+	// one ("status": "stalled", see this handler's own doc comment), which
+	// this test DB has by default with no real indexer ever having polled
+	// against it, and that is a different, unrelated code path from the
+	// pool-exhaustion one under test here.
+	held.Release()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO system_state (key, value, last_poll_at)
+		 VALUES ('latest_ledger_cursor', '1', NOW())
+		 ON CONFLICT (key) DO UPDATE SET last_poll_at = NOW()`,
+	)
+	if err != nil {
+		t.Fatalf("seed system_state: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM system_state WHERE key = 'latest_ledger_cursor'")
+	})
+
+	rec2 := httptest.NewRecorder()
+	IndexerStats(pool).ServeHTTP(rec2, statsReq())
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("after releasing the held connection, want 200, got %d, body: %s", rec2.Code, rec2.Body.String())
+	}
+}
+
 func TestMetricsHandler_ExposesAllThreeGauges(t *testing.T) {
 	rec := httptest.NewRecorder()
 	MetricsHandler(nil, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))

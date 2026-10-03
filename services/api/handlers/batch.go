@@ -130,12 +130,9 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		batchGlobalSem <- struct{}{}
 		go func(i int, id string) {
 			defer wg.Done()
-			event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 			defer func() { <-localSem }()
 			defer func() { <-batchGlobalSem }()
-			event, err := grpcclient.CallWithRetry(ctx, 1, func(ctx context.Context) (*gen.Event, error) {
-				return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
-			})
+			event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 			if err != nil {
 				results[i] = result{id: id, found: false}
 				return
