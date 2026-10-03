@@ -173,9 +173,7 @@ fn truncate_error(msg: &str) -> String {
 /// as an explicit pre-cutover gate, not as an ongoing check — routine
 /// exhaustion once the indexer is live is already covered by
 /// TridentPartitionExhaustionWarning/Exhausted in monitoring/alerts.yml.
-async fn run_partition_check(
-    min_headroom_ledgers: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_partition_check(min_headroom_ledgers: i64) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -196,6 +194,7 @@ async fn run_partition_check(
             pool_idle_timeout: cfg.rpc_pool_idle_timeout,
             pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
             tcp_keepalive: cfg.rpc_tcp_keepalive,
+            max_calls_per_sec: cfg.rpc_max_calls_per_sec,
         },
     )?;
     let tip = rpc.get_latest_ledger().await?;

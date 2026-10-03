@@ -58,6 +58,7 @@ description is accurate. Keep this file honest by hand.
 | `INDEXER_DB_POOL_SIZE` | Optional | `3` | Indexer's own Postgres pool size. |
 | `INDEX_TOPIC_FILTERS` | Optional | none (no narrowing) | Comma-separated topic patterns pushed into the RPC filter alongside the contract allowlist. |
 | `INDEX_DIAGNOSTIC` | Optional | `false` | Store Soroban diagnostic events (high-volume; keep `false` in production). |
+| `RPC_STARTUP_CHECK_ENABLED` | Optional | `true` | Verify RPC connectivity before the poll loop starts; disabling it means an unreachable endpoint only surfaces once polling begins (issue #687). |
 | `TRACKED_SAC_ASSETS` | Optional | none | Assets to derive SAC contract ids for and track. |
 | `REDIS_STREAM_MAXLEN` | Optional | `10000` | Max events kept in the Redis stream before trimming. |
 | `METRICS_PORT` | Optional | `9090` | Prometheus `/metrics` port; also doubles as the indexer's liveness/readiness signal. |

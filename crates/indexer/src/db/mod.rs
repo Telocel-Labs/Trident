@@ -1948,10 +1948,10 @@ mod tests {
         second_run_event.transaction_hash = tx_hash.clone();
         second_run_event.raw_event_index = 0;
 
-        insert_events_batch(&pool, &[first_run_event])
+        insert_events_batch(&pool, "testnet", &[first_run_event])
             .await
             .expect("first run insert failed");
-        insert_events_batch(&pool, &[second_run_event])
+        insert_events_batch(&pool, "testnet", &[second_run_event])
             .await
             .expect("second run insert must not error");
 
@@ -2009,7 +2009,7 @@ mod tests {
         event_b.transaction_hash = tx_hash_b.clone();
         event_b.raw_event_index = 0;
 
-        insert_events_batch(&pool, &[event_a.clone(), event_b.clone()])
+        insert_events_batch(&pool, "testnet", &[event_a.clone(), event_b.clone()])
             .await
             .expect("insert failed");
 
@@ -2033,7 +2033,7 @@ mod tests {
 
         // Re-run the exact same insert (simulating a re-index of the same
         // page): must still collapse to the same two rows, not four.
-        insert_events_batch(&pool, &[event_a, event_b])
+        insert_events_batch(&pool, "testnet", &[event_a, event_b])
             .await
             .expect("re-insert must not error");
 

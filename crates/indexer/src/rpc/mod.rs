@@ -679,6 +679,21 @@ impl RpcClient {
         Ok(result.sequence)
     }
 
+    /// Verify at least one configured endpoint is reachable, returning the
+    /// chain tip it reports (issue #687).
+    ///
+    /// Reuses `getLatestLedger` — the same lightweight call the
+    /// `partition-check` subcommand already uses — rather than probing a
+    /// dedicated health endpoint, since `getLatestLedger` is guaranteed
+    /// present on any Stellar RPC-compatible node the way a bespoke health
+    /// route is not. Callers should run this once at startup, before the
+    /// poll loop begins, so a misconfigured or unreachable endpoint produces
+    /// an immediate, clear failure rather than surfacing only once polling
+    /// starts failing.
+    pub async fn check_connectivity(&self) -> Result<u64, TridentError> {
+        self.get_latest_ledger().await
+    }
+
     /// Fetch the ledger hash for a given sequence number via `getLedgers`.
     /// Returns `None` if the RPC does not know about that ledger yet.
     pub async fn get_ledger(&self, sequence: u64) -> Result<Option<String>, TridentError> {
@@ -1209,5 +1224,55 @@ mod tests {
             elapsed >= Duration::from_millis(900),
             "10 calls at 5/sec should take >= ~1s, took {elapsed:?}"
         );
+    }
+
+    /// A reachable endpoint's startup connectivity check succeeds and reports
+    /// the chain tip (issue #687).
+    #[tokio::test]
+    async fn check_connectivity_succeeds_against_a_reachable_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "sequence": 12345 }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let tip = client
+            .check_connectivity()
+            .await
+            .expect("a reachable endpoint must pass the connectivity check");
+        assert_eq!(tip, 12345);
+    }
+
+    /// No configured endpoint being reachable must surface as an error the
+    /// caller can fail startup on, not hang or succeed silently (issue #687).
+    #[tokio::test]
+    async fn check_connectivity_fails_when_every_endpoint_is_unreachable() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&secondary)
+            .await;
+
+        let client = RpcClient::with_endpoints(
+            vec![primary.uri(), secondary.uri()],
+            &fast_timeout_settings(),
+        )
+        .unwrap();
+
+        let err = client
+            .check_connectivity()
+            .await
+            .expect_err("no endpoint is reachable, the check must fail");
+        assert!(err.retryable(), "an unreachable RPC is a retryable failure");
     }
 }
