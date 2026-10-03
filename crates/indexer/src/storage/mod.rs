@@ -177,7 +177,7 @@ mod tests {
         use stellar_strkey::ed25519::PublicKey as StrkeyPublicKey;
         let mut bytes = [0u8; 32];
         bytes[0..8].copy_from_slice(&(i as u64).to_be_bytes());
-        StrkeyPublicKey(bytes).to_string()
+        StrkeyPublicKey(bytes).to_string().as_str().to_owned()
     }
 
     /// A holder count that exceeds the RPC's per-call key cap must still
