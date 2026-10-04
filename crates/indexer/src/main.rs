@@ -4,6 +4,10 @@ use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 use tokio::time;
 use sqlx::PgPool;
 
