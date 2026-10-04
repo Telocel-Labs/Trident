@@ -601,6 +601,116 @@ impl TridentClient {
 
         Ok(Subscription::new(event_stream))
     }
+
+    // -----------------------------------------------------------------
+    // Webhook subscription management (issue #677)
+    //
+    // Signature verification for INCOMING deliveries lives in
+    // `crate::webhook`, deliberately separate from this client — these
+    // methods manage the subscription resource itself via the `/v1/webhooks`
+    // API. Request/response shapes are the generated OpenAPI models in
+    // `openapi_models_gen`; do not hand-edit those, they are regenerated
+    // from `api/openapi.yaml` by `scripts/generate_sdk_models.py`.
+    // -----------------------------------------------------------------
+
+    /// Create a webhook subscription for a contract's events.
+    ///
+    /// The returned [`WebhookCreateResponse::secret`] is shown only once —
+    /// store it to verify incoming deliveries with
+    /// [`crate::webhook::verify_signature`].
+    pub async fn create_webhook(
+        &self,
+        request: &crate::openapi_models_gen::WebhookCreateRequest,
+    ) -> Result<crate::openapi_models_gen::WebhookCreateResponse, TridentError> {
+        let url = format!("{}/v1/webhooks", self.config.api_url);
+        let response = self
+            .http
+            .post(&url)
+            .headers(self.headers())
+            .json(request)
+            .send()
+            .await?;
+        let response = check_response(response).await?;
+        Ok(response.json().await?)
+    }
+
+    /// List webhook subscriptions for the caller's API key, cursor-paginated.
+    pub async fn list_webhooks(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<crate::openapi_models_gen::ListWebhooksResponse, TridentError> {
+        let mut url = url::Url::parse(&format!("{}/v1/webhooks", self.config.api_url))
+            .map_err(|e| TridentError::WebSocket(e.to_string()))?;
+        {
+            let mut qs = url.query_pairs_mut();
+            if let Some(limit) = limit {
+                qs.append_pair("limit", &limit.to_string());
+            }
+            if let Some(cursor) = cursor {
+                qs.append_pair("cursor", cursor);
+            }
+        }
+        let response = self.http.get(url).headers(self.headers()).send().await?;
+        let response = check_response(response).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Permanently delete a webhook subscription.
+    ///
+    /// A subscription owned by a different API key returns the same
+    /// [`TridentError::NotFound`] as one that doesn't exist at all — the API
+    /// deliberately does not distinguish the two.
+    pub async fn delete_webhook(&self, id: &str) -> Result<(), TridentError> {
+        let url = format!("{}/v1/webhooks/{id}", self.config.api_url);
+        let response = self
+            .http
+            .delete(&url)
+            .headers(self.headers())
+            .send()
+            .await?;
+        check_response(response).await?;
+        Ok(())
+    }
+
+    /// Pause deliveries for a webhook subscription without deleting it.
+    pub async fn pause_webhook(
+        &self,
+        id: &str,
+    ) -> Result<crate::openapi_models_gen::WebhookStatusResponse, TridentError> {
+        let url = format!("{}/v1/webhooks/{id}/pause", self.config.api_url);
+        let response = self.http.patch(&url).headers(self.headers()).send().await?;
+        let response = check_response(response).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Resume deliveries for a previously paused webhook subscription.
+    pub async fn resume_webhook(
+        &self,
+        id: &str,
+    ) -> Result<crate::openapi_models_gen::WebhookStatusResponse, TridentError> {
+        let url = format!("{}/v1/webhooks/{id}/resume", self.config.api_url);
+        let response = self.http.patch(&url).headers(self.headers()).send().await?;
+        let response = check_response(response).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Rotate a webhook subscription's signing secret.
+    ///
+    /// The previous secret remains valid for the overlap window described by
+    /// [`crate::webhook::verify_signature`]'s multi-token header handling —
+    /// update your receiver to the new
+    /// [`WebhookRotateSecretResponse::secret`](crate::openapi_models_gen::WebhookRotateSecretResponse::secret)
+    /// before the old one is fully retired.
+    pub async fn rotate_webhook_secret(
+        &self,
+        id: &str,
+    ) -> Result<crate::openapi_models_gen::WebhookRotateSecretResponse, TridentError> {
+        let url = format!("{}/v1/webhooks/{id}/rotate-secret", self.config.api_url);
+        let response = self.http.post(&url).headers(self.headers()).send().await?;
+        let response = check_response(response).await?;
+        Ok(response.json().await?)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,5 +1377,173 @@ mod tests {
         let item = sub.next().await.unwrap().unwrap();
         assert_eq!(item.id, "test");
         assert!(sub.next().await.is_none());
+    }
+
+    // --- Webhook subscription management (issue #677) ---
+
+    #[tokio::test]
+    async fn create_webhook_parses_response() {
+        let mut server = Server::new_async().await;
+
+        let body = serde_json::json!({
+            "id": "wh_1",
+            "contractId": "CAAAA",
+            "network": "testnet",
+            "secret": "whsec_abc123",
+            "targetUrl": "https://example.com/hook"
+        });
+
+        let mock = server
+            .mock("POST", "/v1/webhooks")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let request = crate::openapi_models_gen::WebhookCreateRequest {
+            contract_id: "CAAAA".to_string(),
+            network: Some("testnet".to_string()),
+            target_url: "https://example.com/hook".to_string(),
+            topic0: None,
+        };
+        let result = client.create_webhook(&request).await.unwrap();
+
+        assert_eq!(result.id, "wh_1");
+        assert_eq!(result.secret, "whsec_abc123");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_webhooks_parses_response() {
+        let mut server = Server::new_async().await;
+
+        let body = serde_json::json!({
+            "webhooks": [{
+                "id": "wh_1",
+                "contractId": "CAAAA",
+                "network": "testnet",
+                "targetUrl": "https://example.com/hook",
+                "createdAt": "2024-01-01T00:00:00Z",
+                "apiKeyId": null,
+                "pausedAt": null,
+                "secret": null,
+                "topic0": null
+            }],
+            "has_more": false,
+            "next_cursor": ""
+        });
+
+        let mock = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/webhooks".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let result = client.list_webhooks(Some(10), None).await.unwrap();
+
+        assert_eq!(result.webhooks.len(), 1);
+        assert_eq!(result.webhooks[0].id, "wh_1");
+        // The list response never carries the signing secret.
+        assert!(result.webhooks[0].secret.is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delete_webhook_succeeds_on_204() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("DELETE", "/v1/webhooks/wh_1")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        client.delete_webhook("wh_1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delete_webhook_missing_returns_not_found() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("DELETE", "/v1/webhooks/does-not-exist")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let err = client.delete_webhook("does-not-exist").await.unwrap_err();
+        assert!(matches!(err, TridentError::NotFound));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pause_then_resume_webhook_report_status() {
+        let mut server = Server::new_async().await;
+
+        let pause_mock = server
+            .mock("PATCH", "/v1/webhooks/wh_1/pause")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({"status": "paused"}).to_string())
+            .create_async()
+            .await;
+        let resume_mock = server
+            .mock("PATCH", "/v1/webhooks/wh_1/resume")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({"status": "resumed"}).to_string())
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+
+        let paused = client.pause_webhook("wh_1").await.unwrap();
+        assert!(matches!(
+            paused.status,
+            crate::openapi_models_gen::WebhookStatusResponseStatus::Paused
+        ));
+
+        let resumed = client.resume_webhook("wh_1").await.unwrap();
+        assert!(matches!(
+            resumed.status,
+            crate::openapi_models_gen::WebhookStatusResponseStatus::Resumed
+        ));
+
+        pause_mock.assert_async().await;
+        resume_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rotate_webhook_secret_returns_both_secrets() {
+        let mut server = Server::new_async().await;
+
+        let body = serde_json::json!({
+            "id": "wh_1",
+            "secret": "whsec_new",
+            "previousSecret": "whsec_old"
+        });
+
+        let mock = server
+            .mock("POST", "/v1/webhooks/wh_1/rotate-secret")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let result = client.rotate_webhook_secret("wh_1").await.unwrap();
+
+        assert_eq!(result.secret, "whsec_new");
+        assert_eq!(result.previous_secret, "whsec_old");
+        mock.assert_async().await;
     }
 }

@@ -39,8 +39,22 @@ pub enum TokenMetadataResolution {
 ///
 /// Returns `Ok(NotAToken)` when any of the three calls fails or returns a
 /// value of the wrong shape — that is the graceful "not a token" path the
-/// issue calls for. Returns `Err` only for a transport/RPC failure, which the
-/// caller should treat as transient and retry later rather than cache.
+/// issue calls for. Returns `Err` only for a transport/RPC failure that
+/// survived `RpcClient::simulate_transaction`'s own internal retry (5
+/// attempts with jittered backoff, issue #660) — a single transient blip no
+/// longer reaches this far at all.
+///
+/// If `Err` is still returned after that internal retry is exhausted (issue
+/// #682): the caller does NOT schedule a guaranteed future retry. The only
+/// caller today, `streamer::resolve_stale_token_metadata`, logs and moves on
+/// without caching a result, so a later attempt is possible but only happens
+/// opportunistically — if this same contract emits another token-event in a
+/// FUTURE poll page. A contract whose only activity was the page that
+/// triggered this failure, and which never emits again, will never be
+/// retried. There is no scheduled/persisted retry queue for this path
+/// (unlike, e.g., `redis_stream::relay::OutboxRelay`'s interval-driven
+/// sweep) — treat "retry later" as best-effort, not guaranteed, until one is
+/// added.
 pub async fn resolve(
     rpc: &RpcClient,
     contract_id: &str,
@@ -280,6 +294,49 @@ mod tests {
         let resolution = resolve(&rpc, TEST_CONTRACT).await.unwrap();
 
         assert_eq!(resolution, TokenMetadataResolution::NotAToken);
+    }
+
+    /// A single transient `simulateTransaction` failure must not surface as
+    /// `Err` from `resolve` — `RpcClient::simulate_transaction`'s own
+    /// internal retry (issue #660) is expected to absorb it, so a caller
+    /// never needs to distinguish "genuinely failed" from "one blip that
+    /// self-healed" (issue #682). Before #660, any transient failure here
+    /// propagated straight to `Err` with no retry at all.
+    #[tokio::test]
+    async fn resolve_recovers_from_a_single_transient_simulate_failure() {
+        let server = MockServer::start().await;
+
+        // The first simulateTransaction call (for `name`) fails transiently
+        // once, then every call succeeds — proving the internal retry, not a
+        // lucky mock ordering, is what recovers this.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mock_simulate_sequence(
+            &server,
+            vec![
+                ok_result(&sc_string("Example Token")),
+                ok_result(&sc_string("EXT")),
+                ok_result(&ScVal::U32(7)),
+            ],
+        )
+        .await;
+
+        let rpc = RpcClient::with_settings(server.uri(), &RpcHttpSettings::default()).unwrap();
+        let resolution = resolve(&rpc, TEST_CONTRACT)
+            .await
+            .expect("a single transient failure must be absorbed by the internal retry");
+
+        assert_eq!(
+            resolution,
+            TokenMetadataResolution::Token(TokenMetadata {
+                name: "Example Token".to_string(),
+                symbol: "EXT".to_string(),
+                decimals: 7,
+            })
+        );
     }
 
     #[tokio::test]
