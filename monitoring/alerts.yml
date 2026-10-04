@@ -697,3 +697,18 @@ groups:
             watching them.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerdbpoolsaturated"
 
+  # ---------------------------------------------------------------------------
+  # Backups (issue #483) — requires something to push
+  # trident_database_backup_last_success_timestamp_seconds; nothing does yet.
+  # ---------------------------------------------------------------------------
+  - name: trident-alerts
+    rules:
+      - alert: TridentDatabaseBackupFailed
+        expr: time() - trident_database_backup_last_success_timestamp_seconds > 93600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database backup has not succeeded in over 26 hours"
+          description: "Automated PostgreSQL backup job has failed or failed to run, risking data loss."
+
