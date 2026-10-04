@@ -301,6 +301,25 @@ async fn maintain_partitions(pool: PgPool) {
     }
 }
 
+/// Prunes `soroban_events` rows older than `days` once per day (issue #482).
+async fn run_retention_job(pool: PgPool, days: u64) {
+    let mut interval = time::interval(Duration::from_secs(86400));
+    loop {
+        interval.tick().await;
+        match sqlx::query("SELECT prune_soroban_events($1)")
+            .bind(days as i64)
+            .execute(&pool)
+            .await
+        {
+            Ok(_) => metrics::record_retention_job_success(),
+            Err(e) => {
+                tracing::error!(error = %e, "retention job failed");
+                metrics::record_retention_job_failure();
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -454,6 +473,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Daily partition maintenance (issue #431): keeps the events table's
     // partition ceiling ahead of the live chain tip.
     tokio::spawn(maintain_partitions(db_pool.clone()));
+
+    // Daily event-retention pruning (issue #482), opt-in via EVENT_RETENTION_DAYS.
+    if let Some(days) = cfg.event_retention_days {
+        tokio::spawn(run_retention_job(db_pool.clone(), days));
+    }
 
     // Allow the shutdown drain to finish its in-flight work before the process
     // is killed. Kubernetes/Fly terminationGracePeriodSeconds should be ≥ this
