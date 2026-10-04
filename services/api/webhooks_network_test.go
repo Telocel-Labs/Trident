@@ -41,6 +41,11 @@ func TestCreateWebhookHandler_RejectsUnknownNetwork(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks", body)
 	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	req.Header.Set("Content-Type", "application/json")
+	// The handler resolves webhook ownership from the API key id in the
+	// request context, which middleware.APIKey puts there after a database
+	// lookup. This test invokes the handler directly, so it must supply the
+	// same value the middleware would.
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -86,6 +91,11 @@ func TestCreateWebhookHandler_AcceptsKnownNetwork(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks", body)
 	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	req.Header.Set("Content-Type", "application/json")
+	// The handler resolves webhook ownership from the API key id in the
+	// request context, which middleware.APIKey puts there after a database
+	// lookup. This test invokes the handler directly, so it must supply the
+	// same value the middleware would.
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)

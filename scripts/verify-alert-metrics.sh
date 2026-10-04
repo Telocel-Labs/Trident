@@ -121,7 +121,12 @@ FUNCS = {
 # Prefixes owned by exporters we deploy alongside Trident rather than by
 # Trident itself. A metric under one of these is verified by that exporter
 # being present in the deployment, which is a different check from this one.
-EXTERNAL_EXPORTER_PREFIXES = ("node_", "pg_", "redis_", "container_")
+#
+# kube_* comes from kube-state-metrics, which reports on the cluster rather
+# than on any process — TridentPodOOMKilled reads
+# kube_pod_container_status_terminated_reason, which no application /metrics
+# endpoint can ever serve, so checking for it here would always fail.
+EXTERNAL_EXPORTER_PREFIXES = ("node_", "pg_", "redis_", "container_", "kube_")
 
 doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
 found = set()
