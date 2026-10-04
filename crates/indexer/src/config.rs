@@ -109,6 +109,9 @@ pub struct Config {
     pub tracked_sac_assets: Vec<crate::parser::sac::TrackedAsset>,
     /// Maximum allowable reorg depth in ledgers before halting for operator intervention (issue #196).
     pub max_reorg_depth: u64,
+    /// Days of soroban_events history to retain before the retention job
+    /// prunes older rows (issue #482). `None` disables pruning.
+    pub event_retention_days: Option<u64>,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -284,6 +287,9 @@ impl Config {
             2_592_000,
         );
         let max_reorg_depth = parse_bounded_u64("MAX_REORG_DEPTH", 128, 1, 10_000);
+        let event_retention_days: Option<u64> = std::env::var("EVENT_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok());
         let db_pool_size = parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE);
         // #215 names redis_stream_maxlen among the knobs that must be
         // range-checked. These three previously used
@@ -506,6 +512,7 @@ impl Config {
             network_passphrase,
             tracked_sac_assets,
             max_reorg_depth: max_reorg_depth.unwrap(),
+            event_retention_days,
         })
     }
 

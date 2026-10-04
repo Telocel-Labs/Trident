@@ -50,6 +50,8 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+pub const RETENTION_JOB_SUCCESS_TOTAL: &str = "trident_retention_job_success_total";
+pub const RETENTION_JOB_FAILURE_TOTAL: &str = "trident_retention_job_failure_total";
 /// Circuit breaker state (issue #197): 0 = Closed, 1 = Open, 2 = HalfOpen.
 /// See `streamer::circuit_breaker` for the state machine.
 pub const RPC_BREAKER_STATE: &str = "trident_indexer_rpc_breaker_state";
@@ -188,6 +190,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Events skipped (diagnostic, failed call, or contract filter)"
     );
     describe_counter!(PARSE_ERRORS_TOTAL, "Total events that failed XDR decoding");
+    describe_counter!(
+        RETENTION_JOB_SUCCESS_TOTAL,
+        "Total successful event-retention pruning runs (issue #482)"
+    );
+    describe_counter!(
+        RETENTION_JOB_FAILURE_TOTAL,
+        "Total failed event-retention pruning runs (issue #482)"
+    );
     describe_counter!(
         DEAD_LETTERED_TOTAL,
         "Undecodable events durably captured in parse_errors (issue #414)"
@@ -636,4 +646,14 @@ pub fn set_rpc_health_score(endpoint: &str, score: u8) {
 ///   - TridentPartitionExhausted          (<= 0,        critical severity + Fatal poll error)
 pub fn set_partition_lookahead(lookahead: i64) {
     gauge!(PARTITION_LOOKAHEAD_LEDGERS).set(lookahead as f64);
+}
+
+/// Records one successful event-retention pruning run (issue #482).
+pub fn record_retention_job_success() {
+    counter!(RETENTION_JOB_SUCCESS_TOTAL).increment(1);
+}
+
+/// Records one failed event-retention pruning run (issue #482).
+pub fn record_retention_job_failure() {
+    counter!(RETENTION_JOB_FAILURE_TOTAL).increment(1);
 }
