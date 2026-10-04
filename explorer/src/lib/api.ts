@@ -1,4 +1,4 @@
-import type { SorobanEvent, ListEventsResponse, Network } from "./types";
+import type { SorobanEvent, ListEventsResponse, Network, IndexerStats } from "./types";
 
 const TESTNET_URL =
   import.meta.env.TRIDENT_TESTNET_API_URL ?? "https://api.testnet.trident.dev";
@@ -145,4 +145,11 @@ export function streamHeaders(lastEventId?: string): HeadersInit {
   if (API_KEY) h["X-API-Key"] = API_KEY;
   if (lastEventId) h["Last-Event-ID"] = lastEventId;
   return h;
+}
+
+export async function getIndexerStats(network: Network = "testnet"): Promise<IndexerStats> {
+  // Public endpoint (security: [] in the OpenAPI spec) — no API key attached.
+  const res = await fetch(`${baseUrl(network)}/v1/stats/indexer`);
+  if (!res.ok) throw new Error(`API ${res.status}`);
+  return (await res.json()) as IndexerStats;
 }

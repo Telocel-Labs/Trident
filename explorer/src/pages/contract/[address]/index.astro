@@ -144,7 +144,7 @@ function filterUrl(overrides: Record<string, string>): string {
 >
   <!-- Breadcrumb -->
   <nav class="text-xs text-gray-500 mb-6 flex items-center gap-1.5" aria-label="Breadcrumb">
-    <a href={`/?network=${network}`} class="hover:text-white">Home</a>
+    <a href={`/explorer?network=${network}`} class="hover:text-white">Explorer</a>
     <span>/</span>
     <span class="text-gray-300 font-mono" title={address}>{shortAddr}</span>
   </nav>
@@ -172,6 +172,10 @@ function filterUrl(overrides: Record<string, string>): string {
           }`}
         >
           {network}
+        </span>
+        <span id="stream-status" class="hidden items-center gap-1.5">
+          <span id="stream-dot" class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
+          <span id="stream-label">Connecting</span>
         </span>
       </div>
     </div>
@@ -351,4 +355,113 @@ function filterUrl(overrides: Record<string, string>): string {
 
 <script>
   import '../../../lib/contract-sse';
+</script>
+
+<script>
+  // Copy address button
+  const copyBtn = document.getElementById('copy-address') as HTMLButtonElement | null;
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      const addr = copyBtn.dataset.address ?? '';
+      try {
+        await navigator.clipboard.writeText(addr);
+        const orig = copyBtn.textContent;
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = orig; }, 1500);
+      } catch { /* clipboard unavailable */ }
+    });
+  }
+
+  // JS "Load more" — appends rows instead of navigating. Row click-to-navigate
+  // for these appended rows is handled by the delegated listener in
+  // lib/contract-sse (it matches any tr[data-href], not just ones present at
+  // page load).
+  const loadMoreLink = document.getElementById('load-more-link') as HTMLAnchorElement | null;
+  if (loadMoreLink) {
+    loadMoreLink.addEventListener('click', async (e) => {
+      e.preventDefault();
+      loadMoreLink.textContent = 'Loading…';
+      loadMoreLink.setAttribute('disabled', '');
+
+      const params = new URLSearchParams(window.location.search);
+      const network = params.get('network') ?? 'testnet';
+      const contractId = window.location.pathname.split('/')[2];
+      const apiParams = new URLSearchParams({ network, contractId });
+      if (params.get('topic0')) apiParams.set('topic0', params.get('topic0')!);
+      if (params.get('ledgerFrom')) apiParams.set('ledgerFrom', params.get('ledgerFrom')!);
+      if (params.get('ledgerTo')) apiParams.set('ledgerTo', params.get('ledgerTo')!);
+      apiParams.set('cursor', loadMoreLink.dataset.cursor!);
+
+      try {
+        const res = await fetch(`/api/events.json?${apiParams}`);
+        if (!res.ok) throw new Error('fetch failed');
+        const data: { events: any[]; has_more: boolean; next_cursor: string | null } = await res.json();
+
+        const tbody = document.getElementById('events-tbody');
+        if (tbody && data.events.length) {
+          for (const ev of data.events) {
+            const tr = document.createElement('tr');
+            tr.className = 'hover:bg-gray-900/60 cursor-pointer transition-colors';
+            tr.dataset.href = `/contract/${encodeURIComponent(ev.contract_id)}/event/${encodeURIComponent(ev.id)}?network=${network}`;
+
+            const time = document.createElement('td');
+            time.className = 'px-4 py-3 text-gray-400 whitespace-nowrap text-xs';
+            time.textContent = new Date(ev.ledger_timestamp).toLocaleTimeString();
+            tr.append(time);
+
+            const seq = document.createElement('td');
+            seq.className = 'px-4 py-3 font-mono text-gray-300 text-xs';
+            seq.textContent = String(ev.ledger_sequence);
+            tr.append(seq);
+
+            const typeTd = document.createElement('td');
+            typeTd.className = 'px-4 py-3';
+            const badge = document.createElement('span');
+            badge.className = 'px-2 py-0.5 rounded-full text-xs bg-indigo-900/50 text-indigo-300 font-medium';
+            badge.textContent = ev.topics?.[0] ?? ev.event_type;
+            typeTd.append(badge);
+            tr.append(typeTd);
+
+            const topic1 = document.createElement('td');
+            topic1.className = 'px-4 py-3 font-mono text-gray-400 text-xs truncate max-w-[180px] hidden md:table-cell';
+            topic1.textContent = ev.topics?.[1] ? `${String(ev.topics[1]).slice(0, 20)}...` : '—';
+            tr.append(topic1);
+
+            const txTd = document.createElement('td');
+            txTd.className = 'px-4 py-3 hidden lg:table-cell';
+            const txLink = document.createElement('a');
+            txLink.href = `${network === 'mainnet' ? 'https://stellar.expert/explorer/public' : 'https://stellar.expert/explorer/testnet'}/tx/${encodeURIComponent(ev.transaction_hash)}`;
+            txLink.target = '_blank';
+            txLink.rel = 'noopener noreferrer';
+            txLink.className = 'font-mono text-xs text-gray-400 hover:text-indigo-300';
+            txLink.textContent = `${String(ev.transaction_hash).slice(0, 8)}...${String(ev.transaction_hash).slice(-6)}`;
+            txTd.append(txLink);
+            tr.append(txTd);
+
+            const dataTd = document.createElement('td');
+            dataTd.className = 'px-4 py-3 hidden xl:table-cell font-mono text-xs text-gray-500 max-w-[200px] truncate';
+            dataTd.textContent = ev.data ? String(ev.data).slice(0, 60) : '—';
+            tr.append(dataTd);
+
+            tbody.appendChild(tr);
+          }
+        }
+
+        if (data.has_more && data.next_cursor) {
+          loadMoreLink.dataset.cursor = data.next_cursor;
+          loadMoreLink.textContent = 'Load more';
+          loadMoreLink.removeAttribute('disabled');
+          // Update no-JS href too
+          const url = new URL(window.location.href);
+          url.searchParams.set('cursor', data.next_cursor);
+          loadMoreLink.href = url.pathname + url.search;
+        } else {
+          loadMoreLink.remove();
+        }
+      } catch {
+        loadMoreLink.textContent = 'Load more';
+        loadMoreLink.removeAttribute('disabled');
+      }
+    });
+  }
 </script>

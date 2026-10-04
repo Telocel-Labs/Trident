@@ -67,3 +67,14 @@ export interface StreamedEvent {
   data: string;
   event_id?: string;
 }
+
+export type IndexerStatus = 'healthy' | 'lagging' | 'stalled';
+
+export interface IndexerStats {
+  status: IndexerStatus;
+  network: string;
+  last_ledger_indexed: number | null;
+  chain_tip_ledger: number | null;
+  lag_ledgers: number | null;
+  lag_seconds_estimated: number | null;
+}
