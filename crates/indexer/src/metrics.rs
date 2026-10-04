@@ -107,6 +107,8 @@ pub const EVENTS_BY_CONTRACT_TOTAL: &str = "trident_indexer_events_by_contract_t
 pub const EVENT_DECODE_DURATION_SECONDS: &str = "trident_indexer_event_decode_duration_seconds";
 /// Health score (0-100) for each RPC endpoint. Label: `endpoint` (URL).
 pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
+pub const RPC_CIRCUIT_STATE: &str = "trident_rpc_circuit_state";
+pub const LEDGER_GAPS_TOTAL: &str = "trident_indexer_ledger_gaps_total";
 /// Indexer's own Postgres pool, documented in docs/metrics-catalog.md.
 pub const DB_POOL_SIZE: &str = "trident_indexer_db_pool_size";
 pub const DB_POOL_IDLE_CONNECTIONS: &str = "trident_indexer_db_pool_idle_connections";
@@ -324,16 +326,16 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Ledgers remaining before the ingest cursor reaches the last named soroban_events partition boundary (issue #525)"
     );
     describe_counter!(
-        REORGS_TOTAL,
-        "Ledger reorganisations detected and repaired (issue #196)"
-    );
-    describe_counter!(
         LEDGER_GAPS_DETECTED_TOTAL,
         "Gaps found in the processed ledger range by the periodic ledger_metadata scan (issue #216)"
     );
     describe_counter!(
         LEDGER_GAPS_CLOSED_TOTAL,
         "Previously-enqueued backfill jobs confirmed filled by a later gap scan (issue #216)"
+    );
+    describe_gauge!(
+        LEDGER_GAPS_TOTAL,
+        "Number of missing ledger sequences detected in the processed range"
     );
 
     // Counters only render in the scrape output once touched at least once;
@@ -656,4 +658,9 @@ pub fn record_retention_job_success() {
 /// Records one failed event-retention pruning run (issue #482).
 pub fn record_retention_job_failure() {
     counter!(RETENTION_JOB_FAILURE_TOTAL).increment(1);
+}
+
+/// Publish the current number of detected ledger gaps.
+pub fn set_ledger_gaps(count: i64) {
+    gauge!(LEDGER_GAPS_TOTAL).set(count as f64);
 }

@@ -43,13 +43,25 @@ pub use circuit_breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, Ou
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
 const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
 
-/// How often (in poll loop iterations) the gap scan runs (issue #216). Much
-/// less frequent than the filter refresh above: a gap scan reads the whole
-/// `ledger_metadata` table's sequence column via a window function, and a
-/// gap that has existed for one poll interval will still be there in ten
-/// minutes, so there is no correctness reason to run it more often than
-/// this. At the default 5s poll interval this is ~10 minutes.
+/// How often (in poll loop iterations) the backfill-enqueuing gap scan runs
+/// (issue #216). Much less frequent than the filter refresh above: a gap
+/// scan reads the whole `ledger_metadata` table's sequence column via a
+/// window function, and a gap that has existed for one poll interval will
+/// still be there in ten minutes, so there is no correctness reason to run
+/// it more often than this. At the default 5s poll interval this is ~10
+/// minutes.
 const GAP_SCAN_EVERY_N_POLLS: u32 = 120;
+
+/// How far back the lightweight gap gauge scan looks (issue #413). Bounded
+/// so the scan cost stays constant instead of growing with chain height —
+/// at ~5s per ledger this covers roughly the last 14 hours of ingest, which
+/// is the window where a gap is still worth surfacing. Anything older is a
+/// backfill job (`trident-backfill`), covered by the scan above instead.
+const GAUGE_GAP_SCAN_WINDOW_LEDGERS: u64 = 10_000;
+
+/// Gap gauge scanning is a periodic audit, not per-poll work — keeping it
+/// off the ingest hot path matters more than sub-minute detection latency.
+const GAUGE_GAP_SCAN_EVERY_N_POLLS: u32 = 60;
 
 pub struct Streamer {
     config: Config,
@@ -1322,6 +1334,39 @@ impl Streamer {
         // Recompute lag once the loop settles so it reflects the final cursor
         // relative to the chain tip (zero once we have caught up).
         metrics::set_ledger_lag(self.last_chain_tip.saturating_sub(*cursor) as i64);
+
+        // Gap detection (#413): scan for missing ledger sequences and publish
+        // the count so operators can see gaps and trigger backfill.
+        //
+        // Scanned over a bounded trailing window, not the whole processed
+        // range: `generate_series(1, cursor)` would materialise ~4M rows per
+        // call at current testnet height and grow forever. A gap older than
+        // this window is a backfill job, not something the poll loop should
+        // rediscover every cycle.
+        //
+        // Throttled to its own interval for the same reason — this is a
+        // periodic audit, and running it per-poll puts a growing scan on the
+        // ingest hot path.
+        if *cursor > 1 && self.poll_count.is_multiple_of(GAUGE_GAP_SCAN_EVERY_N_POLLS) {
+            let from = cursor.saturating_sub(GAUGE_GAP_SCAN_WINDOW_LEDGERS).max(1);
+            match db::detect_ledger_gaps(&self.db, from, *cursor).await {
+                Ok(gaps) => {
+                    let gap_count = gaps.len() as i64;
+                    metrics::set_ledger_gaps(gap_count);
+                    if gap_count > 0 {
+                        tracing::warn!(
+                            gaps = gap_count,
+                            from,
+                            to = *cursor,
+                            "Ledger gaps detected in scanned window"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to detect ledger gaps");
+                }
+            }
+        }
 
         // Write health stats after every successful cycle (issue #62).
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
