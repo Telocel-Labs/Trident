@@ -1,124 +1,182 @@
 ---
 import Base from '../layouts/Base.astro';
+import { getIndexerStats } from '../lib/api';
+import type { IndexerStats, Network } from '../lib/types';
 
-interface ServiceStatus {
-  name: string;
-  status: 'operational' | 'degraded' | 'outage';
-  latencyMs: number;
-  description: string;
+const rawNetwork = Astro.url.searchParams.get('network');
+const network: Network = rawNetwork === 'mainnet' ? 'mainnet' : 'testnet';
+
+let stats: IndexerStats | null = null;
+let unreachable = false;
+try {
+  stats = await getIndexerStats(network);
+} catch {
+  unreachable = true;
 }
 
-const services: ServiceStatus[] = [
-  {
-    name: 'Soroban Event Ingestion (Testnet)',
-    status: 'operational',
-    latencyMs: 120,
-    description: 'Real-time ledger polling and transaction event stream extraction.',
-  },
-  {
-    name: 'REST API & WebSockets (/v1)',
-    status: 'operational',
-    latencyMs: 45,
-    description: 'Public query endpoints, SSE streams, and webhook delivery.',
-  },
-  {
-    name: 'gRPC High-Throughput API',
-    status: 'operational',
-    latencyMs: 18,
-    description: 'Protobuf event streaming for high-volume indexers and backfills.',
-  },
-  {
-    name: 'PostgreSQL Event Store & Partitions',
-    status: 'operational',
-    latencyMs: 8,
-    description: 'Partitioned event storage with index caching and schema guards.',
-  },
-];
+// Every numeric field is nullable in the API contract — always fall back to
+// an em dash, never render null/NaN/undefined.
+function num(v: number | null | undefined): string {
+  return v == null ? '—' : v.toLocaleString('en-US');
+}
 
-const overallStatus = services.every((s) => s.status === 'operational')
-  ? 'All Systems Operational'
-  : services.some((s) => s.status === 'outage')
-    ? 'Service Outage Detected'
-    : 'Partial System Degradation';
+function staleness(seconds: number | null | undefined): string {
+  if (seconds == null) return '—';
+  if (seconds < 60) return `about ${Math.round(seconds)}s behind`;
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `about ${m}m behind`;
+  const h = Math.round(m / 60);
+  return `about ${h}h behind`;
+}
 
-const statusColor =
-  overallStatus === 'All Systems Operational'
-    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-    : overallStatus === 'Service Outage Detected'
-      ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
-      : 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+const statusStyles: Record<string, { dot: string; text: string; label: string }> = {
+  healthy: { dot: 'bg-green-500', text: 'text-green-400', label: 'Healthy' },
+  lagging: { dot: 'bg-ember-500', text: 'text-ember-400', label: 'Lagging' },
+  stalled: { dot: 'bg-red-600', text: 'text-red-500', label: 'Stalled' },
+  unreachable: { dot: 'bg-red-700', text: 'text-red-500', label: 'Indexer unreachable' },
+};
 
-const incidents = [
-  {
-    id: 'inc-001',
-    title: 'Scheduled Testnet Ledger Catch-Up Protocol',
-    status: 'Resolved',
-    date: 'August 28, 2026',
-    summary: 'Indexer completed routine resync following testnet reset with zero dropped subscriber events.',
-  },
-];
+const currentKey = unreachable ? 'unreachable' : (stats?.status ?? 'unreachable');
+const current = statusStyles[currentKey] ?? statusStyles.unreachable;
 ---
 
-<Base title="System Status" description="Real-time uptime, service health, and incident tracking for Trident.">
-  <div class="max-w-4xl mx-auto py-6">
-    <!-- Header Banner -->
-    <div class={`p-5 rounded-xl border flex items-center justify-between mb-8 ${statusColor}`}>
+<Base
+  title="Indexer Status"
+  description="Live health of the Trident indexer: last indexed ledger, chain tip, and data freshness."
+>
+  <section class="max-w-2xl mx-auto py-10">
+    <div class="flex items-center justify-between mb-8">
+      <h1 class="text-2xl font-bold text-white">Indexer status</h1>
+      <div class="flex gap-2 text-sm" role="group" aria-label="Network selector">
+        <a
+          href="?network=testnet"
+          class={`px-3 py-1 rounded-full transition-colors ${
+            network === 'testnet' ? 'bg-gray-800 text-white' : 'text-gray-500 hover:text-white'
+          }`}
+          aria-current={network === 'testnet' ? 'true' : undefined}>Testnet</a
+        >
+        <a
+          href="?network=mainnet"
+          class={`px-3 py-1 rounded-full transition-colors ${
+            network === 'mainnet' ? 'bg-gray-800 text-white' : 'text-gray-500 hover:text-white'
+          }`}
+          aria-current={network === 'mainnet' ? 'true' : undefined}>Mainnet</a
+        >
+      </div>
+    </div>
+
+    <div
+      id="status-card"
+      class="rounded-xl border border-gray-800 bg-gray-900 p-6"
+      data-network={network}
+    >
       <div class="flex items-center gap-3">
-        <span class="relative flex h-3.5 w-3.5">
-          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-          <span class="relative inline-flex rounded-full h-3.5 w-3.5 bg-emerald-500"></span>
+        <span id="status-dot" class={`h-3 w-3 rounded-full ${current.dot}`} aria-hidden="true"
+        ></span>
+        <span id="status-label" class={`text-lg font-semibold ${current.text}`}>
+          {current.label}
         </span>
-        <h1 class="text-xl font-bold">{overallStatus}</h1>
+        <span id="status-network" class="ml-auto text-xs text-gray-500">
+          {stats?.network ?? network}
+        </span>
       </div>
-      <span class="text-xs text-gray-400">Updated automatically</span>
-    </div>
 
-    <!-- Services Grid -->
-    <div class="space-y-4 mb-12">
-      <h2 class="text-lg font-semibold text-white mb-4">Core Components</h2>
-      {services.map((svc) => (
-        <div class="p-4 bg-gray-900/60 border border-gray-800 rounded-lg flex items-center justify-between">
-          <div>
-            <div class="font-medium text-white text-base">{svc.name}</div>
-            <div class="text-xs text-gray-400 mt-0.5">{svc.description}</div>
-          </div>
-          <div class="flex items-center gap-4">
-            <span class="text-xs text-gray-500 font-mono">{svc.latencyMs}ms</span>
-            <span
-              class={`px-2.5 py-1 rounded-full text-xs font-semibold uppercase tracking-wider ${
-                svc.status === 'operational'
-                  ? 'bg-emerald-500/20 text-emerald-300'
-                  : svc.status === 'degraded'
-                    ? 'bg-amber-500/20 text-amber-300'
-                    : 'bg-rose-500/20 text-rose-300'
-              }`}
-            >
-              {svc.status}
-            </span>
-          </div>
+      <dl class="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5 text-sm">
+        <div>
+          <dt class="text-gray-500">Last ledger indexed</dt>
+          <dd id="stat-last" class="mt-1 font-mono text-white text-base">
+            {num(stats?.last_ledger_indexed)}
+          </dd>
         </div>
-      ))}
+        <div>
+          <dt class="text-gray-500">Chain tip ledger</dt>
+          <dd id="stat-tip" class="mt-1 font-mono text-white text-base">
+            {num(stats?.chain_tip_ledger)}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">Ledger gap</dt>
+          <dd id="stat-lag" class="mt-1 font-mono text-white text-base">
+            {num(stats?.lag_ledgers)}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">Data freshness</dt>
+          <dd id="stat-fresh" class="mt-1 text-white text-base">
+            {staleness(stats?.lag_seconds_estimated)}
+          </dd>
+        </div>
+      </dl>
     </div>
 
-    <!-- Past Incidents -->
-    <div>
-      <h2 class="text-lg font-semibold text-white mb-4">Past Incidents & Maintenance</h2>
-      <div class="space-y-4">
-        {incidents.map((inc) => (
-          <div class="p-5 bg-gray-900/40 border border-gray-800 rounded-lg">
-            <div class="flex items-center justify-between mb-2">
-              <span class="font-medium text-white">{inc.title}</span>
-              <span class="text-xs text-gray-400">{inc.date}</span>
-            </div>
-            <p class="text-sm text-gray-400">{inc.summary}</p>
-            <div class="mt-3">
-              <span class="text-xs font-medium text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
-                {inc.status}
-              </span>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  </div>
+    <p class="mt-4 text-xs text-gray-500 text-right" id="refresh-note">Refreshes every 10s</p>
+  </section>
 </Base>
+
+<script>
+  import type { IndexerStats } from '../lib/types';
+
+  const card = document.getElementById('status-card');
+  const network = card?.dataset.network ?? 'testnet';
+
+  const dot = document.getElementById('status-dot');
+  const label = document.getElementById('status-label');
+  const netEl = document.getElementById('status-network');
+  const last = document.getElementById('stat-last');
+  const tip = document.getElementById('stat-tip');
+  const lag = document.getElementById('stat-lag');
+  const fresh = document.getElementById('stat-fresh');
+
+  const styles: Record<string, { dot: string; text: string; label: string }> = {
+    healthy: { dot: 'bg-green-500', text: 'text-green-400', label: 'Healthy' },
+    lagging: { dot: 'bg-ember-500', text: 'text-ember-400', label: 'Lagging' },
+    stalled: { dot: 'bg-red-600', text: 'text-red-500', label: 'Stalled' },
+    unreachable: { dot: 'bg-red-700', text: 'text-red-500', label: 'Indexer unreachable' },
+  };
+
+  function num(v: number | null | undefined): string {
+    return v == null ? '—' : v.toLocaleString('en-US');
+  }
+
+  function staleness(seconds: number | null | undefined): string {
+    if (seconds == null) return '—';
+    if (seconds < 60) return `about ${Math.round(seconds)}s behind`;
+    const m = Math.round(seconds / 60);
+    if (m < 60) return `about ${m}m behind`;
+    const h = Math.round(m / 60);
+    return `about ${h}h behind`;
+  }
+
+  function render(key: string, stats: IndexerStats | null): void {
+    const s = styles[key] ?? styles.unreachable;
+    if (dot) dot.className = `h-3 w-3 rounded-full ${s.dot}`;
+    if (label) {
+      label.className = `text-lg font-semibold ${s.text}`;
+      label.textContent = s.label;
+    }
+    if (netEl) netEl.textContent = stats?.network ?? network;
+    if (last) last.textContent = num(stats?.last_ledger_indexed);
+    if (tip) tip.textContent = num(stats?.chain_tip_ledger);
+    if (lag) lag.textContent = num(stats?.lag_ledgers);
+    if (fresh) fresh.textContent = staleness(stats?.lag_seconds_estimated);
+  }
+
+  async function refresh(): Promise<void> {
+    try {
+      const res = await fetch(`/api/status.json?network=${network}`);
+      if (!res.ok) {
+        render('unreachable', null);
+        return;
+      }
+      const stats = (await res.json()) as IndexerStats;
+      render(stats.status, stats);
+    } catch {
+      render('unreachable', null);
+    }
+  }
+
+  const id = setInterval(refresh, 10_000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearInterval(id);
+  });
+</script>

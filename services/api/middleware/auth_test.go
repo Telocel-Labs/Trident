@@ -43,6 +43,7 @@ func TestAPIKey(t *testing.T) {
 		{name: "missing key", path: "/v1/events/stream", wantStatus: http.StatusUnauthorized, checkBody: true},
 		{name: "invalid key", path: "/v1/events/stream", key: "wrong-key", wantStatus: http.StatusUnauthorized, checkBody: true},
 		{name: "health is public", path: "/v1/health", wantStatus: http.StatusNoContent},
+		{name: "indexer stats is public", path: "/v1/stats/indexer", wantStatus: http.StatusNoContent},
 	}
 
 	for _, tt := range tests {

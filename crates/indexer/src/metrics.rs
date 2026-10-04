@@ -337,6 +337,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         LEDGER_GAPS_TOTAL,
         "Number of missing ledger sequences detected in the processed range"
     );
+    describe_gauge!(
+        RPC_CIRCUIT_STATE,
+        "Per-endpoint RPC circuit breaker state: 0=closed, 1=open, 2=half-open"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -663,4 +667,16 @@ pub fn record_retention_job_failure() {
 /// Publish the current number of detected ledger gaps.
 pub fn set_ledger_gaps(count: i64) {
     gauge!(LEDGER_GAPS_TOTAL).set(count as f64);
+}
+
+/// Publish the per-endpoint RPC circuit breaker state as a numeric gauge:
+/// 0 = Closed, 1 = Open, 2 = HalfOpen.
+pub fn set_rpc_circuit_state(endpoint: &str, state: &str) {
+    let val = match state {
+        "Closed" => 0.0,
+        "Open" => 1.0,
+        "HalfOpen" => 2.0,
+        _ => 0.0,
+    };
+    gauge!(RPC_CIRCUIT_STATE, "endpoint" => endpoint.to_string()).set(val);
 }
