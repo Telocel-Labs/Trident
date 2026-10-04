@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio_retry::strategy::ExponentialBackoff;
-use trident_common::TridentError;
+use trident_common::{RpcErrorKind, TridentError};
 
 pub mod filters;
 
@@ -436,7 +436,20 @@ fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentErr
     if err.is_timeout() {
         metrics::record_rpc_timeout();
         metrics::record_rpc_error(context, "timeout");
-        return TridentError::rpc(anyhow::Error::new(err).context(format!("{context} timed out")));
+        return TridentError::rpc_kind(
+            anyhow::Error::new(err).context(format!("{context} timed out")),
+            RpcErrorKind::Timeout,
+        );
+    }
+    // `reqwest::Error::is_connect()` — a real typed signal, not derived from
+    // the formatted message — distinguishes "never reached the endpoint"
+    // from any other transport failure (issue #658).
+    if err.is_connect() {
+        metrics::record_rpc_error(context, "connection_refused");
+        return TridentError::rpc_kind(
+            anyhow::Error::new(err).context(context),
+            RpcErrorKind::ConnectionRefused,
+        );
     }
     metrics::record_rpc_error(context, "transport");
     TridentError::rpc(anyhow::Error::new(err).context(context))
@@ -564,19 +577,24 @@ impl RpcClient {
         result
     }
 
-    /// Record an error based on its type.
+    /// Record an error based on its typed classification (issue #658).
+    ///
+    /// Reads `TridentError::rpc_error_kind()`, set at the point the error was
+    /// constructed from a real typed signal (`reqwest::Error::is_timeout()`,
+    /// an HTTP status code, a JSON-RPC error body) — never re-derived from the
+    /// formatted `Display` text, so a wording change in the error message
+    /// cannot change which health-scoring deduction is applied.
     fn record_error(&self, url: &str, error: &TridentError) {
-        let error_str = error.to_string();
-        if error_str.contains("timed out") {
-            self.record_timeout(url);
-        } else if error_str.contains("rate limited") {
-            self.record_rate_limited(url);
-        } else if error_str.contains("HTTP 4") || error_str.contains("HTTP 5") {
-            self.record_non_200(url);
-        } else if error_str.contains("RPC error") {
-            self.record_rpc_error(url);
-        } else if error_str.contains("connection refused") {
-            self.record_connection_refused(url);
+        match error.rpc_error_kind() {
+            Some(RpcErrorKind::Timeout) => self.record_timeout(url),
+            Some(RpcErrorKind::RateLimited) => self.record_rate_limited(url),
+            Some(RpcErrorKind::NonSuccessStatus) => self.record_non_200(url),
+            Some(RpcErrorKind::JsonRpcError) => self.record_rpc_error(url),
+            Some(RpcErrorKind::ConnectionRefused) => self.record_connection_refused(url),
+            // No typed classification attached (e.g. a decode failure routed
+            // through the generic `rpc_transport_error` fallback): apply no
+            // deduction rather than guessing from the message text.
+            None => {}
         }
     }
 
@@ -619,15 +637,18 @@ impl RpcClient {
         if !resp.status().is_success() {
             let status = resp.status();
             metrics::record_rpc_error(context, classify_http_status(status));
-            let kind = if status.as_u16() == 429 {
-                "rate limited"
+            let (kind_label, error_kind) = if status.as_u16() == 429 {
+                ("rate limited", RpcErrorKind::RateLimited)
             } else {
-                "non-200"
+                ("non-200", RpcErrorKind::NonSuccessStatus)
             };
-            return Err(TridentError::rpc(anyhow::anyhow!(
-                "{context}: endpoint {url} returned HTTP {} ({kind})",
-                status
-            )));
+            return Err(TridentError::rpc_kind(
+                anyhow::anyhow!(
+                    "{context}: endpoint {url} returned HTTP {} ({kind_label})",
+                    status
+                ),
+                error_kind,
+            ));
         }
 
         let body: JsonRpcResponse<R> = resp
@@ -645,11 +666,10 @@ impl RpcClient {
                 "rpc_error"
             };
             metrics::record_rpc_error(context, error_type);
-            return Err(TridentError::rpc(anyhow::anyhow!(
-                "{context}: RPC error {}: {}",
-                err.code,
-                err.message
-            )));
+            return Err(TridentError::rpc_kind(
+                anyhow::anyhow!("{context}: RPC error {}: {}", err.code, err.message),
+                RpcErrorKind::JsonRpcError,
+            ));
         }
 
         body.result.ok_or_else(|| {
@@ -1071,6 +1091,64 @@ mod tests {
             client.health_scorer().select_best_endpoint(),
             primary.uri(),
             "a single 429 must not fail over to a backup that could be rate-limited too"
+        );
+    }
+
+    /// A JSON-RPC error body scores a -10 deduction via `record_rpc_error`
+    /// (issue #658). Directly exercises the one classification arm that had
+    /// no existing coverage at all.
+    #[tokio::test]
+    async fn json_rpc_error_body_is_scored_as_rpc_error() {
+        let primary = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32000, "message": "internal server error" }
+            })))
+            .mount(&primary)
+            .await;
+
+        let client =
+            RpcClient::with_endpoints(vec![primary.uri()], &fast_timeout_settings()).unwrap();
+
+        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+        assert_eq!(client.health_scorer().get_score(&primary.uri()), 90);
+    }
+
+    /// Classification is driven by the typed [`RpcErrorKind`] attached when
+    /// the error was constructed, not by substring-matching the formatted
+    /// message (issue #658). Two JSON-RPC error responses that differ only in
+    /// their `message` text must be scored identically — proving a wording
+    /// change in the underlying error text cannot change which
+    /// health-scoring deduction is applied.
+    #[tokio::test]
+    async fn error_classification_is_independent_of_the_message_text() {
+        async fn score_after_one_json_rpc_error(message: &str) -> u8 {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32000, "message": message }
+                })))
+                .mount(&server)
+                .await;
+            let client =
+                RpcClient::with_endpoints(vec![server.uri()], &fast_timeout_settings()).unwrap();
+            assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+            client.health_scorer().get_score(&server.uri())
+        }
+
+        let score_a = score_after_one_json_rpc_error("internal server error").await;
+        let score_b =
+            score_after_one_json_rpc_error("a completely different wording for the same failure")
+                .await;
+
+        assert_eq!(
+            score_a, score_b,
+            "classification must not depend on the exact text of the RPC error message"
         );
     }
 
