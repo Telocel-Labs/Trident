@@ -4,10 +4,8 @@ use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
+use tokio::time;
+use sqlx::PgPool;
 
 mod alerting;
 mod config;
@@ -284,6 +282,21 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     }
 }
 
+/// Runs `ensure_future_event_partitions` once per day so the events table's
+/// partition ceiling never catches up with the live chain tip (issue #431).
+async fn maintain_partitions(pool: PgPool) {
+    let mut interval = time::interval(Duration::from_secs(86400)); // Once per day
+    loop {
+        interval.tick().await;
+        if let Err(e) = sqlx::query("SELECT ensure_future_event_partitions(3)")
+            .execute(&pool)
+            .await
+        {
+            tracing::error!(error = %e, "failed to run ensure_future_event_partitions");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -433,6 +446,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "RECONCILE_ENABLED=false: nothing is verifying indexed counts against the RPC source"
         );
     }
+
+    // Daily partition maintenance (issue #431): keeps the events table's
+    // partition ceiling ahead of the live chain tip.
+    tokio::spawn(maintain_partitions(db_pool.clone()));
 
     // Allow the shutdown drain to finish its in-flight work before the process
     // is killed. Kubernetes/Fly terminationGracePeriodSeconds should be ≥ this
