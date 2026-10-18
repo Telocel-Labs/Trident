@@ -38,12 +38,23 @@ type cacheStreamEntry struct {
 
 // contractIDFromStreamMessage extracts contract_id from one stream message's
 // values, or "" if the message is missing, malformed, or carries no
-// contract id — none of which are errors worth logging here: a message this
-// invalidator can't parse just means its cache entries fall back to
-// expiring by TTL instead of being invalidated early, and ws.StartConsumer
-// already logs/handles the same malformed-message cases for the delivery
-// path that actually needs them acknowledged.
+// contract id. It first checks the flat "contract_id" field (as published by
+// the indexer, issue #711), falling back to extracting from the JSON in "data"
+// for backward compatibility.
 func contractIDFromStreamMessage(values map[string]any) string {
+	if raw, ok := values["contract_id"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case []byte:
+			if len(v) > 0 {
+				return string(v)
+			}
+		}
+	}
+
 	raw, ok := values["data"]
 	if !ok {
 		return ""

@@ -44,6 +44,8 @@ fn extract_context(metadata: &tonic::metadata::MetadataMap) -> opentelemetry::Co
     opentelemetry::global::get_text_map_propagator(|prop| prop.extract(&MetadataCarrier(metadata)))
 }
 
+use trident_common::redis_stream_fields;
+
 const REDIS_STREAM_KEY: &str = "trident:events";
 
 /// Default in-flight buffer per subscriber. Bounded so one slow consumer
@@ -323,12 +325,12 @@ async fn run_stream_consumer(
                     for entry in stream_key.ids {
                         last_id = entry.id.clone();
 
-                        if entry_field(&entry, "contract_id") != contract_id {
+                        if entry_field(&entry, redis_stream_fields::CONTRACT_ID) != contract_id {
                             continue;
                         }
 
                         let topics: Vec<String> =
-                            serde_json::from_str(&entry_field(&entry, "topics"))
+                            serde_json::from_str(&entry_field(&entry, redis_stream_fields::TOPICS))
                                 .unwrap_or_default();
 
                         if let Some(ref t0) = topic_0 {
@@ -339,16 +341,16 @@ async fn run_stream_consumer(
 
                         let event = Event {
                             id: String::new(),
-                            contract_id: entry_field(&entry, "contract_id"),
-                            ledger_sequence: entry_field(&entry, "ledger_sequence")
+                            contract_id: entry_field(&entry, redis_stream_fields::CONTRACT_ID),
+                            ledger_sequence: entry_field(&entry, redis_stream_fields::LEDGER_SEQUENCE)
                                 .parse()
                                 .unwrap_or(0),
-                            ledger_timestamp: entry_field(&entry, "ledger_timestamp"),
-                            transaction_hash: entry_field(&entry, "transaction_hash"),
-                            event_index: entry_field(&entry, "event_index").parse().unwrap_or(0),
-                            event_type: entry_field(&entry, "event_type"),
+                            ledger_timestamp: entry_field(&entry, redis_stream_fields::LEDGER_TIMESTAMP),
+                            transaction_hash: entry_field(&entry, redis_stream_fields::TRANSACTION_HASH),
+                            event_index: entry_field(&entry, redis_stream_fields::EVENT_INDEX).parse().unwrap_or(0),
+                            event_type: entry_field(&entry, redis_stream_fields::EVENT_TYPE),
                             topics,
-                            data: entry_field(&entry, "data"),
+                            data: entry_field(&entry, redis_stream_fields::DATA),
                             created_at: String::new(),
                         };
 

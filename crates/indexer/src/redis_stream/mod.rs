@@ -1,7 +1,7 @@
 pub mod relay;
 
 use redis::{streams::StreamMaxlen, AsyncCommands};
-use trident_common::{SorobanEvent, TridentError};
+use trident_common::{redis_stream_fields, SorobanEvent, TridentError};
 
 const STREAM_KEY: &str = "trident:events";
 
@@ -27,17 +27,17 @@ pub async fn publish_event(
     let ledger_sequence = event.ledger_sequence.to_string();
     let event_index = event.event_index.to_string();
     let mut fields: Vec<(&str, &str)> = vec![
-        ("contract_id", event.contract_id.as_str()),
-        ("ledger_sequence", &ledger_sequence),
-        ("ledger_timestamp", event.ledger_timestamp.as_str()),
-        ("transaction_hash", event.transaction_hash.as_str()),
-        ("event_index", &event_index),
-        ("event_type", &event_type),
-        ("topics", &topics),
-        ("data", &data),
+        (redis_stream_fields::CONTRACT_ID, event.contract_id.as_str()),
+        (redis_stream_fields::LEDGER_SEQUENCE, &ledger_sequence),
+        (redis_stream_fields::LEDGER_TIMESTAMP, event.ledger_timestamp.as_str()),
+        (redis_stream_fields::TRANSACTION_HASH, event.transaction_hash.as_str()),
+        (redis_stream_fields::EVENT_INDEX, &event_index),
+        (redis_stream_fields::EVENT_TYPE, &event_type),
+        (redis_stream_fields::TOPICS, &topics),
+        (redis_stream_fields::DATA, &data),
     ];
     if let Some(id) = event_id {
-        fields.push(("event_id", id));
+        fields.push((redis_stream_fields::EVENT_ID, id));
     }
 
     let _: String = conn

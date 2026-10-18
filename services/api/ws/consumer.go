@@ -24,10 +24,105 @@ const groupName = "trident-api"
 // internal references don't all need renaming.
 const streamKey = StreamKey
 
-// streamEntry is the JSON structure expected in each Redis Stream message value.
+// Redis Stream field names published by the indexer (crates/indexer/src/redis_stream/mod.rs).
+// Defined here and checked by contract tests against Rust constants to prevent schema drift.
+const (
+	StreamFieldContractID      = "contract_id"
+	StreamFieldLedgerSequence  = "ledger_sequence"
+	StreamFieldLedgerTimestamp = "ledger_timestamp"
+	StreamFieldTransactionHash = "transaction_hash"
+	StreamFieldEventIndex      = "event_index"
+	StreamFieldEventType       = "event_type"
+	StreamFieldTopics          = "topics"
+	StreamFieldData            = "data"
+	StreamFieldEventID         = "event_id"
+)
+
+// StreamRequiredFields contains the fields that must be present for a standard published event.
+var StreamRequiredFields = []string{
+	StreamFieldContractID,
+	StreamFieldLedgerSequence,
+	StreamFieldLedgerTimestamp,
+	StreamFieldTransactionHash,
+	StreamFieldEventIndex,
+	StreamFieldEventType,
+	StreamFieldTopics,
+	StreamFieldData,
+}
+
+// StreamAllFields contains all known fields that may appear on the event stream.
+var StreamAllFields = []string{
+	StreamFieldContractID,
+	StreamFieldLedgerSequence,
+	StreamFieldLedgerTimestamp,
+	StreamFieldTransactionHash,
+	StreamFieldEventIndex,
+	StreamFieldEventType,
+	StreamFieldTopics,
+	StreamFieldData,
+	StreamFieldEventID,
+}
+
+// streamEntry is the legacy JSON structure expected when "data" held an envelope.
+// Retained for backward compatibility if old messages exist in Redis.
 type streamEntry struct {
 	ContractID string          `json:"contract_id"`
 	Payload    json.RawMessage `json:"payload"`
+}
+
+// redisValString converts a Redis message value to string.
+func redisValString(val any) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return ""
+	}
+}
+
+// parseStreamMessage extracts contract_id and constructs the JSON broadcast payload
+// from a Redis Stream message's Values map.
+//
+// In Trident's indexer, events are published as flat stream fields:
+// contract_id, ledger_sequence, ledger_timestamp, transaction_hash, event_index,
+// event_type, topics, data, and optionally event_id.
+//
+// If a message was published in legacy format (where values["data"] contains JSON
+// with {"contract_id": ..., "payload": ...}), it falls back to parsing that format.
+func parseStreamMessage(values map[string]any) (contractID string, payload []byte, ok bool) {
+	cid := redisValString(values[StreamFieldContractID])
+	if cid != "" {
+		// Indexer flat schema format.
+		// Build the broadcast event payload expected by WebSocket subscribers & SDKs.
+		eventMap := make(map[string]any, len(values))
+		for k, v := range values {
+			eventMap[k] = redisValString(v)
+		}
+		b, err := json.Marshal(eventMap)
+		if err != nil {
+			return "", nil, false
+		}
+		return cid, b, true
+	}
+
+	// Legacy / nested fallback: check if "data" holds a JSON envelope with contract_id.
+	if raw, exists := values[StreamFieldData]; exists {
+		rawStr := redisValString(raw)
+		if rawStr != "" {
+			var entry streamEntry
+			if err := json.Unmarshal([]byte(rawStr), &entry); err == nil && entry.ContractID != "" {
+				p := entry.Payload
+				if len(p) == 0 {
+					p = json.RawMessage(rawStr)
+				}
+				return entry.ContractID, p, true
+			}
+		}
+	}
+
+	return "", nil, false
 }
 
 // StartConsumer begins a Redis Streams consumer group reader. It creates the
@@ -101,44 +196,16 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 
 		for _, stream := range entries {
 			for _, msg := range stream.Messages {
-				// msg.ID is the message id we must XACK after processing.
-				raw, ok := msg.Values["data"]
-				if !ok {
-					slog.Warn("ws: stream message missing 'data' field", "id", msg.ID)
-					// Acknowledge to avoid stuck messages, since we can't process it.
+				cid, payload, valid := parseStreamMessage(msg.Values)
+				if !valid || cid == "" {
+					slog.Warn("ws: stream entry missing contract_id or malformed", "id", msg.ID)
 					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
 						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
 					}
 					continue
 				}
 
-				rawStr, ok := raw.(string)
-				if !ok {
-					slog.Warn("ws: stream message 'data' is not a string", "id", msg.ID)
-					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
-						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
-					}
-					continue
-				}
-
-				var entry streamEntry
-				if err := json.Unmarshal([]byte(rawStr), &entry); err != nil {
-					slog.Warn("ws: failed to unmarshal stream entry", "id", msg.ID, "err", err)
-					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
-						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
-					}
-					continue
-				}
-
-				if entry.ContractID == "" {
-					slog.Warn("ws: stream entry missing contract_id", "id", msg.ID)
-					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
-						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
-					}
-					continue
-				}
-
-				hub.Broadcast(entry.ContractID, entry.Payload)
+				hub.Broadcast(cid, payload)
 
 				// Acknowledge the message after successful broadcast.
 				if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
@@ -172,43 +239,16 @@ func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, consumerNa
 	}
 
 	for _, msg := range messages {
-		raw, ok := msg.Values["data"]
-		if !ok {
-			slog.Warn("ws: recovered message missing 'data'", "id", msg.ID)
-			// Acknowledge to avoid loops.
+		cid, payload, valid := parseStreamMessage(msg.Values)
+		if !valid || cid == "" {
+			slog.Warn("ws: recovered entry missing contract_id or malformed", "id", msg.ID)
 			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
 				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
 			}
 			continue
 		}
 
-		rawStr, ok := raw.(string)
-		if !ok {
-			slog.Warn("ws: recovered message 'data' not string", "id", msg.ID)
-			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
-				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
-			}
-			continue
-		}
-
-		var entry streamEntry
-		if err := json.Unmarshal([]byte(rawStr), &entry); err != nil {
-			slog.Warn("ws: failed to unmarshal recovered entry", "id", msg.ID, "err", err)
-			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
-				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
-			}
-			continue
-		}
-
-		if entry.ContractID == "" {
-			slog.Warn("ws: recovered entry missing contract_id", "id", msg.ID)
-			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
-				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
-			}
-			continue
-		}
-
-		hub.Broadcast(entry.ContractID, entry.Payload)
+		hub.Broadcast(cid, payload)
 		if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
 			slog.Warn("ws: failed to XACK recovered message", "id", msg.ID, "err", err)
 		}
