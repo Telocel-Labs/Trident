@@ -21,7 +21,6 @@ import (
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/Depo-dev/trident/services/api/ws"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -284,7 +283,7 @@ type indexerStatsRow struct {
 	lastPollAt         *time.Time
 }
 
-func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) {
+func queryIndexerStats(ctx context.Context, db DBPool, network string) (indexerStatsRow, error) {
 	var row indexerStatsRow
 	err := db.QueryRow(ctx,
 		`SELECT last_ledger_indexed,
@@ -293,7 +292,8 @@ func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) 
 		        poll_duration_ms,
 		        last_poll_at
 		   FROM system_state
-		  WHERE key = 'latest_ledger_cursor'`,
+		  WHERE key = $1`,
+		CursorKey(network),
 	).Scan(
 		&row.lastLedgerIndexed,
 		&row.eventsIndexedTotal,
@@ -301,7 +301,7 @@ func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) 
 		&row.pollDurationMs,
 		&row.lastPollAt,
 	)
-	if err != nil && err != pgx.ErrNoRows {
+	if err != nil {
 		return row, err
 	}
 	return row, nil
@@ -366,7 +366,8 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		stats, err := queryIndexerStats(ctx, db)
+		network := middleware.NetworkFromContext(r.Context())
+		stats, err := queryIndexerStats(ctx, db, network)
 		if err != nil {
 			slog.Error("stats: DB query failed", "err", err)
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database query failed")
@@ -416,7 +417,7 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 			AvgPollDurationMs:   stats.pollDurationMs,
 			LastPollAt:          lastPollAtStr,
 			Status:              status,
-			Network:             os.Getenv("NETWORK"),
+			Network:             network,
 		}
 
 		httpStatus := http.StatusOK

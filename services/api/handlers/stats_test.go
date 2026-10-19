@@ -113,6 +113,16 @@ func TestIndexerStats_NullLastPollAt_IsStalled(t *testing.T) {
 	}
 }
 
+func TestIndexerStats_MissingRow_Returns503(t *testing.T) {
+	resetChainTipCache()
+	rec := httptest.NewRecorder()
+	IndexerStats(&mockStatsDB{scanErr: pgx.ErrNoRows}).ServeHTTP(rec, statsReq())
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing row: want 503, got %d", rec.Code)
+	}
+}
+
 func TestIndexerStats_Healthy_Returns200(t *testing.T) {
 	now := time.Now()
 	ledger := int64(1000)
@@ -315,14 +325,14 @@ func TestIndexerStats_PoolExhausted_DegradesGracefully(t *testing.T) {
 	held.Release()
 	_, err = pool.Exec(ctx,
 		`INSERT INTO system_state (key, value, last_poll_at)
-		 VALUES ('latest_ledger_cursor', '1', NOW())
+		 VALUES ('latest_ledger_cursor:testnet', '1', NOW())
 		 ON CONFLICT (key) DO UPDATE SET last_poll_at = NOW()`,
 	)
 	if err != nil {
 		t.Fatalf("seed system_state: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "DELETE FROM system_state WHERE key = 'latest_ledger_cursor'")
+		_, _ = pool.Exec(context.Background(), "DELETE FROM system_state WHERE key = 'latest_ledger_cursor:testnet'")
 	})
 
 	rec2 := httptest.NewRecorder()
