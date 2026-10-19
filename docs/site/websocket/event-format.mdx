@@ -58,6 +58,16 @@ Events are delivered in **ledger sequence order**. Within a ledger, events are d
 
 ---
 
+## Delivery and replication model
+
+Trident's WebSocket delivery uses a **fan-out broadcast architecture**:
+- **Independent stream cursors (`XREAD`)**: In horizontally scaled deployments (e.g. multi-replica Go API instances behind a load balancer), each API replica maintains its own independent read position on the Redis event stream (`trident:events`).
+- **Full event fan-out**: Every connected WebSocket client receives every matching event regardless of which replica it is connected to. Replicas do not load-balance or split stream entries among themselves.
+- **Resume semantics**: Each replica initializes its read cursor at the stream tail (`$`) or latest entry ID, advancing monotonically as events arrive. On client reconnection, subscriptions are re-established, and clients can backfill any missed historical range via `GET /v1/events` or replay streams.
+- **Distinction from consumer groups**: Redis consumer groups (`XREADGROUP`) are strictly reserved for work-distribution tasks (such as at-most-once webhook deliveries in `trident-webhooks`), where each message must only be processed by one worker. In contrast, live WebSocket and GraphQL streaming use fan-out reads so that all replicas observe and broadcast all events.
+
+---
+
 ## Other message types
 
 In addition to `"event"` messages, the server may send:

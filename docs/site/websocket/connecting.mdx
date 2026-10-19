@@ -66,6 +66,15 @@ In self-hosted mode, the global cap is set by `MAX_WS_CONNECTIONS` (default: 100
 
 ---
 
+## Horizontal scaling & replica fan-out
+
+When running multiple API replicas behind a load balancer, Trident ensures full event broadcast across all instances:
+- Each replica runs an independent stream reader (`XREAD`) against Redis, receiving every published event.
+- Clients connected to any replica receive all matching events for their subscribed contracts.
+- Event broadcast is never partitioned or load-balanced across replicas (unlike webhook worker consumer groups).
+
+---
+
 ## Next steps
 
 Once connected, send a [Subscription frame](/websocket/subscription-format) to begin receiving events.
