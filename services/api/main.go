@@ -581,7 +581,6 @@ type retentionConfig struct {
 	AuditLogDays          int
 	ParseErrorsDays       int
 	WebhookDeliveriesDays int
-	SorobanEventsDays     int
 	EventOutboxDays       int
 }
 
@@ -590,11 +589,6 @@ func loadRetentionConfig() retentionConfig {
 		AuditLogDays:          envInt("RETENTION_AUDIT_LOG_DAYS", 90),
 		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
 		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
-		// Highest-volume table; unlike audit_log/parse_errors/webhook_deliveries
-		// it previously defaulted to 0 (disabled), letting it grow unbounded
-		// with growing indexes/WAL/vacuum pressure unless an operator opted in
-		// explicitly (#645). 90 days matches the audit log's window.
-		SorobanEventsDays: envInt("RETENTION_SOROBAN_EVENTS_DAYS", 90),
 		// event_outbox is the fastest-growing unbounded table (issue #604):
 		// rows are only ever flipped published = TRUE, never deleted, and
 		// each carries a full JSONB copy of the event. 7 days is generous
@@ -614,8 +608,8 @@ func envInt(key string, defaultVal int) int {
 	return defaultVal
 }
 
-// startRetentionJob runs a periodic retention cleanup loop (issue #245).
-// It replaces the ad-hoc audit cleanup with a configurable per-table policy.
+// startRetentionJob runs a periodic retention cleanup loop (issues #245, #730).
+// Event retention is handled exclusively by partition pruning in the indexer.
 func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 	cfg := loadRetentionConfig()
 	interval := 6 * time.Hour
@@ -634,27 +628,23 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 				query string
 			}{
 				{"audit_log", cfg.AuditLogDays,
-					`DELETE FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
-						SELECT ctid FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					`DELETE FROM audit_log WHERE id IN (
+						SELECT id FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
 				{"parse_errors", cfg.ParseErrorsDays,
-					`DELETE FROM parse_errors WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
-						SELECT ctid FROM parse_errors WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					`DELETE FROM parse_errors WHERE id IN (
+						SELECT id FROM parse_errors WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
 				{"webhook_deliveries", cfg.WebhookDeliveriesDays,
-					`DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
-						SELECT ctid FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
-					)`},
-				{"soroban_events", cfg.SorobanEventsDays,
-					`DELETE FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
-						SELECT ctid FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					`DELETE FROM webhook_deliveries WHERE id IN (
+						SELECT id FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
 				// event_outbox additionally requires published = TRUE: an
 				// unpublished row must never be deleted regardless of age,
 				// since the relay has not yet delivered it (issue #604).
 				{"event_outbox", cfg.EventOutboxDays,
-					`DELETE FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
-						SELECT ctid FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					`DELETE FROM event_outbox WHERE seq IN (
+						SELECT seq FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
 			}
 

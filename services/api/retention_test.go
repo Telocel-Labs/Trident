@@ -13,7 +13,6 @@ func TestLoadRetentionConfig_Defaults(t *testing.T) {
 		"RETENTION_AUDIT_LOG_DAYS",
 		"RETENTION_PARSE_ERRORS_DAYS",
 		"RETENTION_WEBHOOK_DELIVERIES_DAYS",
-		"RETENTION_SOROBAN_EVENTS_DAYS",
 		"RETENTION_EVENT_OUTBOX_DAYS",
 	} {
 		t.Setenv(key, "")
@@ -31,13 +30,7 @@ func TestLoadRetentionConfig_Defaults(t *testing.T) {
 	if cfg.WebhookDeliveriesDays != 30 {
 		t.Errorf("WebhookDeliveriesDays = %d, want 30", cfg.WebhookDeliveriesDays)
 	}
-	// #645: previously defaulted to 0 (disabled), leaving the
-	// highest-volume table to grow unbounded unless an operator opted in.
-	if cfg.SorobanEventsDays != 90 {
-		t.Errorf("SorobanEventsDays = %d, want 90", cfg.SorobanEventsDays)
-	}
-	// #604: event_outbox is the fastest-growing unbounded table, so unlike
-	// soroban_events it defaults to enabled rather than opt-in.
+	// #604: event_outbox is the fastest-growing unbounded table, defaults to enabled.
 	if cfg.EventOutboxDays != 7 {
 		t.Errorf("EventOutboxDays = %d, want 7", cfg.EventOutboxDays)
 	}

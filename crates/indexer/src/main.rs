@@ -287,12 +287,14 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 }
 
 /// Runs `ensure_future_event_partitions` once per day so the events table's
-/// partition ceiling never catches up with the live chain tip (issue #431).
-async fn maintain_partitions(pool: PgPool) {
+/// partition ceiling never catches up with the live chain tip (issues #431, #728).
+async fn maintain_partitions(pool: PgPool, network: String) {
     let mut interval = time::interval(Duration::from_secs(86400)); // Once per day
     loop {
         interval.tick().await;
-        if let Err(e) = sqlx::query("SELECT ensure_future_event_partitions(3)")
+        let cursor = crate::db::get_cursor(&pool, &network).await.unwrap_or(0);
+        if let Err(e) = sqlx::query("SELECT ensure_future_event_partitions($1, 3)")
+            .bind(cursor as i64)
             .execute(&pool)
             .await
         {
@@ -301,16 +303,22 @@ async fn maintain_partitions(pool: PgPool) {
     }
 }
 
-/// Prunes `soroban_events` rows older than `days` once per day (issue #482).
+/// Prunes `soroban_events` rows older than `days` once per day (issues #482, #729).
 async fn run_retention_job(pool: PgPool, days: u64) {
     let mut interval = time::interval(Duration::from_secs(86400));
     loop {
         interval.tick().await;
-        match sqlx::query("SELECT prune_soroban_events($1)")
-            .bind(days as i64)
-            .execute(&pool)
-            .await
-        {
+        let result = async {
+            let mut conn = pool.acquire().await?;
+            sqlx::query("SET statement_timeout = '300s'").execute(&mut *conn).await?;
+            sqlx::query("SELECT prune_soroban_events($1)")
+                .bind(days as i64)
+                .execute(&mut *conn)
+                .await?;
+            Ok::<(), sqlx::Error>(())
+        }.await;
+
+        match result {
             Ok(_) => metrics::record_retention_job_success(),
             Err(e) => {
                 tracing::error!(error = %e, "retention job failed");
@@ -470,9 +478,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Daily partition maintenance (issue #431): keeps the events table's
+    // Daily partition maintenance (issues #431, #728): keeps the events table's
     // partition ceiling ahead of the live chain tip.
-    tokio::spawn(maintain_partitions(db_pool.clone()));
+    tokio::spawn(maintain_partitions(db_pool.clone(), cfg.network.clone()));
 
     // Daily event-retention pruning (issue #482), opt-in via EVENT_RETENTION_DAYS.
     if let Some(days) = cfg.event_retention_days {

@@ -249,6 +249,22 @@ impl Streamer {
                                     index_from,
                                     cursor - 1,
                                 );
+                                if let Err(e) = crate::db::enqueue_backfill_job(
+                                    &self.db,
+                                    crate::db::LedgerGap {
+                                        from_ledger: index_from as u64,
+                                        to_ledger: cursor.saturating_sub(1),
+                                    },
+                                    &self.config.network,
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        error = %e,
+                                        contract_id = id,
+                                        "failed to enqueue backfill job for historical contract"
+                                    );
+                                }
                             }
                         }
                     }

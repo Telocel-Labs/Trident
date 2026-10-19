@@ -22,12 +22,13 @@ type ContractConfig struct {
 
 // ContractResponse is the JSON representation of an indexed_contracts row.
 type ContractResponse struct {
-	ID         string  `json:"id"`
-	ContractID string  `json:"contract_id"`
-	Network    *string `json:"network,omitempty"`
-	Label      *string `json:"label,omitempty"`
-	IndexFrom  int64   `json:"index_from"`
-	CreatedAt  string  `json:"created_at"`
+	ID            string  `json:"id"`
+	ContractID    string  `json:"contract_id"`
+	Network       *string `json:"network,omitempty"`
+	Label         *string `json:"label,omitempty"`
+	IndexFrom     int64   `json:"index_from"`
+	BackfillJobID *string `json:"backfill_job_id,omitempty"`
+	CreatedAt     string  `json:"created_at"`
 }
 
 // CreateContractRequest is the JSON body for POST /v1/admin/contracts.
@@ -111,13 +112,41 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 			return
 		}
 
+		var backfillJobID *string
+		if req.IndexFrom > 0 {
+			network := req.Network
+			if network == "" {
+				network = "testnet"
+			}
+			var cursorSeq int64
+			errCursor := cfg.DB.QueryRow(ctx,
+				`SELECT COALESCE(NULLIF(value, '')::bigint, 0) FROM system_state WHERE key = $1`,
+				"latest_ledger_cursor:"+network,
+			).Scan(&cursorSeq)
+			if errCursor == nil && cursorSeq > req.IndexFrom {
+				var jid string
+				errJob := cfg.DB.QueryRow(ctx,
+					`INSERT INTO backfill_jobs (from_ledger, to_ledger, network)
+					 VALUES ($1, $2, $3)
+					 ON CONFLICT (network, from_ledger, to_ledger) WHERE status IN ('pending', 'running')
+					 DO UPDATE SET created_at = EXCLUDED.created_at
+					 RETURNING id::text`,
+					req.IndexFrom, cursorSeq-1, network,
+				).Scan(&jid)
+				if errJob == nil {
+					backfillJobID = &jid
+				}
+			}
+		}
+
 		writeJSON(w, http.StatusCreated, ContractResponse{
-			ID:         id,
-			ContractID: req.ContractID,
-			Network:    strPtrOrNil(req.Network),
-			Label:      strPtrOrNil(req.Label),
-			IndexFrom:  req.IndexFrom,
-			CreatedAt:  createdAt.Format(time.RFC3339),
+			ID:            id,
+			ContractID:    req.ContractID,
+			Network:       strPtrOrNil(req.Network),
+			Label:         strPtrOrNil(req.Label),
+			IndexFrom:     req.IndexFrom,
+			BackfillJobID: backfillJobID,
+			CreatedAt:     createdAt.Format(time.RFC3339),
 		})
 	}
 }
