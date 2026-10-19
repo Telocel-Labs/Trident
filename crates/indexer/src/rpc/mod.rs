@@ -161,9 +161,35 @@ where
     })
 }
 
+fn opt_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OptStringOrNumber {
+        String(String),
+        Number(u64),
+    }
+
+    let opt = Option::<OptStringOrNumber>::deserialize(deserializer)?;
+    Ok(opt.map(|v| match v {
+        OptStringOrNumber::String(s) => s,
+        OptStringOrNumber::Number(n) => n.to_string(),
+    }))
+}
+
+/// Parse the ledger sequence number from a stellar-rpc cursor (issue #722).
+///
+/// In stellar-rpc, pagination cursors are typically formatted as
+/// `<ledger_seq>-<event_index>` or `<ledger_seq>` (with optional leading zeros).
+pub fn parse_ledger_from_cursor(cursor: &str) -> Option<u64> {
+    cursor.split('-').next()?.trim().parse::<u64>().ok()
+}
+
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RawEvent {
     #[serde(rename = "type")]
     pub event_type: String,
@@ -215,10 +241,11 @@ impl RawEvent {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EventsPage {
     pub events: Vec<RawEvent>,
     pub latest_ledger: u64,
+    pub cursor: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +329,8 @@ struct GetEventsResult {
     events: Vec<RawEvent>,
     #[serde(rename = "latestLedger")]
     latest_ledger: u64,
+    #[serde(default, deserialize_with = "opt_string_or_number")]
+    cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -774,6 +803,7 @@ impl RpcClient {
         Ok(EventsPage {
             events: result.events,
             latest_ledger: result.latest_ledger,
+            cursor: result.cursor,
         })
     }
 
@@ -983,6 +1013,37 @@ mod tests {
             .expect("event must deserialize");
         assert_eq!(ev.page_cursor(), "0000000000000000000-0000000000");
         assert_ne!(ev.page_cursor(), ev.id);
+    }
+
+    #[test]
+    fn parse_ledger_from_cursor_parses_various_formats() {
+        assert_eq!(parse_ledger_from_cursor("0000000000000001000-0000000000"), Some(1000));
+        assert_eq!(parse_ledger_from_cursor("0000000000000000007-0000000001"), Some(7));
+        assert_eq!(parse_ledger_from_cursor("12345-0"), Some(12345));
+        assert_eq!(parse_ledger_from_cursor("54321"), Some(54321));
+        assert_eq!(parse_ledger_from_cursor(""), None);
+        assert_eq!(parse_ledger_from_cursor("-1"), None);
+        assert_eq!(parse_ledger_from_cursor("invalid"), None);
+    }
+
+    #[test]
+    fn get_events_result_deserializes_top_level_cursor() {
+        let json = serde_json::json!({
+            "events": [],
+            "latestLedger": 1000,
+            "cursor": "0000000000000001000-0000000000"
+        });
+        let res: GetEventsResult = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(res.latest_ledger, 1000);
+        assert_eq!(res.cursor.as_deref(), Some("0000000000000001000-0000000000"));
+
+        let json_no_cursor = serde_json::json!({
+            "events": [],
+            "latestLedger": 500
+        });
+        let res2: GetEventsResult = serde_json::from_value(json_no_cursor).expect("must deserialize");
+        assert_eq!(res2.latest_ledger, 500);
+        assert_eq!(res2.cursor, None);
     }
 
     #[test]

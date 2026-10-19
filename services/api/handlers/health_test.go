@@ -215,6 +215,25 @@ func TestReady_NilDependencies_Returns503(t *testing.T) {
 	}
 }
 
+// TestReady_MissingCursorRow_Returns503 verifies that when the cursor row in
+// system_state is missing (ErrNoRows), checkPostgres fails and GET /v1/ready
+// returns 503 degraded instead of 200 with null indexer_lag (issue #716).
+func TestReady_MissingCursorRow_Returns503(t *testing.T) {
+	db := &healthMockDB{scanErr: pgx.ErrNoRows}
+	rdb := fakeRedisPinger{}
+	grpcClient := &fakeEventsClient{
+		listEvents: func(_ context.Context, _ *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return &gen.ListEventsResponse{}, nil
+		},
+	}
+
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, rdb, grpcClient).ServeHTTP(rr, req)
+
+	assertDegraded(t, rr, "postgres")
+}
+
 func assertDegraded(t *testing.T, rr *httptest.ResponseRecorder, failingCheck string) {
 	t.Helper()
 	if rr.Code != http.StatusServiceUnavailable {

@@ -652,6 +652,37 @@ pub async fn get_latest_storage_value(
     Ok(row.and_then(|(v,)| v))
 }
 
+/// Fetch the latest storage value for multiple keys in a single query (issue #724).
+pub async fn get_latest_storage_values(
+    pool: &PgPool,
+    contract_id: &str,
+    network: &str,
+    storage_keys: &[String],
+) -> Result<std::collections::HashMap<String, Option<serde_json::Value>>, TridentError> {
+    if storage_keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let rows: Vec<(String, Option<serde_json::Value>)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT ON (storage_key) storage_key, value_json
+        FROM contract_storage_snapshots
+        WHERE contract_id = $1 AND network = $2 AND storage_key = ANY($3)
+        ORDER BY storage_key, ledger_sequence DESC
+        "#,
+    )
+    .bind(contract_id)
+    .bind(network)
+    .bind(storage_keys)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("get_latest_storage_values"))
+    })?;
+
+    Ok(rows.into_iter().collect())
+}
+
 /// One contract-storage snapshot row, ready to persist (issue #270).
 pub struct StorageSnapshotRow<'a> {
     pub contract_id: &'a str,
@@ -986,7 +1017,7 @@ pub async fn close_filled_backfill_jobs(
 /// same `system_state` table and schema — migration 0033 copies the
 /// pre-existing single row's value into the namespaced key for whichever
 /// network the deployment was already running, so no position is lost.
-fn cursor_key(network: &str) -> String {
+pub fn cursor_key(network: &str) -> String {
     format!("latest_ledger_cursor:{network}")
 }
 
@@ -1854,6 +1885,14 @@ mod tests {
     use super::*;
     use serde_json::json;
     use trident_common::{EventType, SorobanEvent};
+
+    #[test]
+    fn cursor_key_format_matches_contract() {
+        assert_eq!(cursor_key("mainnet"), "latest_ledger_cursor:mainnet");
+        assert_eq!(cursor_key("testnet"), "latest_ledger_cursor:testnet");
+        assert_eq!(cursor_key("futurenet"), "latest_ledger_cursor:futurenet");
+        assert_eq!(cursor_key("sandbox"), "latest_ledger_cursor:sandbox");
+    }
 
     fn make_event(contract_id: &str, ledger_sequence: u64, event_index: u32) -> SorobanEvent {
         SorobanEvent {

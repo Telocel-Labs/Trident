@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
@@ -108,7 +109,8 @@ func Ready(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.Han
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(parentCtx, healthCheckTimeout)
 			defer cancel()
-			lastLedger, pgErr = checkPostgres(ctx, db)
+			network := middleware.NetworkFromContext(parentCtx)
+			lastLedger, pgErr = checkPostgres(ctx, db, network)
 		}()
 
 		go func() {
@@ -161,10 +163,9 @@ func resultString(err error) string {
 }
 
 // checkPostgres pings the pool then queries system_state for the indexer's
-// last processed ledger. Returns (nil, errNoDatabase) when db is nil,
-// (nil, err) on ping/query failure, (&ledger, nil) on success, or
-// (nil, nil) when the system_state row doesn't exist yet (ErrNoRows).
-func checkPostgres(ctx context.Context, db DBPool) (*int64, error) {
+// last processed ledger on the given network. Returns (nil, errNoDatabase) when db is nil,
+// or (nil, err) on ping/query failure (including ErrNoRows).
+func checkPostgres(ctx context.Context, db DBPool, network string) (*int64, error) {
 	if db == nil {
 		return nil, errNoDatabase
 	}
@@ -175,9 +176,10 @@ func checkPostgres(ctx context.Context, db DBPool) (*int64, error) {
 	}
 	var lastLedger *int64
 	row := db.QueryRow(ctx,
-		`SELECT last_ledger_indexed FROM system_state WHERE key = 'latest_ledger_cursor'`,
+		`SELECT last_ledger_indexed FROM system_state WHERE key = $1`,
+		CursorKey(network),
 	)
-	if err := row.Scan(&lastLedger); err != nil && err != pgx.ErrNoRows {
+	if err := row.Scan(&lastLedger); err != nil {
 		return nil, err
 	}
 	return lastLedger, nil

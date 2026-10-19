@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -91,9 +92,11 @@ func InternalStatus() http.HandlerFunc {
 
 			// Indexer lag
 			if statusDeps.db != nil {
+				network := middleware.NetworkFromContext(ctx)
 				var lastLedger int64
 				row := statusDeps.db.QueryRow(ctx,
-					`SELECT COALESCE(CAST(value AS BIGINT), 0) FROM system_state WHERE key = 'latest_ledger_cursor'`,
+					`SELECT COALESCE(CAST(value AS BIGINT), 0) FROM system_state WHERE key = $1`,
+					CursorKey(network),
 				)
 				_ = row.Scan(&lastLedger)
 				if tip := globalChainTipCache.get(ctx); tip != nil {

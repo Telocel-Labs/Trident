@@ -4062,6 +4062,7 @@ dependencies = [
  "chrono",
  "clap",
  "console-subscriber",
+ "futures",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",

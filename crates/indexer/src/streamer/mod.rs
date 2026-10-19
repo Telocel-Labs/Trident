@@ -969,6 +969,31 @@ impl Streamer {
             self.last_chain_tip = page.latest_ledger;
 
             if page.events.is_empty() {
+                // If the response carries a cursor marking how far the server scanned,
+                // persist progress through empty ranges so lag reflects scanned progress
+                // rather than staying stuck at the last-event ledger (issue #722).
+                if let Some(scanned) = page
+                    .cursor
+                    .as_deref()
+                    .and_then(crate::rpc::parse_ledger_from_cursor)
+                {
+                    if scanned > *cursor {
+                        commit_page_with_fallback(
+                            &self.db,
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            &self.config.network,
+                            Some(scanned),
+                            None,
+                            self.config.db_batch_size,
+                        )
+                        .await?;
+                        *cursor = scanned;
+                        metrics::set_ledger_lag(page.latest_ledger.saturating_sub(*cursor) as i64);
+                    }
+                }
                 break;
             }
 
@@ -1126,23 +1151,46 @@ impl Streamer {
             let mut ledger_timestamp = String::new();
             let mut ledger_sequence = 0u64;
 
+            let is_ledger_boundary = page.events.len() < self.config.max_events_per_poll as usize;
+
             if let Some(last) = page.events.last() {
                 let seq: u64 = last.ledger.parse().unwrap_or(*cursor);
-                if seq > *cursor {
-                    next_cursor = Some(seq);
-                    ledger_sequence = seq;
+                // Advance cursor to last_ledger - 1 unless the page is known to end on a ledger boundary (issue #721).
+                let mut advance_to = if is_ledger_boundary {
+                    seq
+                } else {
+                    seq.saturating_sub(1)
+                };
+
+                // If this page ended on a ledger boundary and the RPC returned a cursor
+                // that scanned beyond seq, advance to the scanned progress (issue #722).
+                if is_ledger_boundary {
+                    if let Some(scanned) = page
+                        .cursor
+                        .as_deref()
+                        .and_then(crate::rpc::parse_ledger_from_cursor)
+                    {
+                        if scanned > advance_to {
+                            advance_to = scanned;
+                        }
+                    }
+                }
+
+                if advance_to > *cursor {
+                    next_cursor = Some(advance_to);
+                    ledger_sequence = advance_to;
                     ledger_timestamp = last.ledger_closed_at.clone();
 
                     // Fetch the real ledger hash from getLedgers RPC.
                     // Non-critical: log a warning on failure, store empty string.
-                    ledger_hash = match self.rpc.get_ledger(seq).await {
+                    ledger_hash = match self.rpc.get_ledger(advance_to).await {
                         Ok(Some(h)) => h,
                         Ok(None) => {
-                            tracing::warn!(seq, "getLedgers returned no ledger for sequence");
+                            tracing::warn!(seq = advance_to, "getLedgers returned no ledger for sequence");
                             String::new()
                         }
                         Err(e) => {
-                            tracing::warn!(seq, error = %e, "getLedgers failed, storing empty hash");
+                            tracing::warn!(seq = advance_to, error = %e, "getLedgers failed, storing empty hash");
                             String::new()
                         }
                     };
@@ -1184,30 +1232,63 @@ impl Streamer {
                 })
                 .collect();
 
-            // Per-invocation fee + declared-resource metering for tracked
-            // contracts (issue #266). Every event in `page_events` already
-            // passed the allowlist check above, so this never runs unbounded
-            // index-all fan-out (see docs/contract-invocation-metering.md).
-            //
-            // Two passes over `page_events`: fetching (pass 1) mutates
-            // `tx_metrics`, and building the rows (pass 2) borrows from it —
-            // keeping those separate avoids holding a long-lived immutable
-            // borrow into the map across a later mutable insert.
-            let mut tx_metrics: std::collections::HashMap<
-                &str,
-                Option<crate::parser::invocation_metrics::InvocationMetrics>,
-            > = std::collections::HashMap::new();
-            let mut invocation_metrics: Vec<db::InvocationMetricRow<'_>> = Vec::new();
+            // Commit events first: events, outbox, cursor, and ledger metadata (issue #724).
+            // Enrichment (invocation metrics, snapshots, metadata) runs after the commit,
+            // so commit latency is independent of enrichment RPC latency.
+            commit_page_with_fallback(
+                &self.db,
+                &page_events,
+                &page_tokens,
+                &[],
+                &[],
+                &self.config.network,
+                next_cursor,
+                next_cursor.map(|_| db::LedgerMeta {
+                    sequence: ledger_sequence,
+                    hash: &ledger_hash,
+                    timestamp: &ledger_timestamp,
+                    event_count: events_in_page,
+                }),
+                self.config.db_batch_size,
+            )
+            .instrument(tracing::info_span!(
+                "db_commit_page",
+                events = page_events.len()
+            ))
+            .await?;
+
+            if let Some(seq) = next_cursor {
+                *cursor = seq;
+            }
+
+            // Invocation metrics: run calls concurrently with a bounded buffer_unordered (issue #724)
             if self.contract_filter.is_some() {
+                let mut unique_hashes: Vec<String> = Vec::new();
+                let mut seen_hashes: HashSet<String> = HashSet::new();
                 for event in &page_events {
-                    if !tx_metrics.contains_key(event.transaction_hash.as_str()) {
-                        let decoded = self.fetch_invocation_metrics(&event.transaction_hash).await;
-                        tx_metrics.insert(event.transaction_hash.as_str(), decoded);
+                    if seen_hashes.insert(event.transaction_hash.clone()) {
+                        unique_hashes.push(event.transaction_hash.clone());
                     }
                 }
 
-                let mut seen_pairs: std::collections::HashSet<(&str, &str)> =
-                    std::collections::HashSet::new();
+                use futures::stream::{self, StreamExt};
+                let concurrency = 16;
+                let streamer = &*self;
+                let fetched_results: Vec<(String, Option<crate::parser::invocation_metrics::InvocationMetrics>)> =
+                    stream::iter(unique_hashes)
+                        .map(|tx_hash| async move {
+                            let decoded = streamer.fetch_invocation_metrics(&tx_hash).await;
+                            (tx_hash, decoded)
+                        })
+                        .buffer_unordered(concurrency)
+                        .collect()
+                        .await;
+
+                let tx_metrics: HashMap<String, Option<crate::parser::invocation_metrics::InvocationMetrics>> =
+                    fetched_results.into_iter().collect();
+
+                let mut seen_pairs: HashSet<(&str, &str)> = HashSet::new();
+                let mut invocation_metrics: Vec<db::InvocationMetricRow<'_>> = Vec::new();
                 for event in &page_events {
                     let pair = (event.contract_id.as_str(), event.transaction_hash.as_str());
                     if !seen_pairs.insert(pair) {
@@ -1223,18 +1304,25 @@ impl Streamer {
                         });
                     }
                 }
+
+                if !invocation_metrics.is_empty() {
+                    for chunk in invocation_metrics.chunks(self.config.db_batch_size.max(1)) {
+                        if let Err(e) = db::insert_invocation_metrics_batch(
+                            &self.db,
+                            &self.config.network,
+                            chunk,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, "Failed to persist invocation metrics batch");
+                        }
+                    }
+                }
             }
 
-            // Contract storage snapshots (issue #270): bounded to tracked
-            // contracts already classified as SEP-41 tokens (issue #269), and
-            // only for holder addresses that moved funds in this page — never
-            // a scan of arbitrary storage.
-            let mut owned_storage_snapshots: Vec<OwnedStorageSnapshot> = Vec::new();
+            // Storage snapshots: batch storage lookups into one query (issue #724)
             if !self.token_contracts.is_empty() {
-                let mut holders_by_contract: std::collections::HashMap<
-                    &str,
-                    std::collections::HashSet<&str>,
-                > = std::collections::HashMap::new();
+                let mut holders_by_contract: HashMap<&str, HashSet<&str>> = HashMap::new();
                 for (index, token) in &page_tokens {
                     let contract_id = page_events[*index].contract_id.as_str();
                     if !self.token_contracts.contains(contract_id) {
@@ -1254,6 +1342,8 @@ impl Streamer {
                 } else {
                     *cursor
                 };
+
+                let mut owned_storage_snapshots: Vec<OwnedStorageSnapshot> = Vec::new();
                 for (contract_id, holders) in holders_by_contract {
                     let holder_list: Vec<String> =
                         holders.into_iter().map(str::to_string).collect();
@@ -1271,63 +1361,58 @@ impl Streamer {
                         }
                     };
 
-                    for obs in observations {
-                        let last = db::get_latest_storage_value(
+                    if !observations.is_empty() {
+                        let storage_keys: Vec<String> = observations
+                            .iter()
+                            .map(|obs| obs.storage_key.clone())
+                            .collect();
+                        let latest_values = db::get_latest_storage_values(
                             &self.db,
                             contract_id,
                             &self.config.network,
-                            &obs.storage_key,
+                            &storage_keys,
                         )
                         .await
-                        .unwrap_or(None);
+                        .unwrap_or_default();
 
-                        if last != obs.value_json {
-                            owned_storage_snapshots.push(OwnedStorageSnapshot {
-                                contract_id: contract_id.to_string(),
-                                storage_key: obs.storage_key,
-                                key_json: obs.key_json,
-                                value_json: obs.value_json,
-                                ledger_sequence: snapshot_ledger,
-                            });
+                        for obs in observations {
+                            let last = latest_values.get(&obs.storage_key).cloned().flatten();
+                            if last != obs.value_json {
+                                owned_storage_snapshots.push(OwnedStorageSnapshot {
+                                    contract_id: contract_id.to_string(),
+                                    storage_key: obs.storage_key,
+                                    key_json: obs.key_json,
+                                    value_json: obs.value_json,
+                                    ledger_sequence: snapshot_ledger,
+                                });
+                            }
                         }
                     }
                 }
-            }
-            let storage_snapshots: Vec<db::StorageSnapshotRow<'_>> = owned_storage_snapshots
-                .iter()
-                .map(|s| db::StorageSnapshotRow {
-                    contract_id: &s.contract_id,
-                    storage_key: &s.storage_key,
-                    key_json: &s.key_json,
-                    value_json: s.value_json.as_ref(),
-                    ledger_sequence: s.ledger_sequence,
-                })
-                .collect();
 
-            commit_page_with_fallback(
-                &self.db,
-                &page_events,
-                &page_tokens,
-                &invocation_metrics,
-                &storage_snapshots,
-                &self.config.network,
-                next_cursor,
-                next_cursor.map(|_| db::LedgerMeta {
-                    sequence: ledger_sequence,
-                    hash: &ledger_hash,
-                    timestamp: &ledger_timestamp,
-                    event_count: events_in_page,
-                }),
-                self.config.db_batch_size,
-            )
-            .instrument(tracing::info_span!(
-                "db_commit_page",
-                events = page_events.len()
-            ))
-            .await?;
-
-            if let Some(seq) = next_cursor {
-                *cursor = seq;
+                if !owned_storage_snapshots.is_empty() {
+                    let storage_snapshots: Vec<db::StorageSnapshotRow<'_>> = owned_storage_snapshots
+                        .iter()
+                        .map(|s| db::StorageSnapshotRow {
+                            contract_id: &s.contract_id,
+                            storage_key: &s.storage_key,
+                            key_json: &s.key_json,
+                            value_json: s.value_json.as_ref(),
+                            ledger_sequence: s.ledger_sequence,
+                        })
+                        .collect();
+                    for chunk in storage_snapshots.chunks(self.config.db_batch_size.max(1)) {
+                        if let Err(e) = db::insert_storage_snapshots_batch(
+                            &self.db,
+                            &self.config.network,
+                            chunk,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, "Failed to persist storage snapshots batch");
+                        }
+                    }
+                }
             }
 
             // Resolve + cache SEP-41 token metadata for any contract seen in

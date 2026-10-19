@@ -1,6 +1,9 @@
 package middleware
 
-import "context"
+import (
+	"context"
+	"os"
+)
 
 type contextKey string
 
@@ -41,11 +44,14 @@ func WithAPIKeyID(ctx context.Context, id string) context.Context {
 }
 
 // NetworkFromContext returns the network associated with the authenticated API
-// key. Defaults to "testnet" when the request is unauthenticated or the key
-// has no network set.
+// key. Defaults to os.Getenv("NETWORK") (or "testnet" if unset) when the request
+// is unauthenticated or the key has no network set (issue #716).
 func NetworkFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(contextKeyNetwork).(string); ok && v != "" {
 		return v
+	}
+	if env := os.Getenv("NETWORK"); env != "" {
+		return env
 	}
 	return "testnet"
 }
