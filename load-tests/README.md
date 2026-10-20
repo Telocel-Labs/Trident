@@ -36,7 +36,7 @@ scripts to match rather than the other way around.
 | `rate-limit-concurrency.js` | One-key burst proving the tier limit holds under launch-scale concurrency | `BASE_URL=http://localhost:3000 API_KEY=<key> EXPECTED_LIMIT=100 CONCURRENT_REQUESTS=1000 k6 run load-tests/rate-limit-concurrency.js` |
 | `ingest-soak.sh` | Sustained ingest volume (contract mint loop) + Go API / Rust indexer resource sampling over time | `LOCAL_RPC_URL=http://localhost:8000/rpc SOAK_DURATION_SECONDS=1800 ./load-tests/ingest-soak.sh` |
 | `launch-soak.sh` | Combined 24-hour launch soak: ingest volume plus events, batch, stats, and SSE load running together (issue #440) | `BASE_URL=https://staging.example.com API_KEY=<key> ./load-tests/launch-soak.sh` |
-| `chaos-launch.sh` | Launch chaos verification for Postgres, Redis, and optional RPC faults with before/during/after readiness probes (issue #439) | `BASE_URL=http://localhost:3000 COMPOSE_FILE=docker/docker-compose.yml RPC_SERVICE=<rpc-service> ./load-tests/chaos-launch.sh` |
+| `chaos-launch.sh` | Induced Postgres, Redis, and local RPC outages, including breaker, fail-open, cursor, outbox, gap, duplicate, and recovery assertions | See [Local dependency chaos verification](#local-dependency-chaos-verification) |
 | `graceful-shutdown-launch.sh` | Rolling SIGTERM verification for API request drain, SSE reconnect behavior, and indexer cursor safety (issue #442) | `BASE_URL=http://localhost:3000 COMPOSE_FILE=docker/docker-compose.yml ./load-tests/graceful-shutdown-launch.sh` |
 
 `API_KEY` is optional for the k6 scripts — every script's checks accept
@@ -107,39 +107,62 @@ mid-drain. Terminating the indexer leaves the API untouched, so readiness must
 stay `200` throughout. Both scenarios also require recovery to `200` within
 `RECOVERY_SECONDS`. The script exits non-zero if any assertion fails or any load
 generator fails.
-### Launch chaos verification (`chaos-launch.sh`)
+### Local dependency chaos verification (`chaos-launch.sh`)
 
-`chaos-launch.sh` is the fault-injection harness for issue #439. It records
-`/v1/ready` before, during, and after each induced dependency fault:
+The fault-injection overlay adds a local Soroban RPC container. Use an isolated
+Compose project and the CI fixture environment so the API has a known test key.
+Start RPC first and wait for its health endpoint before starting the application:
 
 ```bash
+COMPOSE_PROJECT=trident-chaos
+COMPOSE_FILES='docker/docker-compose.yml;docker/docker-compose.ci.yml;docker/docker-compose.chaos.yml'
+docker compose -p "$COMPOSE_PROJECT" \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.ci.yml \
+  -f docker/docker-compose.chaos.yml \
+  --env-file .env.ci up -d stellar-rpc
+
+# Wait until this reports "healthy":
+curl -sSf -X POST http://localhost:8000/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+
+docker compose -p "$COMPOSE_PROJECT" \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.ci.yml \
+  -f docker/docker-compose.chaos.yml \
+  --env-file .env.ci up -d --build
+
+COMPOSE_PROJECT="$COMPOSE_PROJECT" \
+COMPOSE_FILES="$COMPOSE_FILES" \
+COMPOSE_ENV_FILE=.env.ci \
 BASE_URL=http://localhost:3000 \
-COMPOSE_FILE=docker/docker-compose.yml \
+API_KEY=ci-test-api-key-do-not-use-in-production \
+NETWORK=testnet \
 FAULT_SECONDS=30 \
-RECOVERY_SECONDS=45 \
-RPC_SERVICE=<local-rpc-service-name> \
+RECOVERY_SECONDS=180 \
 ./load-tests/chaos-launch.sh
 ```
 
-The script covers Postgres down/slow, Redis down/evicted, and RPC down/slow when
-`RPC_SERVICE` points at a compose-managed RPC service. Results are written under
+The local test key and salt in `.env.ci` are fixtures only; never use them in a
+non-CI environment. The script stops or pauses the database, Redis, and the
+compose-managed RPC service. `RECOVERY_SECONDS` also bounds cursor catch-up and
+outbox-drain checks. Results and response bodies are written under
 `load-tests/chaos-results/<timestamp>/`.
 
-The harness asserts the readiness contract rather than only recording it.
-`GET /v1/ready` returns 200 only when Postgres, Redis, and the gRPC backend all
-pass, and 503 when any check fails, so each scenario checks that:
+The harness asserts that Postgres and Redis outages make `/v1/ready` return 503
+without hanging, while RPC faults leave API reads ready and open the indexer's
+RPC circuit breaker. During Redis outage it additionally makes an authenticated
+API request and requires the per-key fail-open metric to increment. Following
+each restore it checks readiness, cursor advancement, non-decreasing recent
+event counts, zero recent ledger gaps and duplicate event keys, and (after Redis
+outage) an outbox backlog no larger than its pre-fault baseline. It exits
+non-zero on any failed assertion.
 
-- readiness reported 503 while the dependency was stopped or paused — a 200
-  means the outage went undetected, and a timeout (recorded as `000`) means the
-  probe hung instead of failing fast;
-- readiness returned to 200 within `RECOVERY_SECONDS` after the dependency came
-  back;
-- flushing Redis stays 200, because an emptied cache is a miss, not an outage.
-
-The script exits non-zero if any assertion fails and prints the failure count in
-`summary.txt`, so it can gate a launch checklist. Still treat data loss, cursor
-corruption, or unbounded retry loops seen in the logs as follow-up issues — those
-are not asserted automatically.
+The opt-in [Dependency chaos tests workflow](../.github/workflows/chaos.yml)
+runs the same compose-backed scenarios on demand. It is intentionally not part
+of the every-pull-request CI path because the job repeatedly stops live
+dependencies.
 
 **Running it against staging** (issue #499): the harness as written targets
 `docker compose` service names, so it cannot run unmodified against a

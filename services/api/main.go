@@ -48,6 +48,7 @@ const (
 	usageRollupLookback        = 48 * time.Hour
 	usageRollupRetention       = 400 * 24 * time.Hour
 	usageRollupCleanupInterval = 24 * time.Hour
+	eventRetentionInterval     = 6 * time.Hour
 )
 
 const defaultDBPoolSize = 5
@@ -598,7 +599,7 @@ type retentionConfig struct {
 	AuditLogDays          int
 	ParseErrorsDays       int
 	WebhookDeliveriesDays int
-	SorobanEventsDays     int
+	EventRetentionDays    int
 	EventOutboxDays       int
 }
 
@@ -607,11 +608,7 @@ func loadRetentionConfig() retentionConfig {
 		AuditLogDays:          envInt("RETENTION_AUDIT_LOG_DAYS", 90),
 		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
 		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
-		// Highest-volume table; unlike audit_log/parse_errors/webhook_deliveries
-		// it previously defaulted to 0 (disabled), letting it grow unbounded
-		// with growing indexes/WAL/vacuum pressure unless an operator opted in
-		// explicitly (#645). 90 days matches the audit log's window.
-		SorobanEventsDays: envInt("RETENTION_SOROBAN_EVENTS_DAYS", 90),
+		EventRetentionDays:    envInt("EVENT_RETENTION_DAYS", 0),
 		// event_outbox is the fastest-growing unbounded table (issue #604):
 		// rows are only ever flipped published = TRUE, never deleted, and
 		// each carries a full JSONB copy of the event. 7 days is generous
@@ -636,6 +633,7 @@ func envInt(key string, defaultVal int) int {
 func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 	cfg := loadRetentionConfig()
 	interval := 6 * time.Hour
+	startSorobanEventRetentionJob(ctx, pool, cfg.EventRetentionDays)
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -670,10 +668,6 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 				{"webhook_deliveries", cfg.WebhookDeliveriesDays,
 					`DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
 						SELECT ctid FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
-					)`},
-				{"soroban_events", cfg.SorobanEventsDays,
-					`DELETE FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
-						SELECT ctid FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
 				// event_outbox additionally requires published = TRUE: an
 				// unpublished row must never be deleted regardless of age,
@@ -717,6 +711,63 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 		}
 	}
 	}()
+}
+
+func startSorobanEventRetentionJob(ctx context.Context, pool *pgxpool.Pool, days int) {
+	if days <= 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(eventRetentionInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				startedAt := time.Now()
+				deleted, err := pruneSorobanEvents(ctx, pool, days)
+				slog.Info(fmt.Sprintf("[retention] pruned %d events older than %d days in %dms",
+					deleted, days, time.Since(startedAt).Milliseconds()))
+				if deleted > 0 {
+					metrics.RetentionRowsDeletedTotal.WithLabelValues("soroban_events").Add(float64(deleted))
+				}
+				if err != nil && ctx.Err() == nil {
+					slog.Warn("retention: soroban_events cleanup failed", "err", err)
+				}
+			}
+		}
+	}()
+}
+
+func pruneSorobanEvents(ctx context.Context, pool *pgxpool.Pool, days int) (int64, error) {
+	var totalDeleted int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+
+		tag, err := pool.Exec(ctx,
+			`DELETE FROM soroban_events
+			 WHERE id IN (
+			     SELECT id FROM soroban_events
+			     WHERE ledger_timestamp < NOW() - ($1 || ' days')::INTERVAL
+			     LIMIT 1000
+			 )`,
+			fmt.Sprintf("%d", days),
+		)
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		rowsDeleted := tag.RowsAffected()
+		totalDeleted += rowsDeleted
+		if rowsDeleted == 0 {
+			return totalDeleted, nil
+		}
+	}
 }
 
 // runUsageRollupCleanup bounds usage_rollup storage by deleting daily buckets

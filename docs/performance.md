@@ -239,10 +239,11 @@ them with your own numbers as soon as you have a week of mainnet ingest.
 | High | 90 days | 741 GiB | **1.5 TiB** |
 
 Unbounded retention on the expected scenario reaches ~1.2 TiB of provisioned
-disk after a year, so set `RETENTION_SOROBAN_EVENTS_DAYS` (default `0`, pruning
-disabled — see [`ENVIRONMENT.md`](ENVIRONMENT.md)) on mainnet, or plan disk
-growth. Because `soroban_events` is partitioned by `ledger_sequence`, retention
-is a cheap partition drop rather than a bulk `DELETE`.
+disk after a year, so set `EVENT_RETENTION_DAYS` (default `0`, pruning disabled
+— see [`ENVIRONMENT.md`](ENVIRONMENT.md)) on mainnet, or plan disk growth. The
+Go API deletes old events in batches of 1,000 every six hours to keep individual
+transactions short. The indexer also supports dropping fully expired
+`ledger_sequence` partitions when its retention policy is configured.
 
 Spikes multiply growth: an airdrop or launch can push a single day to the High
 row. See
@@ -430,18 +431,21 @@ configured Kubernetes termination grace period.
 ## Launch Chaos Baseline
 
 Issue #439 requires actual fault injection for the launch environment. Use
-`load-tests/chaos-launch.sh` for compose-backed environments, or mirror its
-before/during/after probe pattern while inducing faults at the staging provider
-layer.
+`load-tests/chaos-launch.sh` with the local RPC compose overlay, or mirror its
+before/during/after assertions while inducing faults at the staging provider
+layer. See [`load-tests/README.md`](../load-tests/README.md#local-dependency-chaos-verification)
+for the complete local setup.
 
 Recommended command for a compose-backed run:
 
 ```bash
 BASE_URL=http://localhost:3000 \
-COMPOSE_FILE=docker/docker-compose.yml \
+COMPOSE_PROJECT=trident-chaos \
+COMPOSE_FILES='docker/docker-compose.yml;docker/docker-compose.ci.yml;docker/docker-compose.chaos.yml' \
+COMPOSE_ENV_FILE=.env.ci \
 FAULT_SECONDS=30 \
-RECOVERY_SECONDS=45 \
-RPC_SERVICE=<local-rpc-service-name> \
+RECOVERY_SECONDS=180 \
+API_KEY=ci-test-api-key-do-not-use-in-production \
 ./load-tests/chaos-launch.sh
 ```
 
@@ -568,7 +572,7 @@ remediation to point to:
 | `audit_log` | `RETENTION_AUDIT_LOG_DAYS` (default 90) | Same job as above (issue #245). |
 | `parse_errors` | `RETENTION_PARSE_ERRORS_DAYS` (default 30) | Same job as above. |
 | `webhook_deliveries` | `RETENTION_WEBHOOK_DELIVERIES_DAYS` (default 30) | Same job as above. |
-| `soroban_events` | Manual partition drop (see Retention above) | Deliberately manual: an automated drop is irreversible chain data loss, not a routine cleanup. |
+| `soroban_events` | `EVENT_RETENTION_DAYS` (default 0), Go API retention job | Opt-in, chunked by 1,000 rows every six hours using `ledger_timestamp`; `0` disables pruning. |
 | `contract_storage_snapshots` | None — append-only by design | One row per balance change per holder; the history itself is the product (balance-over-time queries), not incidental log data. No safe cutoff exists without breaking that use case. |
 | `contract_invocation_metrics` | None yet — documented gap | Grows with chain activity like `soroban_events` (one row per contract invocation), but is not partitioned. Not covered by this issue's outbox-first scope; needs its own pass to confirm downstream analytics consumers (contract stats rollups) tolerate pruning before adding a job. |
 | `ledger_metadata` | None — should not be pruned | Keyed by `ledger_sequence`; the periodic gap-detection scan (issue #216, `docs/runbooks/gap-detection-backfill-drill.md`) reads across the full historical range to find missing ledgers. Pruning old rows would make gap detection blind to gaps in the pruned range, defeating the backfill safety net it exists to provide. |

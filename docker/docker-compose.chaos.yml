@@ -1,0 +1,35 @@
+# Local dependency fault-injection overlay. Compose this after the regular
+# stack (and, when used, docker-compose.ci.yml).
+#
+# Example:
+#   docker compose \
+#     -f docker/docker-compose.yml \
+#     -f docker/docker-compose.ci.yml \
+#     -f docker/docker-compose.chaos.yml \
+#     --env-file .env.ci up -d
+services:
+  stellar-rpc:
+    image: stellar/quickstart:testing
+    command: ["--local", "--enable", "rpc,horizon"]
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  indexer:
+    environment:
+      STELLAR_RPC_URL: http://stellar-rpc:8000/rpc
+      RPC_CONNECT_TIMEOUT_MS: "500"
+      RPC_REQUEST_TIMEOUT_MS: "1500"
+      RPC_BREAKER_FAILURE_THRESHOLD: "3"
+      RPC_BREAKER_COOLDOWN_MS: "10000"
+      POLL_INTERVAL_FLOOR_MS: "250"
+      POLL_INTERVAL_CEILING_MS: "1000"
+    depends_on:
+      stellar-rpc:
+        condition: service_started
+
+  api:
+    environment:
+      METRICS_PORT: "9091"
+    ports:
+      - "9091:9091"

@@ -128,6 +128,7 @@ services:
       # Route through PgBouncer, never postgres:5432 directly.
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
       GO_API_DB_POOL_SIZE: ${GO_API_DB_POOL_SIZE:-5}
+      EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-0}
       # PgBouncer admin console — backs GET /v1/admin/db.
       PGBOUNCER_ADMIN_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/pgbouncer
       ADMIN_API_KEY: ${ADMIN_API_KEY}

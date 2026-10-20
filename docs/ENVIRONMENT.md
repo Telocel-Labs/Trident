@@ -163,7 +163,7 @@ guessing would silently derive wrong SAC contract ids.
 | `RETENTION_AUDIT_LOG_DAYS` | Optional | `90` | Days to retain audit log rows. |
 | `RETENTION_PARSE_ERRORS_DAYS` | Optional | `30` | Days to retain parse-error rows. |
 | `RETENTION_WEBHOOK_DELIVERIES_DAYS` | Optional | `30` | Days to retain webhook delivery records. |
-| `RETENTION_SOROBAN_EVENTS_DAYS` | Optional | `0` (disabled) | Days to retain Soroban events; `0` disables pruning. |
+| `EVENT_RETENTION_DAYS` | Optional | `0` (disabled) | Days to retain Soroban events by ledger timestamp; `0` disables pruning. When enabled, events are deleted in batches every 6 hours. |
 | `RETENTION_EVENT_OUTBOX_DAYS` | Optional | `7` | Days to retain *published* event_outbox rows (issue #604). An unpublished row (`published = FALSE`) is never eligible regardless of age. |
 | `PPROF_ENABLED` | Optional | `false` | Enables the internal-only pprof profiling server. Never exposed publicly — bind it to loopback/localhost only. |
 | `PPROF_ADDR` | Optional | `127.0.0.1:6060` | Bind address for the pprof server, when enabled. |

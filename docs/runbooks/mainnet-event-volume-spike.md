@@ -160,7 +160,7 @@ temporary changes you do not want long term (allowlist, topic filters).
   not let a spike run unattended for days.
 - **Plan storage.** A spike multiplies row growth. Re-check disk against
   [`../performance.md`](../performance.md#mainnet-storage-capacity-and-provisioning)
-  and consider `RETENTION_SOROBAN_EVENTS_DAYS`.
+  and consider `EVENT_RETENTION_DAYS`.
 - **Alert earlier.** Lag alerts fire after 10 minutes above 200 ledgers. For
   mainnet consider an alert on `deriv(trident_indexer_ledger_lag[15m]) > 0`
   sustained for 15 minutes with `rpc_errors` near zero, which identifies volume

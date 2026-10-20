@@ -1,6 +1,6 @@
 # Chaos drill findings (issue #499)
 
-## Status: harness verified, staging run not performed
+## Status: compose validation complete, fault run not performed
 
 Issue #499 asks for `load-tests/chaos-launch.sh` (built for #439) to be run
 against staging for Postgres, Redis, and RPC faults, with real observed
@@ -9,47 +9,37 @@ degradation behavior recorded. That could not be done from this environment:
 - Staging is a Kubernetes deployment reached only through CI secrets
   (`STAGING_KUBECONFIG`, `STAGING_URL`, `STAGING_DATABASE_URL` — see
   `.github/workflows/staging-deploy.yml`), none of which are available here.
-- The harness itself is compose-native (`docker compose stop/pause/exec`
-  against `docker/docker-compose.yml`'s service names), so it cannot target a
-  Kubernetes staging deployment as written without a rewrite to `kubectl`
-  equivalents (see "Running against Kubernetes staging" below) — it is built
-  and documented for a compose-backed environment.
-- A local compose dry run was also not possible: this environment has the
-  Docker CLI but no reachable Docker daemon (`docker info` fails to connect
-  to the daemon socket), so even `docker compose up` against the existing
-  local `docker/docker-compose.yml` could not be exercised here.
+- The harness is compose-native (`docker compose stop/pause/exec` against
+  compose service names), so it cannot target Kubernetes staging unmodified.
+- The local Docker CLI has no reachable daemon (`docker info` fails to connect
+  to the Docker Desktop engine), so the induced faults and recovery assertions
+  could not be executed here.
 
-Rather than claim a run that didn't happen, this documents what was actually
-done: a full static verification of the harness's logic against the real
-`/v1/ready` contract and the production compose topology, which surfaced two
-genuine gaps worth filing as follow-ups, plus the exact procedure for someone
-with staging or local Docker access to execute the real drill.
+`bash -n` and `docker compose ... config --quiet` pass for the current harness
+and compose overlays. The focused Go rate-limit and readiness tests pass. A
+broader handler test run still has unrelated contract-stats range failures.
+No fault-injection run is claimed. The static findings below record limitations
+that remain in the current setup, followed by the current local run procedure.
 
-## What was verified
+## Historical review and remaining limitations
 
-1. **Shell correctness.** `bash -n load-tests/chaos-launch.sh` and
-   `shellcheck load-tests/chaos-launch.sh` both pass clean — no syntax errors,
-   no shellcheck warnings.
+1. **Current static checks.** `bash -n load-tests/chaos-launch.sh` and
+   `docker compose -p trident-chaos -f docker/docker-compose.yml
+   -f docker/docker-compose.ci.yml -f docker/docker-compose.chaos.yml
+   --env-file .env.ci config --quiet` pass. ShellCheck was not installed.
 
 2. **Readiness contract cross-check.** Read
    `services/api/handlers/health.go` (`Ready` handler) directly against the
    harness's assertions:
-   - `GET /v1/ready` returns `503` if any of Postgres, Redis, or the gRPC
-     backend check fails, `200` only if all three pass. `expect_degraded`
-     (harness line 62) and `expect_healthy` (line 72) match this exactly:
-     503 during a fault is a pass, 200 during a fault is a failure, and a
-     hang (curl's `000` from `--max-time 10`) is a failure either way rather
-     than being mistaken for either state.
-   - Redis is checked with a plain `Ping` (`checkRedis`, health.go:186) with
-     no dependency on cached keys existing, so `FLUSHDB` correctly leaves
-     `/v1/ready` at 200 — the harness's `run_redis_evicting` scenario
-     (chaos-launch.sh:124) asserting `expect_healthy` "during" the flush,
-     not `expect_degraded`, matches the handler's actual behavior rather than
-     the more intuitive-but-wrong assumption that clearing the cache should
-     look unhealthy.
-   - No RPC/gRPC dependency is reachable from a stubbed local run, so the
-     gRPC-down path (`checkGRPC`, health.go:193, a real `ListEvents` call)
-     was reasoned through code rather than exercised.
+   - Postgres and Redis are direct readiness dependencies, so their outages
+     should return 503 while `/v1/health` stays live.
+   - RPC is upstream of the indexer, not a direct API readiness dependency.
+     During RPC outage, `/v1/ready` and authenticated reads should remain
+     available while `trident_indexer_rpc_breaker_state` reaches 1.
+   - The current harness additionally checks Redis rate-limit fail-open,
+     cursor recovery, event-count monotonicity, gaps, duplicate event keys,
+     and outbox drain. These remain statically verified only until run with a
+     reachable Docker daemon.
 
 3. **Compose topology cross-check** (`docker/docker-compose.yml`). This is
    where the two findings below came from — see "Findings to file as
@@ -63,8 +53,10 @@ Every service (`indexer`, `api`) connects to `pgbouncer:6432`, never to
 `postgres:5432` directly (`docker-compose.yml:91,129`, both comments say
 "Route through PgBouncer, never postgres directly"). `chaos-launch.sh`'s
 `POSTGRES_SERVICE` defaults to `postgres` and every Postgres scenario
-(`postgres-down`, `postgres-slow`) stops or pauses the `postgres` container,
-which is one hop upstream of what the application actually talks to.
+(`postgres-down`, `postgres-slow`) stops or pauses the `postgres` container.
+In the production compose overlay, applications connect through PgBouncer.
+The local CI compose overlay bypasses PgBouncer, so that local workflow only
+checks database failure, not pooler failure.
 
 This is a real gap, not just a naming nit: PgBouncer sits in front of
 Postgres and is responsible for detecting a dead backend and either failing
@@ -87,41 +79,48 @@ Postgres scenarios can optionally be run against the pooler layer too.
 
 ### Finding 2 — recovery timing assumption doesn't account for PgBouncer's reconnect behavior
 
-`RECOVERY_SECONDS` defaults to 45s, and Postgres's own compose healthcheck
-needs up to `start_period(15s) + retries(10) × interval(10s)` ≈ 115s in the
-worst case to report `healthy` again after a restart
-(`docker-compose.yml:13-18`). The harness's 45s default assumes the
-application-level recovery (PgBouncer reconnecting to Postgres, `checkPostgres`
-succeeding again) happens well before Postgres's own healthcheck would
-declare it healthy — which is plausible (PgBouncer doesn't wait on compose's
-healthcheck; it retries its own backend connection independently) but was
-never actually measured, only assumed by the person who wrote #439's harness
-and reused here.
+`RECOVERY_SECONDS` defaults to 45s, and Postgres's own compose healthcheck needs up to
+`start_period(15s) + retries(10) × interval(10s)` ≈ 115s in the worst case to
+report `healthy` after a restart (`docker-compose.yml:13-18`). The current
+harness uses a 180-second recovery timeout, but the actual recovery duration
+has not been measured.
 
-**Suggested follow-up**: when the harness is actually run (staging or local
-compose with a working daemon), record the wall-clock time from
-`postgres-down-during` to the first `postgres-down-after` probe that returns
-200, and if it's ever close to or past `RECOVERY_SECONDS`, either raise the
-default or make it configurable per-scenario rather than one shared value for
-Postgres, Redis, and RPC recovery.
+**Suggested follow-up**: when the harness is run, record recovery duration for
+each service and adjust the shared timeout or make it configurable per
+scenario if any service approaches the limit.
 
 ## Running the real drill (for whoever has staging or local Docker access)
 
 ### Against local compose (once a Docker daemon is reachable)
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d --build
+COMPOSE_PROJECT=trident-chaos
+COMPOSE_FILES='docker/docker-compose.yml;docker/docker-compose.ci.yml;docker/docker-compose.chaos.yml'
+docker compose -p "$COMPOSE_PROJECT" \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.ci.yml \
+  -f docker/docker-compose.chaos.yml \
+  --env-file .env.ci up -d stellar-rpc
+# Wait for getHealth at http://localhost:8000/rpc to report healthy.
+docker compose -p "$COMPOSE_PROJECT" \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.ci.yml \
+  -f docker/docker-compose.chaos.yml \
+  --env-file .env.ci up -d --build
 BASE_URL=http://localhost:3000 \
-COMPOSE_FILE=docker/docker-compose.yml \
+COMPOSE_PROJECT="$COMPOSE_PROJECT" \
+COMPOSE_FILES="$COMPOSE_FILES" \
+COMPOSE_ENV_FILE=.env.ci \
 FAULT_SECONDS=30 \
-RECOVERY_SECONDS=45 \
+RECOVERY_SECONDS=180 \
+API_KEY=ci-test-api-key-do-not-use-in-production \
 ./load-tests/chaos-launch.sh
 ```
 
-There is no local RPC container in `docker/docker-compose.yml`, so
-`RPC_SERVICE` will be unset and the rpc-down/rpc-slow scenarios will be
-skipped with the harness's own printed instructions for exercising them at
-the network/provider layer instead (chaos-launch.sh:149-158).
+Use only the disposable `.env.ci` credentials. The
+`docker-compose.chaos.yml` overlay supplies the local RPC service and lowers
+test-only request timeouts so the circuit breaker can be observed within the
+test's recovery budget.
 
 ### Against staging
 

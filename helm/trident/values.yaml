@@ -210,6 +210,7 @@ goApi:
   env:
     PORT: "3000"
     GRPC_ADDR: "trident-grpc-api:5000"
+    EVENT_RETENTION_DAYS: "0"
   hpa:
     minReplicas: 2
     maxReplicas: 10
