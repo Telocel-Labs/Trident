@@ -1,4 +1,4 @@
-.PHONY: all dev stop db migrate indexer grpc-api go-api sdk-build test lint lint-openapi help
+.PHONY: all dev stop db migrate indexer grpc-api go-api proto proto-check sdk-build test lint lint-openapi help
 
 # Load environment variables from .env if it exists
 ifneq (,$(wildcard .env))
@@ -103,6 +103,13 @@ lint:
 	fi
 	cd sdk/typescript && npm install && npm run lint
 	cd sdk/react && npm install && npm run lint
+
+proto: ## Generate Go code from Protobuf definitions using Buf
+	buf generate
+
+proto-check: ## Verify that generated Protobuf code matches definitions
+	buf generate
+	git diff --exit-code services/api/gen
 
 lint-openapi: ## Lint the OpenAPI specification
 	@if command -v spectral >/dev/null 2>&1; then \
