@@ -16,9 +16,33 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Gate release jobs on successful CI run and branch restriction (#781)
+  # ---------------------------------------------------------------------------
+  verify-release-gate:
+    name: Verify CI and branch gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify release gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/check-release-gate.sh \
+            --sha "${{ github.sha }}" \
+            --repo "${{ github.repository }}" \
+            --branches "dev,main"
+
+  # ---------------------------------------------------------------------------
   # Build and push multi-platform Docker images in parallel
   # ---------------------------------------------------------------------------
   build-indexer:
+    needs: verify-release-gate
     name: Build indexer image
     runs-on: ubuntu-latest
     permissions:
@@ -61,6 +85,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   build-grpc-api:
+    needs: verify-release-gate
     name: Build gRPC API image
     runs-on: ubuntu-latest
     permissions:
@@ -99,6 +124,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   build-go-api:
+    needs: verify-release-gate
     name: Build Go API image
     runs-on: ubuntu-latest
     permissions:
@@ -145,6 +171,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   build-migrate:
+    needs: verify-release-gate
     name: Build database migration image
     runs-on: ubuntu-latest
     permissions:
@@ -186,6 +213,7 @@ jobs:
   # Publish TypeScript SDK to npm
   # ---------------------------------------------------------------------------
   publish-sdk:
+    needs: verify-release-gate
     name: Publish TypeScript SDK
     runs-on: ubuntu-latest
     defaults:
