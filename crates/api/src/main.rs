@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -16,6 +17,43 @@ mod services;
 
 /// Read-heavy service with moderate concurrency, so a moderate pool is correct.
 const DEFAULT_DB_POOL_SIZE: u32 = 10;
+
+/// Default termination grace period matching Helm values.yaml (terminationGracePeriodSeconds: 30)
+const DEFAULT_GRACE_PERIOD_SECS: u64 = 30;
+
+/// Wait for a SIGINT or SIGTERM signal to initiate graceful shutdown.
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                eprintln!("Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT / Ctrl+C");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM");
+        },
+    }
+}
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
@@ -94,7 +132,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%addr, "Trident gRPC server listening");
 
-    let events_service = services::events::EventsServiceImpl::new(db_pool, redis_manager);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let events_service = services::events::EventsServiceImpl::with_shutdown(
+        db_pool.clone(),
+        redis_manager,
+        shutdown_rx,
+    );
 
     let mut server_builder = tonic::transport::Server::builder();
 
@@ -119,16 +163,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("internal gRPC mTLS disabled — plaintext within the cluster network");
     }
 
-    server_builder
+    let grace_period_secs = std::env::var("GRPC_TERMINATION_GRACE_PERIOD_SECONDS")
+        .or_else(|_| std::env::var("TERMINATION_GRACE_PERIOD_SECONDS"))
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GRACE_PERIOD_SECS);
+
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = signal_tx.send(());
+    });
+
+    let shutdown_signal_future = async move {
+        let _ = signal_rx.await;
+        tracing::info!("Shutdown signal received: draining in-flight requests and notifying subscribers");
+        let _ = shutdown_tx.send(true);
+    };
+
+    let server_future = server_builder
         .add_service(trident::events_server::EventsServer::new(events_service))
-        .serve_with_shutdown(addr, async {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Received shutdown signal");
-        })
-        .await?;
+        .serve_with_shutdown(addr, shutdown_signal_future);
+
+    tracing::info!(grace_period_secs, "Server running with graceful shutdown enabled");
+
+    // Timeout overall shutdown if in-flight calls exceed grace period
+    match tokio::time::timeout(Duration::from_secs(grace_period_secs), server_future).await {
+        Ok(res) => {
+            if let Err(e) = res {
+                tracing::error!("Server error: {e}");
+            } else {
+                tracing::info!("gRPC server drained and stopped cleanly");
+            }
+        }
+        Err(_) => {
+            tracing::warn!("Graceful shutdown exceeded {}s grace period, forcing exit", grace_period_secs);
+        }
+    }
+
+    // Close DB pool connections cleanly
+    db_pool.close().await;
+    tracing::info!("Database connection pool closed");
 
     // Flush OpenTelemetry spans on shutdown (issue #733)
     opentelemetry::global::shutdown_tracer_provider();
+    tracing::info!("Tracer provider flushed");
 
     Ok(())
 }
