@@ -1253,6 +1253,11 @@ jobs:
             || { echo "::error::a >30-day-old rollback rehearsal must exit non-zero"; exit 1; }
           echo "All verdict branches behaved as expected."
 
+      - name: Release gate checker tests
+        run: |
+          bash -n scripts/check-release-gate.sh
+          bash scripts/test-check-release-gate.sh
+
   env-reference:
     name: Env reference
     runs-on: ubuntu-latest
