@@ -92,14 +92,15 @@ Key implications:
   equally-trusted internal caller). Exposing the gRPC port directly to
   untrusted networks would collapse this boundary; it must stay
   internal-only in any deployment.
-- **nginx's `X-Forwarded-For`** is a boundary in itself: nginx *appends* to
-  any client-supplied XFF rather than replacing it
-  (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), so only
-  the last hop is trustworthy. See the per-IP rate limiter's trust-assumption
-  comment (`services/api/middleware/abuse.go`, `trustedClientIP`) — it only
-  reads XFF at all when `TRUSTED_PROXY_ENABLED=true`, which must only be set
-  when nginx (or an equivalent proxy) is confirmed to be the sole path to
-  the API.
+- **Reverse proxy headers (`X-Forwarded-For`, `Fly-Client-IP`)** form a
+  critical boundary: proxies like Nginx append to client-supplied XFF
+  (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), while Fly.io
+  injects `Fly-Client-IP` at its edge. With multi-tier proxies (cloud LB -> Nginx -> Go API),
+  `TRUSTED_PROXIES` allows the rate limiter (`services/api/middleware/abuse.go`, `trustedClientIP`)
+  to walk XFF right-to-left skipping trusted proxy CIDRs, isolating the true external client IP
+  even when clients attempt to forge XFF hops (issues #318, #779). On Fly.io, `TRUSTED_PROXY_PLATFORM=fly`
+  reads `Fly-Client-IP`. Proxy headers are only parsed when `TRUSTED_PROXY_ENABLED=true`
+  and the immediate TCP peer is verified.
 - **Indexer → Soroban RPC** crosses into semi-trusted territory: the RPC
   endpoint is operator-configured (not arbitrary/attacker-supplied), but its
   *responses* are still untrusted input and are parsed defensively

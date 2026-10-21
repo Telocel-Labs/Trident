@@ -109,6 +109,8 @@ The Go API exposes the public HTTP and WebSocket endpoints to client SDKs.
      --config fly/api.toml
    ```
 
+   Note: `fly/api.toml` sets `TRUSTED_PROXY_ENABLED = "true"` and `TRUSTED_PROXY_PLATFORM = "fly"`, ensuring individual client rate limits are tracked via `Fly-Client-IP`.
+
 2. Deploy Go API:
    ```bash
    fly deploy --config fly/api.toml

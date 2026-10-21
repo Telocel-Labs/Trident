@@ -10,6 +10,9 @@ primary_region = "iad"
   LOG_LEVEL = "info"
   # Connect to gRPC API over Fly private network (6PN)
   GRPC_ADDR = "trident-grpc-api.internal:50051"
+  # Per-IP rate limiting trusted proxy configuration (issue #779)
+  TRUSTED_PROXY_ENABLED  = "true"
+  TRUSTED_PROXY_PLATFORM = "fly"
 
 # Secrets are sourced exclusively from Fly's encrypted secrets store
 # (set via: fly secrets set -a trident-api KEY=value), never from [env].

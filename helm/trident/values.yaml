@@ -210,6 +210,10 @@ goApi:
   env:
     PORT: "3000"
     GRPC_ADDR: "trident-grpc-api:5000"
+    # Pre-auth per-IP rate limiting trusted proxy configuration (issue #779).
+    # Enables right-to-left X-Forwarded-For walking across trusted cluster/cloud proxy CIDRs.
+    TRUSTED_PROXY_ENABLED: "true"
+    TRUSTED_PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/8,fd00::/8,::1/128"
   hpa:
     minReplicas: 2
     maxReplicas: 10

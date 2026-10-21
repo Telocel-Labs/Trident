@@ -163,7 +163,10 @@ Variables marked **REQUIRED** must be set before the service starts. Variables m
 | `MAX_IN_FLIGHT_REQUESTS`  | OPTIONAL | integer | `500`       | Global concurrency cap. Requests beyond this many in-flight get `503`. |
 | `PER_IP_RATE_LIMIT_RPS`   | OPTIONAL | integer | `20`        | Per-IP sliding-window request limit, applied before auth. |
 | `PER_IP_RATE_LIMIT_WINDOW_MS`| OPTIONAL | integer | `1000`   | Window (ms) for the per-IP rate limit. |
-| `TRUSTED_PROXY_ENABLED`   | OPTIONAL | boolean | `false`     | Set `true` only when behind the nginx reverse proxy. Resolves client IP from `X-Forwarded-For`. Do NOT enable if untrusted clients can reach the API directly. |
+| `TRUSTED_PROXY_ENABLED`   | OPTIONAL | boolean | `false`     | Set `true` when behind reverse proxies (Nginx, cloud LB, or Fly.io). Resolves client IP from proxy headers. Do NOT enable if untrusted clients can reach the API directly. |
+| `TRUSTED_PROXIES`         | OPTIONAL | string  | —           | Comma-separated list of trusted proxy CIDRs (e.g. `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/8`) or `private`. `X-Forwarded-For` is walked right-to-left skipping these trusted hops to extract the true client IP. |
+| `TRUSTED_PROXY_PLATFORM`  | OPTIONAL | string  | —           | Deployment platform identifier (e.g. `fly`). When set to `fly`, `Fly-Client-IP` is preferred. |
+| `TRUSTED_PROXY_HEADER`    | OPTIONAL | string  | —           | Explicitly override the proxy header used to determine client IP (e.g. `Fly-Client-IP` or `X-Forwarded-For`). |
 
 ### Profiling
 

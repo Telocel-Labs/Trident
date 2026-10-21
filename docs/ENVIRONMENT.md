@@ -159,7 +159,10 @@ guessing would silently derive wrong SAC contract ids.
 | `PER_IP_RATE_LIMIT_RPS` | Optional | `20` | Pre-auth per-IP request limit, applied before any API key is checked (issue #318). |
 | `PER_IP_RATE_LIMIT_WINDOW_MS` | Optional | `1000` | Window for `PER_IP_RATE_LIMIT_RPS`. |
 | `MAX_IN_FLIGHT_REQUESTS` | Optional | `500` | Global concurrency cap; requests beyond it are shed rather than queued. |
-| `TRUSTED_PROXY_ENABLED` | Optional | `false` | **Security-sensitive.** When `true`, the per-IP limiter attributes requests to the last hop in `X-Forwarded-For` instead of the TCP peer. Only enable when the API sits behind a proxy that *appends* to XFF (as `docker/nginx/nginx.conf` does) and is not directly reachable. Enabling it on a directly-reachable API lets any client forge its own source IP and bypass per-IP limiting. |
+| `TRUSTED_PROXY_ENABLED` | Optional | `false` | **Security-sensitive.** When `true`, the per-IP limiter attributes requests to client IP headers instead of the TCP peer. Only enable when the API sits behind a proxy (Nginx, cloud LB, or Fly.io) and is not directly reachable. |
+| `TRUSTED_PROXIES` | Optional | — | Comma-separated list of trusted proxy CIDRs (e.g. `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/8`) or `private`. `X-Forwarded-For` is walked right-to-left skipping these trusted hops to extract the true client IP (issue #779). |
+| `TRUSTED_PROXY_PLATFORM` | Optional | — | Platform identifier (`fly`). When set to `fly`, `Fly-Client-IP` is preferred. |
+| `TRUSTED_PROXY_HEADER` | Optional | — | Explicitly override the proxy header used to resolve client IP (e.g. `Fly-Client-IP` or `X-Forwarded-For`). |
 | `RETENTION_AUDIT_LOG_DAYS` | Optional | `90` | Days to retain audit log rows. |
 | `RETENTION_PARSE_ERRORS_DAYS` | Optional | `30` | Days to retain parse-error rows. |
 | `RETENTION_WEBHOOK_DELIVERIES_DAYS` | Optional | `30` | Days to retain webhook delivery records. |
