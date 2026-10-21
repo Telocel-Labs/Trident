@@ -70,6 +70,10 @@ pub struct Config {
     /// the streamer has not committed yet never read as discrepancies.
     pub reconcile_tip_margin: u64,
     pub index_diagnostic: bool,
+    /// Explicit opt-in required to index every contract on the network when
+    /// the allowlist is empty (issue #802). When false and no contracts are
+    /// registered, the indexer idles instead of ingesting all network traffic.
+    pub index_all: bool,
     /// Topic patterns pushed into the `getEvents` RPC filter alongside the
     /// contract allowlist (issue #203). Empty means "no topic narrowing".
     pub topic_filters: Vec<Vec<String>>,
@@ -220,10 +224,6 @@ impl Config {
         let explicit_network = std::env::var("NETWORK")
             .ok()
             .filter(|v| !v.trim().is_empty());
-        let explicit_network = std::env::var("NETWORK")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let network = explicit_network.clone().unwrap_or_else(|| "testnet".into());
         validate_network_against_rpc(explicit_network.as_deref(), &stellar_rpc_urls)?;
         // Normalise exactly once, here (issue #736). Every later consumer —
         // the cursor key, the network column on every write, the passphrase
@@ -489,6 +489,10 @@ impl Config {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let index_all = std::env::var("INDEX_ALL")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
         // Enabled unless explicitly turned off: the reconciler is the proof
         // that indexed data matches the chain, so it defaults on (issue #511).
         let reconcile_enabled = std::env::var("RECONCILE_ENABLED")
@@ -589,6 +593,7 @@ impl Config {
             reconcile_ledger_span,
             reconcile_tip_margin,
             index_diagnostic,
+            index_all,
             topic_filters,
             max_events_per_poll: max_events_per_poll as u32,
             db_batch_size: db_batch_size as usize,
@@ -711,7 +716,7 @@ pub(crate) fn redact_url(url: &str) -> String {
     if let Some(qmark) = tail.find('?') {
         // Check if this is an RPC-style URL that might need special handling?
         // For now preserve for DB URLs as before
-        let (path_part, query_part) = tail.split_at(qmark);
+        let (path_part, _query_part) = tail.split_at(qmark);
         // But issue #734 says redact path tokens and query strings for RPC URLs
         // This function is used generally - but tests expect specific behavior
         // Tests are for postgres URLs - don't change those
@@ -1142,6 +1147,26 @@ mod tests {
             rendered = format!("{:?}", Config::from_env().unwrap());
         });
         rendered
+    }
+
+    #[test]
+    fn index_all_defaults_to_false() {
+        env::remove_var("INDEX_ALL");
+        let vars = required_vars();
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.index_all, "INDEX_ALL should default to false");
+        });
+    }
+
+    #[test]
+    fn index_all_true_when_env_set() {
+        let mut vars = required_vars();
+        vars.push(("INDEX_ALL", "true"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.index_all, "INDEX_ALL should be true when set");
+        });
     }
 
     #[test]

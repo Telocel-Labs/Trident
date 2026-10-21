@@ -60,6 +60,7 @@ description is accurate. Keep this file honest by hand.
 | `INDEXER_DB_POOL_SIZE` | Optional | `3` | Indexer's own Postgres pool size. |
 | `INDEX_TOPIC_FILTERS` | Optional | none (no narrowing) | Comma-separated topic patterns pushed into the RPC filter alongside the contract allowlist. |
 | `INDEX_DIAGNOSTIC` | Optional | `false` | Store Soroban diagnostic events (high-volume; keep `false` in production). |
+| `INDEX_ALL` | Optional | `false` | Explicit opt-in required to ingest all network contracts when the allowlist (`indexed_contracts`) is empty. When `false` (default) and the allowlist is empty, the indexer idles safely without ingesting full network events (issue #802). |
 | `EVENT_RETENTION_DAYS` | Optional | unset (no pruning) | Days of `soroban_events` history to retain before the retention job prunes older rows (issue #482). |
 | `RPC_STARTUP_CHECK_ENABLED` | Optional | `true` | Verify RPC connectivity before the poll loop starts; disabling it means an unreachable endpoint only surfaces once polling begins (issue #687). |
 | `TRACKED_SAC_ASSETS` | Optional | none | Assets to derive SAC contract ids for and track. |

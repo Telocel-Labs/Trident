@@ -282,6 +282,7 @@ type indexerStatsRow struct {
 	eventsLastPoll     *int64
 	pollDurationMs     *int64
 	lastPollAt         *time.Time
+	indexerMode        *string
 }
 
 func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) {
@@ -304,6 +305,13 @@ func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) 
 	if err != nil && err != pgx.ErrNoRows {
 		return row, err
 	}
+
+	var mode string
+	_ = db.QueryRow(ctx, `SELECT value FROM system_state WHERE key = 'indexer_mode'`).Scan(&mode)
+	if mode != "" {
+		row.indexerMode = &mode
+	}
+
 	return row, nil
 }
 
@@ -344,6 +352,8 @@ type IndexerStatsResponse struct {
 	LastPollAt          *string  `json:"last_poll_at"`
 	Status              string   `json:"status"`
 	Network             string   `json:"network"`
+	Mode                *string  `json:"mode,omitempty"`
+	Reason              *string  `json:"reason,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +427,20 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 			LastPollAt:          lastPollAtStr,
 			Status:              status,
 			Network:             os.Getenv("NETWORK"),
+		}
+
+		if stats.indexerMode != nil {
+			if *stats.indexerMode == "idle_no_contracts" {
+				m := "idle"
+				r := "no contracts registered"
+				resp.Mode = &m
+				resp.Reason = &r
+				if status == "healthy" {
+					resp.Status = "idle"
+				}
+			} else {
+				resp.Mode = stats.indexerMode
+			}
 		}
 
 		httpStatus := http.StatusOK

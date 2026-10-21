@@ -101,6 +101,7 @@ pub struct Streamer {
     /// Trips after sustained RPC failures so the run loop stops attempting
     /// polls during an outage instead of retrying every interval (issue #197).
     rpc_breaker: CircuitBreaker,
+    pub mode: crate::metrics::IndexerMode,
 }
 
 /// One contract-storage snapshot change observed during a poll cycle,
@@ -176,7 +177,7 @@ impl Streamer {
             "SAC asset registry built"
         );
         let parser = Parser::new(config.index_diagnostic).with_sac_registry(sac_registry);
-        let contract_filter = Self::load_filter(&db, &config.network).await?;
+        let (mode, contract_filter) = Self::load_filter(&db, &config.network, config.index_all).await?;
         let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
         let alerter = Alerter::from_config(
             config.alert_webhook_url.clone(),
@@ -207,21 +208,36 @@ impl Streamer {
             adaptive_poll,
             token_contracts: Arc::new(std::sync::RwLock::new(HashSet::new())),
             rpc_breaker,
+            mode,
         })
     }
 
-    /// Load (or reload) the contract allowlist from DB.
-    /// Returns `None` if the table is empty (index-all mode).
+    /// Load (or reload) the contract allowlist from DB (issue #802).
+    /// When the allowlist is empty, index-all is only permitted if `index_all` is true.
+    /// Otherwise, returns `IdleNoContracts` mode and idles without ingesting.
     async fn load_filter(
         pool: &PgPool,
         network: &str,
-    ) -> Result<Option<HashMap<String, i64>>, TridentError> {
+        index_all: bool,
+    ) -> Result<(crate::metrics::IndexerMode, Option<HashMap<String, i64>>), TridentError> {
         let map = db::load_indexed_contracts(pool, network).await?;
         if map.is_empty() {
-            Ok(None)
+            if index_all {
+                tracing::info!(network, "Contract allowlist is empty; INDEX_ALL=true: index-all mode active");
+                db::set_indexer_mode(pool, network, "index_all").await.ok();
+                metrics::set_indexer_mode(crate::metrics::IndexerMode::IndexAll);
+                Ok((crate::metrics::IndexerMode::IndexAll, None))
+            } else {
+                tracing::info!(network, "Contract allowlist is empty and INDEX_ALL is false: idling (no contracts registered)");
+                db::set_indexer_mode(pool, network, "idle_no_contracts").await.ok();
+                metrics::set_indexer_mode(crate::metrics::IndexerMode::IdleNoContracts);
+                Ok((crate::metrics::IndexerMode::IdleNoContracts, Some(HashMap::new())))
+            }
         } else {
-            tracing::info!(count = map.len(), "Contract allowlist loaded");
-            Ok(Some(map))
+            tracing::info!(count = map.len(), network, "Contract allowlist loaded");
+            db::set_indexer_mode(pool, network, "filtered").await.ok();
+            metrics::set_indexer_mode(crate::metrics::IndexerMode::Filtered);
+            Ok((crate::metrics::IndexerMode::Filtered, Some(map)))
         }
     }
 
@@ -229,8 +245,9 @@ impl Streamer {
     /// Detects newly-registered contracts with a historical `index_from` and
     /// logs a backfill suggestion (issue #202).
     pub async fn refresh_contract_filter(&mut self) -> Result<(), TridentError> {
-        match Self::load_filter(&self.db, &self.config.network).await {
-            Ok(filter) => {
+        match Self::load_filter(&self.db, &self.config.network, self.config.index_all).await {
+            Ok((new_mode, filter)) => {
+                self.mode = new_mode;
                 // Detect newly added contracts whose index_from is behind the
                 // current cursor, which means historical events are missing.
                 if let Some(ref new_map) = filter {
@@ -850,6 +867,31 @@ impl Streamer {
                 )));
             }
         };
+        if self.mode == crate::metrics::IndexerMode::IdleNoContracts {
+            // Empty allowlist without explicit INDEX_ALL opt-in (issue #802).
+            // Do not call getEvents and ingest nothing. Keep chain tip and lag updated.
+            if let Ok(latest) = self.rpc.get_latest_ledger().await {
+                self.last_chain_tip = latest;
+                metrics::set_ledger_lag(latest.saturating_sub(*cursor) as i64);
+            }
+            metrics::set_indexer_mode(crate::metrics::IndexerMode::IdleNoContracts);
+            let poll_duration = poll_start.elapsed();
+            metrics::record_poll_duration(poll_duration.as_secs_f64());
+            let _ = db::update_health_stats(
+                &self.db,
+                &self.config.network,
+                *cursor as i64,
+                0,
+                poll_duration,
+            )
+            .await;
+            tracing::info!(
+                network = %self.config.network,
+                "Indexer idling: no contracts registered and INDEX_ALL is false"
+            );
+            return Ok(0);
+        }
+
         // Full jitter (issue #197): without it, every indexer replica computes
         // the identical backoff schedule and retries in lockstep against the
         // same RPC endpoint on a shared outage.
@@ -2129,6 +2171,7 @@ mod tests {
             rpc_max_calls_per_sec: 50,
             rpc_startup_check_enabled: false,
             index_diagnostic: false,
+            index_all: true,
             topic_filters: Vec::new(),
             max_events_per_poll: 200,
             db_batch_size: 1_000,
@@ -2859,6 +2902,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".into(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
@@ -3499,6 +3543,50 @@ mod tests {
 
         let mut cursor = 0u64;
         s.poll_once(&mut cursor).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_without_opt_in_idles_and_does_not_call_get_events() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getLatestLedger"
+            })))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "sequence": 12345 }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents"
+            })))
+            .respond_with(rpc_ok(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = test_config(&db_url, &redis_url, server.uri());
+        config.index_all = false;
+        let db = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let mut s = Streamer::new(config, db).await.unwrap();
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &[]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        assert_eq!(s.mode, crate::metrics::IndexerMode::IdleNoContracts);
+
+        let mut cursor = 0u64;
+        let events = s.poll_once(&mut cursor).await.unwrap();
+        assert_eq!(events, 0);
+        assert_eq!(s.last_chain_tip, 12345);
     }
 
     #[tokio::test]

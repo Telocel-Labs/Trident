@@ -23,6 +23,7 @@ type mockStatsDB struct {
 	eventsLast  *int64
 	pollMs      *int64
 	lastPollAt  *time.Time
+	mode        *string
 	scanErr     error
 }
 
@@ -43,6 +44,12 @@ type mockStatsRow struct{ m *mockStatsDB }
 func (r *mockStatsRow) Scan(dest ...any) error {
 	if r.m.scanErr != nil {
 		return r.m.scanErr
+	}
+	if len(dest) == 1 {
+		if s, ok := dest[0].(*string); ok && r.m.mode != nil {
+			*s = *r.m.mode
+		}
+		return nil
 	}
 	if len(dest) != 5 {
 		return fmt.Errorf("expected 5 dest, got %d", len(dest))
@@ -589,5 +596,36 @@ func TestQueryContractStats_KeysetPagination_TiedEventCountsNoSkipOrDuplicate(t 
 		if curCount == prevCount && mineOrder[i] >= mineOrder[i-1] {
 			t.Fatalf("position %d: tied event_count=%d but contract_id did not strictly decrease (%s then %s)", i, curCount, mineOrder[i-1], mineOrder[i])
 		}
+	}
+}
+
+func TestIndexerStats_IdleNoContracts_ReportsIdleAndReason(t *testing.T) {
+	now := time.Now()
+	ledger := int64(1000)
+	total := int64(0)
+	last := int64(0)
+	ms := int64(5)
+	mode := "idle_no_contracts"
+	db := &mockStatsDB{lastLedger: &ledger, eventsTotal: &total, eventsLast: &last, pollMs: &ms, lastPollAt: &now, mode: &mode}
+	setChainTip(1000)
+
+	rec := httptest.NewRecorder()
+	IndexerStats(db).ServeHTTP(rec, statsReq())
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("idle: want 200, got %d", rec.Code)
+	}
+	var resp IndexerStatsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal("decode:", err)
+	}
+	if resp.Status != "idle" {
+		t.Errorf("want status idle, got %q", resp.Status)
+	}
+	if resp.Mode == nil || *resp.Mode != "idle" {
+		t.Errorf("want mode idle, got %v", resp.Mode)
+	}
+	if resp.Reason == nil || *resp.Reason != "no contracts registered" {
+		t.Errorf("want reason 'no contracts registered', got %v", resp.Reason)
 	}
 }
