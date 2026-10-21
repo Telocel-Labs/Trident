@@ -101,6 +101,9 @@ pub struct Streamer {
     /// Trips after sustained RPC failures so the run loop stops attempting
     /// polls during an outage instead of retrying every interval (issue #197).
     rpc_breaker: CircuitBreaker,
+    /// Tracked contracts that have been assigned distinct metric series in index-all mode (issue #798).
+    /// Capped by `config.index_all_metrics_max_contracts`.
+    index_all_metric_contracts: HashSet<String>,
 }
 
 /// One contract-storage snapshot change observed during a poll cycle,
@@ -207,6 +210,7 @@ impl Streamer {
             adaptive_poll,
             token_contracts: Arc::new(std::sync::RwLock::new(HashSet::new())),
             rpc_breaker,
+            index_all_metric_contracts: HashSet::new(),
         })
     }
 
@@ -977,10 +981,24 @@ impl Streamer {
                                 _ => {}
                             }
                         }
-                        // Allowlisted or index-all: record under the real contract_id.
-                        // In index-all mode cardinality is unbounded — operators should
-                        // configure an allowlist if per-contract metrics are needed.
-                        metrics::record_events_by_contract(&event.contract_id, 1);
+                        // Record metrics for the event. When an allowlist is configured,
+                        // only listed contracts reach here and unlisted ones were bucketed
+                        // under "other" above. In index-all mode, bound metric label cardinality
+                        // to at most N+1 series (issue #798): track up to `index_all_metrics_max_contracts`
+                        // distinct contracts and bucket all remaining contracts under "other".
+                        let metric_contract = if self.contract_filter.is_some() {
+                            event.contract_id.as_str()
+                        } else if self.config.index_all_metrics_max_contracts == 0 {
+                            "other"
+                        } else if self.index_all_metric_contracts.contains(&event.contract_id) {
+                            event.contract_id.as_str()
+                        } else if self.index_all_metric_contracts.len() < self.config.index_all_metrics_max_contracts {
+                            self.index_all_metric_contracts.insert(event.contract_id.clone());
+                            event.contract_id.as_str()
+                        } else {
+                            "other"
+                        };
+                        metrics::record_events_by_contract(metric_contract, 1);
                         // Events are accumulated and committed as one page,
                         // together with their outbox rows; the relay owns the
                         // Redis publish (issues #199, #200). Publishing inline
@@ -2150,6 +2168,7 @@ mod tests {
             token_metadata_refresh_interval: Duration::from_secs(86_400),
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
             tracked_sac_assets: Vec::new(),
+            index_all_metrics_max_contracts: 100,
         }
     }
 
@@ -2859,6 +2878,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
@@ -4384,5 +4404,206 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_all_cardinality_bound_produces_at_most_n_plus_one_series() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // High-cardinality fixture: 10 distinct contracts in index-all mode.
+        let mut entries = Vec::new();
+        for i in 0..10 {
+            let cid = format!("CCONTRACT{:02}", i);
+            entries.push((100u64, cid, i as u32));
+        }
+
+        let events: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(ledger, contract_id, idx)| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": contract_id,
+                    "id": format!("{:016}-{}", ledger, idx),
+                    "pagingToken": format!("{}-{}", ledger, idx),
+                    "txHash": format!("hash{}{}{}", ledger, contract_id, idx),
+                    "topic": [sym_xdr("transfer")],
+                    "value": void_xdr(),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        let page_payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": 100
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(page_payload))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 0)))
+            .mount(&server)
+            .await;
+
+        // Cap to 3 distinct contracts (N = 3)
+        let config = Config {
+            index_all_metrics_max_contracts: 3,
+            ..test_config(&db_url, &redis_url, server.uri())
+        };
+
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        reset_db(&pool).await;
+        set_allowlist(&pool, &[]).await; // empty allowlist = index-all
+
+        let mut s = Streamer::new(config, pool.clone()).await.unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let mut cursor = 0u64;
+        let total = s.poll_once(&mut cursor).await.unwrap();
+        drop(guard);
+
+        assert_eq!(total, 10);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let contract_series: Vec<_> = snapshot
+            .iter()
+            .filter(|(key, _, _, _)| {
+                key.kind() == MetricKind::Counter && key.key().name() == metrics::EVENTS_BY_CONTRACT_TOTAL
+            })
+            .collect();
+
+        // Exactly N+1 series (N distinct contracts + 1 sentinel "other")
+        assert_eq!(
+            contract_series.len(),
+            4,
+            "Must produce at most N+1 series (3 distinct contracts + 1 other)"
+        );
+
+        let other_count = contract_series
+            .iter()
+            .find(|(key, _, _, _)| {
+                key.key()
+                    .labels()
+                    .any(|l| l.key() == "contract" && l.value() == "other")
+            })
+            .and_then(|(_, _, _, val)| match val {
+                DebugValue::Counter(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        assert_eq!(other_count, 7, "Remaining 7 contracts must be bucketed under 'other'");
+    }
+
+    #[tokio::test]
+    async fn index_all_cardinality_bound_zero_drops_all_labels() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let mut entries = Vec::new();
+        for i in 0..5 {
+            let cid = format!("CZERO{:02}", i);
+            entries.push((100u64, cid, i as u32));
+        }
+
+        let events: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(ledger, contract_id, idx)| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": contract_id,
+                    "id": format!("{:016}-{}", ledger, idx),
+                    "pagingToken": format!("{}-{}", ledger, idx),
+                    "txHash": format!("hashzero{}{}{}", ledger, contract_id, idx),
+                    "topic": [sym_xdr("transfer")],
+                    "value": void_xdr(),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        let page_payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": 100
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(page_payload))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 0)))
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            index_all_metrics_max_contracts: 0,
+            ..test_config(&db_url, &redis_url, server.uri())
+        };
+
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        reset_db(&pool).await;
+        set_allowlist(&pool, &[]).await;
+
+        let mut s = Streamer::new(config, pool.clone()).await.unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let mut cursor = 0u64;
+        let total = s.poll_once(&mut cursor).await.unwrap();
+        drop(guard);
+
+        assert_eq!(total, 5);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let contract_series: Vec<_> = snapshot
+            .iter()
+            .filter(|(key, _, _, _)| {
+                key.kind() == MetricKind::Counter && key.key().name() == metrics::EVENTS_BY_CONTRACT_TOTAL
+            })
+            .collect();
+
+        assert_eq!(
+            contract_series.len(),
+            1,
+            "When max_contracts is 0, exactly 1 series ('other') must be produced"
+        );
+        let other_count = match contract_series[0].3 {
+            DebugValue::Counter(n) => n,
+            _ => 0,
+        };
+        assert_eq!(other_count, 5);
     }
 }
