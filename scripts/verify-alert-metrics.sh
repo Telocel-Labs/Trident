@@ -172,6 +172,10 @@ ALERT_FILES=(
   "observability/rpc-alerts.yml"
 )
 
+# Verify alert names are unique across rule files (issue #769)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bash "$SCRIPT_DIR/check-alert-names-unique.sh" "${ALERT_FILES[@]}"
+
 REFERENCED_METRICS=()
 for alert_file in "${ALERT_FILES[@]}"; do
   if [ ! -f "$alert_file" ]; then

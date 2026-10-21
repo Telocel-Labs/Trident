@@ -489,6 +489,14 @@ jobs:
       - name: Test check-runbook-urls.sh detection logic
         run: bash scripts/test-check-runbook-urls.sh
 
+      # Issue #769: promtool check rules allows duplicate alert names across
+      # or within files. A duplicated alert causes double-paging and configuration divergence.
+      - name: Check alert names are unique across rule files
+        run: bash scripts/check-alert-names-unique.sh
+
+      - name: Test check-alert-names-unique.sh detection logic
+        run: bash scripts/test-check-alert-names-unique.sh
+
       - name: Download amtool
         run: |
           AM_VERSION="0.27.0"

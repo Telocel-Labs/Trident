@@ -189,26 +189,6 @@ groups:
           severity: warning
           service: indexer
         annotations:
-          summary: "Trident indexer has {{ $value | humanize }} event(s) awaiting replay in the persist dead-letter queue"
-          description: >
-            trident_indexer_persist_dead_letter_backlog is non-zero.
-            One or more events decoded fine but exhausted the persist retry
-            budget, so the streamer captured them in failed_events (issues
-            #208/#508) and advanced the cursor past them. The data is safe
-            but missing from soroban_events until replayed.
-          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
-
-      # A non-empty persist dead-letter queue is data missing from
-      # soroban_events until someone replays it — a silently growing DLQ is
-      # the same as data loss. Rows leave the pending state only through the
-      # documented replay procedure, so this fires for as long as any exist.
-      - alert: TridentIndexerPersistDeadLetterBacklog
-        expr: trident_indexer_persist_dead_letter_backlog > 0
-        for: 5m
-        labels:
-          severity: warning
-          service: indexer
-        annotations:
           summary: "Trident indexer has {{ $value | humanize }} event(s) pending replay in failed_events"
           description: >
             failed_events has pending rows: at least one well-formed event's
