@@ -101,6 +101,8 @@ pub struct Streamer {
     /// Trips after sustained RPC failures so the run loop stops attempting
     /// polls during an outage instead of retrying every interval (issue #197).
     rpc_breaker: CircuitBreaker,
+    /// Last time the dead-letter backlog gauge was refreshed from DB (issue #787).
+    last_failed_events_gauge_refresh: std::time::Instant,
 }
 
 /// One contract-storage snapshot change observed during a poll cycle,
@@ -207,6 +209,8 @@ impl Streamer {
             adaptive_poll,
             token_contracts: Arc::new(std::sync::RwLock::new(HashSet::new())),
             rpc_breaker,
+            last_failed_events_gauge_refresh: std::time::Instant::now()
+                - std::time::Duration::from_secs(60),
         })
     }
 
@@ -1060,12 +1064,15 @@ impl Streamer {
             metrics::record_events_processed(events_in_page as u64);
             metrics::record_events_skipped(skipped_in_page);
 
-            // Refresh the dead-letter backlog gauge every active cycle so an
+            // Refresh the dead-letter backlog gauge on a slow timer (15s) so an
             // operator replay (which shrinks the queue out-of-band) is
-            // reflected without restarting the indexer. Best-effort: the
-            // gauge is observability, not control flow.
-            if let Ok(depth) = db::count_pending_failed_events(&self.db).await {
-                metrics::set_persist_dead_letter_backlog(depth);
+            // reflected without querying COUNT(*) on every single RPC page (issue #787).
+            // Best-effort: the gauge is observability, not control flow.
+            if self.last_failed_events_gauge_refresh.elapsed() >= std::time::Duration::from_secs(15) {
+                if let Ok(depth) = db::count_pending_failed_events(&self.db).await {
+                    metrics::set_persist_dead_letter_backlog(depth);
+                    self.last_failed_events_gauge_refresh = std::time::Instant::now();
+                }
             }
 
             // Decide whether this page advances the cursor, and gather the
@@ -2859,6 +2866,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();

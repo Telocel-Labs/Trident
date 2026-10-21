@@ -45,11 +45,20 @@ pub struct OutboxRelay {
     redis_url: String,
     redis: Option<redis::aio::MultiplexedConnection>,
     config: RelayConfig,
+    /// Last time the outbox backlog gauge was queried from DB (issue #787).
+    last_backlog_report: std::time::Instant,
 }
 
 impl OutboxRelay {
     pub fn new(db: PgPool, redis: redis::aio::MultiplexedConnection, config: RelayConfig) -> Self {
-        Self { db, redis_url: String::new(), redis: Some(redis), config }
+        Self {
+            db,
+            redis_url: String::new(),
+            redis: Some(redis),
+            config,
+            last_backlog_report: std::time::Instant::now()
+                - std::time::Duration::from_secs(60),
+        }
     }
 
     pub fn new_with_config(
@@ -58,7 +67,14 @@ impl OutboxRelay {
         redis: Option<redis::aio::MultiplexedConnection>,
         config: RelayConfig,
     ) -> Self {
-        Self { db, redis_url, redis, config }
+        Self {
+            db,
+            redis_url,
+            redis,
+            config,
+            last_backlog_report: std::time::Instant::now()
+                - std::time::Duration::from_secs(60),
+        }
     }
 
     async fn ensure_redis(&mut self) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
@@ -119,12 +135,13 @@ impl OutboxRelay {
     pub async fn publish_pending(&mut self) -> Result<usize, TridentError> {
         let records = outbox::fetch_unpublished(&self.db, self.config.batch_size).await?;
         if records.is_empty() {
-            self.report_backlog(0).await;
+            self.maybe_report_backlog(false).await;
             return Ok(0);
         }
 
         let mut published_seqs: Vec<i64> = Vec::with_capacity(records.len());
         let mut failure: Option<TridentError> = None;
+        let network = self.config.network.clone();
 
         for record in &records {
             let event = match record.event() {
@@ -167,7 +184,7 @@ impl OutboxRelay {
                 &event,
                 stream_maxlen,
                 Some(&record.event_id.to_string()),
-                &self.config.network,
+                &network,
             )
             .await
             {
@@ -185,7 +202,8 @@ impl OutboxRelay {
 
         // Mark what actually reached Redis, even when the batch aborted early.
         outbox::mark_published(&self.db, &published_seqs).await?;
-        self.report_backlog(published_seqs.len() as i64).await;
+        let has_more = failure.is_some() || records.len() >= self.config.batch_size as usize;
+        self.maybe_report_backlog(has_more).await;
 
         match failure {
             Some(e) => Err(e),
@@ -195,7 +213,26 @@ impl OutboxRelay {
 
     /// Publish the current backlog gauge, warning when it grows past the
     /// configured threshold (the alert signal for a stuck relay).
-    async fn report_backlog(&self, _published: i64) {
+    ///
+    /// To avoid heavy COUNT(*) scans on hot paths (issue #787):
+    /// - If the queue is known to have cleared (fetched fewer than batch_size with no failure),
+    ///   the gauge is immediately updated to 0 without hitting Postgres, unless the 15-second
+    ///   slow timer has elapsed.
+    /// - When rows might remain or the 15-second timer has elapsed, the true count is queried.
+    async fn maybe_report_backlog(&mut self, has_more: bool) {
+        const SLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+        let elapsed = self.last_backlog_report.elapsed();
+
+        if !has_more {
+            metrics::set_outbox_backlog(0);
+            if elapsed < SLOW_REFRESH_INTERVAL {
+                return;
+            }
+        } else if elapsed < SLOW_REFRESH_INTERVAL {
+            return;
+        }
+
+        self.last_backlog_report = std::time::Instant::now();
         match outbox::backlog(&self.db).await {
             Ok(backlog) => {
                 metrics::set_outbox_backlog(backlog);
@@ -209,5 +246,22 @@ impl OutboxRelay {
             }
             Err(e) => tracing::warn!(error = %e, "Failed to read outbox backlog"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_config_creation() {
+        let config = RelayConfig {
+            interval: Duration::from_millis(100),
+            batch_size: 50,
+            backlog_alert_threshold: 1000,
+            stream_maxlen: 10000,
+            network: "testnet".to_string(),
+        };
+        assert_eq!(config.batch_size, 50);
     }
 }
