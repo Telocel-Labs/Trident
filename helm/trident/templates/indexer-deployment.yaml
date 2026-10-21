@@ -41,6 +41,8 @@ spec:
         {{- include "trident.selectorLabels" (dict "root" . "component" "indexer") | nindent 8 }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "trident.serviceAccountName" (dict "root" . "component" "indexer") }}
+      automountServiceAccountToken: false
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.indexer.securityContextUid) | nindent 8 }}
       containers:

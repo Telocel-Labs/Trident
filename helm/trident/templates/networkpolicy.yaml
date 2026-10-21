@@ -1,0 +1,236 @@
+{{- if .Values.networkPolicy.enabled }}
+# Issue #767: Default-deny Ingress NetworkPolicy for all trident pods.
+# Any pod not matching an explicit ingress rule will have all incoming connections dropped.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "trident.fullname" . }}-default-deny
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "trident.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+
+---
+# Issue #767: Nginx ingress & egress policy.
+# Ingress: accepts HTTP traffic on port 80.
+# Egress: forwards requests to go-api port 8080 and DNS port 53.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "trident.fullname" . }}-nginx
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nginx
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 80
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.goApi.service.port }}
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Issue #767: Go API ingress & egress policy.
+# Ingress: accepts traffic ONLY from nginx (and optional Ingress) on port 8080, and Prometheus metrics on 9090.
+# Egress: talks to grpc-api (5000), Postgres (5432), Redis (6379), and DNS (53).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "trident.fullname" . }}-go-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: go-api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.goApi.service.port }}
+    {{- if .Values.ingress.enabled }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.goApi.service.port }}
+    {{- end }}
+    {{- with .Values.networkPolicy.prometheus }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .matchLabels | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9090
+    {{- end }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grpcApi.service.port }}
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+
+---
+# Issue #767: gRPC API ingress & egress policy.
+# Ingress: accepts traffic ONLY from go-api on port 5000 and Prometheus metrics on 9090.
+# Unrelated pods in the namespace are strictly rejected.
+# Egress: talks to Postgres (5432) and DNS (53).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "trident.fullname" . }}-grpc-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grpc-api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grpcApi.service.port }}
+    {{- with .Values.networkPolicy.prometheus }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .matchLabels | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9090
+    {{- end }}
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# Issue #767: Indexer ingress & egress policy.
+# Ingress: refuses all standard application pods; allows Prometheus metrics (9090) and health probes (8080).
+# Egress: talks to Postgres (5432), Redis (6379), Stellar RPC (80, 443), and DNS (53).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "trident.fullname" . }}-indexer
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "indexer") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- with .Values.networkPolicy.prometheus }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .matchLabels | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.indexer.metricsPort | default 9090 }}
+    {{- end }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.indexer.healthPort | default 8080 }}
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+
+---
+{{- if .Values.migrations.enabled }}
+# Issue #767: Migration job egress policy.
+# Ingress: empty (no inbound traffic).
+# Egress: talks to Postgres (5432) and DNS (53).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "trident.fullname" . }}-migrate
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "migrate") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
+{{- end }}
