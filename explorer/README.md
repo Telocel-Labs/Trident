@@ -39,7 +39,7 @@ npm run lint       # type-check with astro check
 | `TRIDENT_MAINNET_API_URL` | Yes | Base URL for the mainnet Trident REST API |
 | `EXPLORER_API_KEY` | Yes | Internal API key (free tier, created at deploy time) |
 | `TRIDENT_TESTNET_SOROBAN_RPC_URL` | No | Soroban RPC used to probe contracts on-chain (testnet default: `https://soroban-testnet.stellar.org`) |
-| `TRIDENT_MAINNET_SOROBAN_RPC_URL` | No | Soroban RPC used to probe contracts on-chain (mainnet default: `https://mainnet.sorobanrpc.com`) |
+| `TRIDENT_MAINNET_SOROBAN_RPC_URL` | Yes | Soroban RPC used to probe contracts on-chain on mainnet (issue #785). Must be configured explicitly (e.g. `https://soroban-mainnet.stellar.org` or your authenticated provider); defaults are disallowed to prevent third-party SLA risk. |
 
 The `EXPLORER_API_KEY` is used server-side only and is never sent to the browser.
 

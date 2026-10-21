@@ -51,6 +51,8 @@ jobs:
 
       - name: Build
         working-directory: explorer
+        env:
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
         run: npm run build
 
       - name: Start the built server
@@ -58,6 +60,7 @@ jobs:
         env:
           TRIDENT_TESTNET_API_URL: https://api.testnet.trident.dev
           TRIDENT_MAINNET_API_URL: https://api.mainnet.trident.dev
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
           EXPLORER_API_KEY: ci-smoke-test-key
           PORT: 4321
         run: |

@@ -233,6 +233,7 @@ jobs:
         env:
           TRIDENT_TESTNET_API_URL: http://localhost:9999
           TRIDENT_MAINNET_API_URL: http://localhost:9999
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
           EXPLORER_API_KEY: ci-dummy-key
 
       - name: Build
@@ -240,6 +241,7 @@ jobs:
         env:
           TRIDENT_TESTNET_API_URL: http://localhost:9999
           TRIDENT_MAINNET_API_URL: http://localhost:9999
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
           EXPLORER_API_KEY: ci-dummy-key
 
   # ---------------------------------------------------------------------------
@@ -357,9 +359,13 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
 
       - name: Type check
         run: npm run lint
+        env:
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
 
   # ---------------------------------------------------------------------------
   # Contracts — reference Soroban contracts (issue #258).
