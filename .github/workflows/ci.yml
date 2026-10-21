@@ -1261,6 +1261,12 @@ jobs:
       - name: Check every env var the code reads is documented
         run: bash scripts/check-env-reference.sh
 
+      # Catches fly/*.toml setting an env var the indexer now hard-rejects
+      # at startup — exactly how POLL_INTERVAL_MS crash-looped every Fly
+      # deploy after #629 (issue #777).
+      - name: Check Fly configs don't set a rejected env var
+        run: bash scripts/check-fly-env-rejected.sh
+
       # Catches two migrations sharing a version prefix before it reaches a
       # real database. The rust-integration job applies migrations with a
       # `for f in *.sql` psql loop rather than the sqlx migrator, so it cannot

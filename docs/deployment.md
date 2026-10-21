@@ -56,7 +56,8 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `MAX_BATCH_BODY_BYTES` | Maximum request body size specifically for `POST /v1/events/batch`, in bytes (default: `2097152`, 2 MiB) |
 | `PER_IP_RATE_LIMIT_RPS` | Per-IP sliding-window request limit, applied before auth on public paths (default: `20`) |
 | `PER_IP_RATE_LIMIT_WINDOW_MS` | Window for the per-IP limit above, in milliseconds (default: `1000`) |
-| `TRUSTED_PROXY_ENABLED` | Set `true` **only** when the API is known to sit entirely behind the provided nginx config (or an equivalent proxy) that is the sole path reachable by clients — resolves the per-IP rate limiter's client IP from the last hop of `X-Forwarded-For` instead of the raw TCP peer address. Leaving this unset/`false` is always safe; enabling it when untrusted clients can reach the API directly lets them spoof their rate-limit bucket via a forged header. See `services/api/middleware/abuse.go` (`trustedClientIP`) and `docs/threat-model.md`. |
+| `TRUSTED_PROXY_ENABLED` | Set `true` **only** when the API is known to sit entirely behind Fly's edge or the provided nginx config (or an equivalent proxy) that is the sole path reachable by clients — resolves the per-IP rate limiter's client IP from Fly's `Fly-Client-IP` header (unforgeable) or, failing back, by walking `X-Forwarded-For` from the right while skipping hops inside `TRUSTED_PROXY_CIDRS`. Leaving this unset/`false` is always safe; enabling it with no `TRUSTED_PROXY_CIDRS` configured on a deployment with more than one proxy hop in front of it still lets a client spoof its rate-limit bucket. See `services/api/middleware/abuse.go` (`trustedClientIP`) and `docs/threat-model.md`. |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of the proxies allowed to be walked past in `X-Forwarded-For` (e.g. Helm sets this to the cluster's RFC1918 pod range so nginx's own hop is skipped). The immediate TCP peer must itself be inside one of these CIDRs or XFF is ignored and the raw peer address is used instead. Not needed on Fly, which is identified via `Fly-Client-IP` instead. |
 | `MAX_IN_FLIGHT_REQUESTS` | Global concurrency cap — requests beyond this many in-flight get `503` to shed load (default: `500`) |
 
 #### Testnet vs. mainnet configuration
@@ -871,6 +872,49 @@ Fly automatically redeploys the app when secrets change.
 fly releases -a trident-api          # list releases
 fly deploy --image-label <version> -a trident-api  # roll back to a specific release
 ```
+
+### Verifying release image signatures and provenance
+
+Every image `.github/workflows/release.yml` pushes to GHCR
+(`trident-indexer`, `trident-grpc-api`, `trident-go-api`, `trident-migrate`)
+is keyless-signed with [cosign](https://docs.sigstore.dev/) using the
+release workflow's own GitHub OIDC identity, and carries a
+[SLSA build provenance attestation](https://slsa.dev/) plus an SPDX SBOM
+attestation (issue #780). Nothing is signed with a private key stored in
+this repository or in secrets — verification ties the image back to
+*this* workflow run, not to an operator-held key.
+
+Before deploying an image to mainnet, verify both the signature and the
+provenance came from this repository's release workflow on the expected
+ref:
+
+```bash
+IMAGE=ghcr.io/telocel-labs/trident-go-api@sha256:<digest>
+
+# Signature: was this image signed by the release workflow?
+cosign verify "$IMAGE" \
+  --certificate-identity-regexp 'https://github.com/Telocel-Labs/Trident/\.github/workflows/release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Build provenance: was it actually built by that workflow run (not just
+# signed after the fact by someone else with repo write access)?
+gh attestation verify "$IMAGE" --repo Telocel-Labs/Trident
+
+# SBOM: inspect what's inside the image.
+cosign download attestation "$IMAGE" --predicate-type spdxjson | \
+  jq -r '.payload' | base64 -d | jq '.predicate'
+```
+
+A locally built image (or one pushed by any workflow other than
+`release.yml`) has no matching attestation and both `cosign verify` and
+`gh attestation verify` fail closed.
+
+An admission-policy example (e.g. for an OPA/Gatekeeper or Kyverno policy
+enforcing `cosign verify` on image pull in a Kubernetes cluster) is out of
+scope for this repo's own Helm chart, which is deployed by its operator
+rather than by Trident itself — point the policy's
+`certificate-identity-regexp`/`certificate-oidc-issuer` at the same values
+used above.
 
 ---
 
