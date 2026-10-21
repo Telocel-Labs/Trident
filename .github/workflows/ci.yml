@@ -1389,6 +1389,9 @@ jobs:
       - name: Render templates
         run: helm template trident helm/trident
 
+      - name: Verify nginx streaming and security configs
+        run: bash scripts/test-check-helm-nginx-streaming.sh
+
       - name: Create kind cluster
         uses: helm/kind-action@0025e74a8c7512023d06dc019c617aa3cf561fde # v1.10.0
         with:
