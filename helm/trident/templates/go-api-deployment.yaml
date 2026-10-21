@@ -123,6 +123,7 @@ metadata:
   name: {{ include "trident.fullname" . }}-go-api
   labels:
     {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "trident.name" . }}
     app.kubernetes.io/component: go-api
 spec:
   type: ClusterIP

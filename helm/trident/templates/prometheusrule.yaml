@@ -1,0 +1,26 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.prometheusRule.enabled }}
+# Issue #768: PrometheusRule rendering all alerting and SLO rules
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "trident.fullname" . }}
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    {{- range $path, $_ := .Files.Glob "rules/*.yml" }}
+    {{- $content := $.Files.Get $path }}
+    {{- if $content }}
+    {{- $parsed := $content | fromYaml }}
+    {{- if $parsed.groups }}
+    {{- toYaml $parsed.groups | nindent 4 }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- with .Values.monitoring.prometheusRule.additionalGroups }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
