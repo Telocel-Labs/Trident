@@ -1193,3 +1193,36 @@ considers this endpoint close to unusable, not merely degraded.
 
 **Escalation:** `severity: page` — this endpoint is near-unusable by the
 scorer's own floor.
+
+## TridentAPIAuditLogDroppedHigh
+
+**Means:** `trident_api_audit_log_dropped_total` is increasing at a non-zero rate for 5 minutes, indicating audit log entries are being dropped (issue #800).
+
+**Why this threshold:** Audit entries record security events and API usage. Any sustained loss indicates channel saturation or exhausted retry capacity under database downtime.
+
+**First steps:**
+1. Check database connectivity and replication health for PostgreSQL.
+2. Check `trident_api_audit_log_flush_failures_total` to see if database writes are actively failing.
+3. Check API server logs for "audit log retry buffer full" or "audit log channel full".
+
+## TridentAPIAuditLogFlushFailuresHigh
+
+**Means:** `trident_api_audit_log_flush_failures_total` is increasing at a non-zero rate for 5 minutes (issue #800).
+
+**Why this threshold:** Batched audit log inserts are failing. The writer is currently retaining entries and retrying with backoff, but continued failures will eventually exhaust the buffer and lead to drops.
+
+**First steps:**
+1. Inspect API logs for "audit log batch insert failed; will retry".
+2. Check Postgres pool statistics (`trident_api_db_pool_*`) for connection pool exhaustion or query timeouts.
+3. Check disk space and permissions on the PostgreSQL database.
+
+## TridentDatabaseBackupFailed
+
+**Means:** `time() - trident_database_backup_last_success_timestamp_seconds > 93600`, indicating automated PostgreSQL backup has not succeeded in over 26 hours.
+
+**Why this threshold:** Daily backups run every 24 hours; 26 hours allows a 2-hour window for backup duration and scheduler jitter before firing.
+
+**First steps:**
+1. Check Kubernetes CronJob or backup job logs (`scripts/backup.sh`).
+2. Verify object storage / destination bucket write permissions and disk space.
+3. Trigger a manual backup run if needed to protect against data loss.
