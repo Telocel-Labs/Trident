@@ -35,6 +35,27 @@ else
   echo "[!] WARNING: Checksum file not found at ${CHECKSUM_FILE}. Proceeding with restore..."
 fi
 
+# Decrypt if encrypted (issue #794)
+RESTORE_FILE="$BACKUP_FILE"
+CLEANUP_DECRYPTED=""
+if [[ "$BACKUP_FILE" == *.enc ]]; then
+  if [[ -z "${BACKUP_ENCRYPTION_KEY:-}" ]]; then
+    echo "[-] ERROR: ${BACKUP_FILE} is encrypted but BACKUP_ENCRYPTION_KEY is not set." >&2
+    exit 1
+  fi
+  echo "[+] Decrypting ${BACKUP_FILE} with AES-256 (PBKDF2)..."
+  RESTORE_FILE="${BACKUP_FILE%.enc}"
+  openssl enc -d -aes-256-cbc -pbkdf2 -in "$BACKUP_FILE" -out "$RESTORE_FILE" -pass env:BACKUP_ENCRYPTION_KEY
+  CLEANUP_DECRYPTED="$RESTORE_FILE"
+fi
+
+cleanup() {
+  if [[ -n "$CLEANUP_DECRYPTED" && -f "$CLEANUP_DECRYPTED" ]]; then
+    rm -f "$CLEANUP_DECRYPTED"
+  fi
+}
+trap cleanup EXIT
+
 echo "[+] Initiating restore into target database..."
 START_TIME=$(date +%s)
 
@@ -49,7 +70,7 @@ pg_restore \
   --no-privileges \
   --verbose \
   --dbname="$TARGET_URL" \
-  "$BACKUP_FILE"
+  "$RESTORE_FILE"
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))

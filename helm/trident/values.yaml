@@ -363,3 +363,34 @@ internalMTLS:
   #   INTERNAL_CLIENT_CERT  - Go API client leaf cert
   #   INTERNAL_CLIENT_KEY   - Go API client private key
   mountPath: /etc/trident/mtls
+
+# ---------------------------------------------------------------------------
+# Database Backups CronJob (issue #794)
+# Runs automated logical dumps (pg_dump custom format) with optional AES-256
+# encryption, off-site replication, and retention policy enforcement.
+# ---------------------------------------------------------------------------
+backup:
+  enabled: false
+  # Daily run at 02:00 UTC
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  image:
+    repository: postgres
+    tag: "16-alpine"
+  retentionDays: 30
+  # Optional key name in global.existingSecret containing encryption passphrase
+  encryptionKeySecretKey: ""
+  # Additional environment variables (e.g. OFFSITE_COPY_CMD: "aws s3 cp ...")
+  env: {}
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  persistence:
+    enabled: false
+    existingClaim: ""
+  securityContextUid: 1001
