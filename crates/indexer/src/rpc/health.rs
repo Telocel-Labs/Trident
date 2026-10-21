@@ -107,6 +107,22 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+#[inline]
+fn unpoison_read<'a, T>(lock: &'a RwLock<T>, name: &str) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|e| {
+        tracing::warn!(lock = name, "RwLock read was poisoned; recovering inner guard");
+        e.into_inner()
+    })
+}
+
+#[inline]
+fn unpoison_write<'a, T>(lock: &'a RwLock<T>, name: &str) -> std::sync::RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(|e| {
+        tracing::warn!(lock = name, "RwLock write was poisoned; recovering inner guard");
+        e.into_inner()
+    })
+}
+
 /// Health state for a single endpoint.
 #[derive(Debug, Clone)]
 struct EndpointHealth {
@@ -231,19 +247,17 @@ impl RpcHealthScorer {
     /// Increases the endpoint's score by 5 (capped at 100) and records the
     /// current ledger if provided. Resets the circuit breaker to closed.
     pub fn record_success(&self, url: &str, ledger: Option<u64>) {
-        if let Ok(mut endpoints) = self.endpoints.write() {
-            if let Some(health) = endpoints.get_mut(url) {
-                health.apply_recovery();
-                if let Some(ledger) = ledger {
-                    health.update_ledger(ledger);
-                }
-
-                // Update the read-optimized scores map and publish metric
-                if let Ok(mut scores) = self.scores.write() {
-                    scores.insert(url.to_string(), health.score);
-                    metrics::set_rpc_health_score(url, health.score);
-                }
+        let mut endpoints = unpoison_write(&self.endpoints, "endpoints");
+        if let Some(health) = endpoints.get_mut(url) {
+            health.apply_recovery();
+            if let Some(ledger) = ledger {
+                health.update_ledger(ledger);
             }
+
+            // Update the read-optimized scores map and publish metric
+            let mut scores = unpoison_write(&self.scores, "scores");
+            scores.insert(url.to_string(), health.score);
+            metrics::set_rpc_health_score(url, health.score);
         }
     }
 
@@ -252,12 +266,11 @@ impl RpcHealthScorer {
     /// Returns true if the circuit is closed or half-open (probe allowed).
     #[allow(dead_code)]
     pub fn is_circuit_allowed(&self, url: &str) -> bool {
-        if let Ok(mut endpoints) = self.endpoints.write() {
-            if let Some(health) = endpoints.get_mut(url) {
-                let state = health.check_circuit();
-                metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
-                return state != CircuitState::Open;
-            }
+        let mut endpoints = unpoison_write(&self.endpoints, "endpoints");
+        if let Some(health) = endpoints.get_mut(url) {
+            let state = health.check_circuit();
+            metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
+            return state != CircuitState::Open;
         }
         true
     }
@@ -265,12 +278,11 @@ impl RpcHealthScorer {
     /// Get the circuit breaker state for an endpoint.
     #[allow(dead_code)]
     pub fn get_circuit_state(&self, url: &str) -> CircuitState {
-        if let Ok(mut endpoints) = self.endpoints.write() {
-            if let Some(health) = endpoints.get_mut(url) {
-                let state = health.check_circuit();
-                metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
-                return state;
-            }
+        let mut endpoints = unpoison_write(&self.endpoints, "endpoints");
+        if let Some(health) = endpoints.get_mut(url) {
+            let state = health.check_circuit();
+            metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
+            return state;
         }
         CircuitState::Closed
     }
@@ -320,7 +332,7 @@ impl RpcHealthScorer {
     ///
     /// Returns true if the endpoint is stale and deducts 10 points.
     pub fn check_and_record_stale(&self, url: &str) -> bool {
-        let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+        let endpoints = unpoison_read(&self.endpoints, "endpoints");
 
         let health = match endpoints.get(url) {
             Some(h) => h,
@@ -369,8 +381,8 @@ impl RpcHealthScorer {
     /// endpoints have the same score, prefers the one most recently successful.
     /// Endpoints whose circuit breaker is Open are skipped entirely.
     pub fn select_best_endpoint(&self) -> String {
-        let scores = self.scores.read().expect("scores lock poisoned");
-        let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+        let scores = unpoison_read(&self.scores, "scores");
+        let mut endpoints = unpoison_write(&self.endpoints, "endpoints");
 
         let mut best_url: Option<&String> = None;
         let mut best_score = MIN_SCORE;
@@ -434,7 +446,7 @@ impl RpcHealthScorer {
         // a few points per call must not flip the active endpoint
         // request-to-request, since every switch pays a fresh connection
         // instead of reusing the pooled one.
-        let mut sticky = self.sticky.write().expect("sticky lock poisoned");
+        let mut sticky = unpoison_write(&self.sticky, "sticky");
         if *sticky != *best_url {
             let current_score = scores
                 .get(sticky.as_str())
@@ -450,7 +462,7 @@ impl RpcHealthScorer {
     /// Get the current score for a specific endpoint.
     #[allow(dead_code)]
     pub fn get_score(&self, url: &str) -> u8 {
-        let scores = self.scores.read().expect("scores lock poisoned");
+        let scores = unpoison_read(&self.scores, "scores");
         scores.get(url).copied().unwrap_or(INITIAL_SCORE)
     }
 
@@ -459,7 +471,7 @@ impl RpcHealthScorer {
     /// Returns a map of endpoint URLs to their current scores.
     #[allow(dead_code)]
     pub fn get_all_scores(&self) -> HashMap<String, u8> {
-        let scores = self.scores.read().expect("scores lock poisoned");
+        let scores = unpoison_read(&self.scores, "scores");
         scores.clone()
     }
 
@@ -467,27 +479,25 @@ impl RpcHealthScorer {
     ///
     /// Returns true if every endpoint has a score below the threshold.
     pub fn all_degraded(&self) -> bool {
-        let scores = self.scores.read().expect("scores lock poisoned");
+        let scores = unpoison_read(&self.scores, "scores");
         scores.values().all(|&score| score < ALL_DEGRADED_THRESHOLD)
     }
 
     /// Apply a score deduction to the given endpoint.
     fn apply_deduction(&self, url: &str, amount: u8) {
-        if let Ok(mut endpoints) = self.endpoints.write() {
-            if let Some(health) = endpoints.get_mut(url) {
-                health.apply_deduction(amount);
-                health.record_failure();
+        let mut endpoints = unpoison_write(&self.endpoints, "endpoints");
+        if let Some(health) = endpoints.get_mut(url) {
+            health.apply_deduction(amount);
+            health.record_failure();
 
-                // Publish circuit breaker state if it changed
-                let state = health.circuit_state;
-                metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
+            // Publish circuit breaker state if it changed
+            let state = health.circuit_state;
+            metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
 
-                // Update the read-optimized scores map and publish metric
-                if let Ok(mut scores) = self.scores.write() {
-                    scores.insert(url.to_string(), health.score);
-                    metrics::set_rpc_health_score(url, health.score);
-                }
-            }
+            // Update the read-optimized scores map and publish metric
+            let mut scores = unpoison_write(&self.scores, "scores");
+            scores.insert(url.to_string(), health.score);
+            metrics::set_rpc_health_score(url, health.score);
         }
     }
 }
@@ -809,5 +819,60 @@ mod tests {
             selected == "https://primary.example" || selected == "https://backup.example",
             "fallback returned an unconfigured endpoint: {selected}"
         );
+    }
+
+    #[test]
+    fn recovers_from_poisoned_endpoints_and_scores_locks() {
+        let s = std::sync::Arc::new(scorer());
+        let s_clone = s.clone();
+
+        // Deliberately poison the endpoints lock
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = s_clone.endpoints.write().unwrap();
+            panic!("deliberate panic to poison endpoints lock");
+        }));
+
+        // Deliberately poison the scores lock
+        let s_clone2 = s.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = s_clone2.scores.write().unwrap();
+            panic!("deliberate panic to poison scores lock");
+        }));
+
+        // Deliberately poison the sticky lock
+        let s_clone3 = s.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = s_clone3.sticky.write().unwrap();
+            panic!("deliberate panic to poison sticky lock");
+        }));
+
+        assert!(s.endpoints.is_poisoned());
+        assert!(s.scores.is_poisoned());
+        assert!(s.sticky.is_poisoned());
+
+        // select_best_endpoint should not panic and should recover
+        let best = s.select_best_endpoint();
+        assert_eq!(best, "https://primary.example");
+
+        // get_score should not panic
+        let score = s.get_score("https://primary.example");
+        assert_eq!(score, INITIAL_SCORE);
+
+        // get_all_scores should not panic
+        let scores = s.get_all_scores();
+        assert_eq!(scores.get("https://primary.example"), Some(&INITIAL_SCORE));
+
+        // record_success should not panic and should update state
+        s.record_success("https://primary.example", Some(1234));
+
+        // all_degraded should not panic
+        assert!(!s.all_degraded());
+
+        // check_and_record_stale should not panic
+        assert!(!s.check_and_record_stale("https://primary.example"));
+
+        // circuit state checks should not panic
+        assert!(s.is_circuit_allowed("https://primary.example"));
+        assert_eq!(s.get_circuit_state("https://primary.example"), CircuitState::Closed);
     }
 }

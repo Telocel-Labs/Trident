@@ -59,20 +59,21 @@ impl SpecCache {
     /// a WASM this process downloaded or from `contract_specs` at startup
     /// (issue #726).
     pub fn get(&self, code_hash: &str) -> Option<Vec<SpecFunction>> {
-        self.by_code_hash
-            .lock()
-            .expect("spec cache mutex poisoned")
-            .get(code_hash)
-            .cloned()
+        let guard = self.by_code_hash.lock().unwrap_or_else(|e| {
+            tracing::warn!("spec cache mutex was poisoned; recovering inner guard");
+            e.into_inner()
+        });
+        guard.get(code_hash).cloned()
     }
 
     /// Remember the parsed functions for `code_hash`. Keying is by WASM hash,
     /// so what is cached is content-addressed and cannot go stale.
     pub fn insert(&self, code_hash: impl Into<String>, functions: Vec<SpecFunction>) {
-        self.by_code_hash
-            .lock()
-            .expect("spec cache mutex poisoned")
-            .insert(code_hash.into(), functions);
+        let mut guard = self.by_code_hash.lock().unwrap_or_else(|e| {
+            tracing::warn!("spec cache mutex was poisoned; recovering inner guard");
+            e.into_inner()
+        });
+        guard.insert(code_hash.into(), functions);
     }
 }
 
@@ -634,5 +635,21 @@ pub(crate) mod tests {
         // One request for the shared hash + one attempt for the broken hash;
         // the preseeded hash costs no request at all.
         assert_eq!(code_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn spec_cache_recovers_from_poisoned_lock() {
+        let cache = std::sync::Arc::new(SpecCache::new());
+        let cache_clone = cache.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache_clone.by_code_hash.lock().unwrap();
+            panic!("deliberate panic to poison spec cache mutex");
+        }));
+
+        assert!(cache.by_code_hash.is_poisoned());
+        assert!(cache.get("nonexistent").is_none());
+        cache.insert("hash1", vec![]);
+        assert!(cache.get("hash1").is_some());
+        assert_eq!(cache.get("hash1").unwrap().len(), 0);
     }
 }
