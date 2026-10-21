@@ -319,6 +319,46 @@ two without paging on a blip.
 `readinessProbe`/`livenessProbe` results if running under Kubernetes (see
 `helm/trident/values.yaml`).
 
+## TridentGrpcAPIProcessDown
+
+**Means:** `up{job="trident-grpc-api"}` is 0 for 2 minutes — Prometheus can't
+scrape the gRPC API on its metrics port (`METRICS_PORT`, default `9092`).
+
+**Why this threshold:** standard scrape-health signal matching the indexer
+and Go API process down rules.
+
+**First steps:**
+1. Check container/process status for `grpc-api` (`docker logs` or `kubectl logs -l app.kubernetes.io/component=grpc-api`).
+2. Verify port 9092 is bound and accessible from Prometheus.
+3. Check for crash loops or panic traces during initialization.
+
+## TridentGrpcAPIErrorRateHigh
+
+**Means:** over 5% of internal gRPC requests across methods (`list_events`,
+`get_event`, `stream_events`) returned non-OK status codes over the last 5
+minutes.
+
+**Why this threshold:** 5% mirrors `TridentAPIHTTP5xxRateHigh` — gRPC calls
+power the Go API and event streaming, so errors here directly propagate to clients.
+
+**First steps:**
+1. Inspect `trident_grpc_api_errors_total` broken down by `method` and `code` (`NOT_FOUND`, `INVALID_ARGUMENT`, `UNAVAILABLE`, `DEADLINE_EXCEEDED`).
+2. Check Postgres pool saturation (`trident_grpc_api_db_pool_acquired_connections`) and query timeouts.
+3. Check Redis connection manager health if `stream_events` is erroring.
+
+## TridentGrpcAPIDBPoolSaturated
+
+**Means:** over 90% of the gRPC API's configured Postgres connection pool
+capacity has been continuously acquired/in-use for 5 minutes.
+
+**Why this threshold:** 90% gives early warning before requests block on
+connection acquisition or fail with connection timeouts.
+
+**First steps:**
+1. Check `trident_grpc_api_db_pool_acquired_connections` vs `_size`.
+2. Inspect `pg_stat_activity` for long-running transactions or lock contention on `soroban_events`.
+3. If sustained legitimate load, consider increasing `GRPC_API_DB_POOL_SIZE` in deployment configuration.
+
 ## TridentAPIDependencyUnhealthy
 
 **Means:** `GET /v1/health` has been returning non-200 for 5 minutes. That
@@ -1193,3 +1233,15 @@ considers this endpoint close to unusable, not merely degraded.
 
 **Escalation:** `severity: page` — this endpoint is near-unusable by the
 scorer's own floor.
+
+
+## TridentDatabaseBackupFailed
+
+**Means:** `trident_database_backup_last_success_timestamp_seconds` has not advanced in over 26 hours — the daily automated database backup has failed or stalled.
+
+**Why this threshold:** Daily backups run every 24 hours. A 26-hour threshold allows for minor scheduling delays before paging on-call.
+
+**First steps:**
+1. Check the backup job logs (`scripts/backup.sh` or Kubernetes CronJob logs).
+2. Verify Postgres connectivity and available disk space in the backup destination.
+3. Manually trigger a backup to ensure recovery point objective (RPO) is maintained.

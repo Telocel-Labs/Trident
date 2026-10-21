@@ -1,9 +1,12 @@
 use trident_common::TridentError;
 
+pub const DEFAULT_METRICS_PORT: u16 = 9092;
+
 #[derive(Debug)]
 pub struct Config {
     pub database_url: String,
     pub grpc_addr: String,
+    pub metrics_port: u16,
     pub mtls: Option<MtlsConfig>,
 }
 
@@ -26,6 +29,12 @@ impl Config {
 
         let database_url = collect_required("DATABASE_URL", &mut missing);
         let grpc_addr = collect_required("GRPC_ADDR", &mut missing);
+
+        let metrics_port = std::env::var("GRPC_METRICS_PORT")
+            .or_else(|_| std::env::var("METRICS_PORT"))
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_METRICS_PORT);
 
         let mtls_enabled = std::env::var("GRPC_MTLS_ENABLED")
             .map(|v| v == "true")
@@ -58,6 +67,7 @@ impl Config {
         Ok(Self {
             database_url: database_url.unwrap(),
             grpc_addr: grpc_addr.unwrap(),
+            metrics_port,
             mtls,
         })
     }
@@ -150,15 +160,29 @@ mod tests {
                 let cfg = Config::from_env().unwrap();
                 assert_eq!(cfg.database_url, "postgres://localhost/trident");
                 assert_eq!(cfg.grpc_addr, "0.0.0.0:50051");
+                assert_eq!(cfg.metrics_port, DEFAULT_METRICS_PORT);
                 assert!(cfg.mtls.is_none());
             },
         );
     }
 
     #[test]
+    fn custom_metrics_port_env() {
+        with_env(
+            &[
+                ("DATABASE_URL", "postgres://localhost/trident"),
+                ("GRPC_ADDR", "0.0.0.0:50051"),
+                ("GRPC_METRICS_PORT", "9999"),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.metrics_port, 9999);
+            },
+        );
+    }
+
+    #[test]
     fn mtls_disabled_by_default() {
-        // Note: do not also take env_guard() here — with_env() below takes
-        // it internally, and the guard mutex is not reentrant.
         env::remove_var("GRPC_MTLS_ENABLED");
         with_env(
             &[

@@ -12,6 +12,7 @@ pub mod trident {
 }
 
 mod config;
+mod metrics;
 mod services;
 
 /// Read-heavy service with moderate concurrency, so a moderate pool is correct.
@@ -58,8 +59,11 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracer = init_tracer();
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer())
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(trident_common::logging::JsonLayer::new(
+            "trident-grpc-api",
+            std::io::stdout,
+        ))
         .with(tracer.map(|t| tracing_opentelemetry::layer().with_tracer(t)))
         .init();
 
@@ -67,6 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{e}");
         std::process::exit(1);
     });
+
+    metrics::install(cfg.metrics_port).unwrap_or_else(|e| {
+        eprintln!("Failed to start metrics exporter on port {}: {e}", cfg.metrics_port);
+        std::process::exit(1);
+    });
+    tracing::info!(metrics_port = cfg.metrics_port, "Prometheus /metrics endpoint listening");
 
     let pool_size = std::env::var("GRPC_API_DB_POOL_SIZE")
         .ok()
@@ -83,6 +93,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_with(connect_options)
         .await?;
     tracing::info!(pool_size, "Database connected via pool");
+
+    let pool_metrics = db_pool.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            metrics::set_db_pool_stats(pool_metrics.size(), pool_metrics.num_idle() as u32);
+        }
+    });
 
     let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL is required");
     let redis_manager = redis::Client::open(redis_url)?

@@ -28,6 +28,9 @@ spec:
             - name: grpc
               containerPort: {{ .Values.grpcApi.service.port }}
               protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.grpcApi.metricsPort | default 9092 }}
+              protocol: TCP
           volumeMounts:
             - name: tmp
               mountPath: /tmp
@@ -114,4 +117,8 @@ spec:
     - name: grpc
       port: {{ .Values.grpcApi.service.port }}
       targetPort: grpc
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.grpcApi.metricsPort | default 9092 }}
+      targetPort: metrics
       protocol: TCP

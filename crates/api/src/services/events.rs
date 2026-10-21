@@ -312,6 +312,15 @@ fn network_matches(entry_network: &str, wanted: Option<&str>) -> bool {
     wanted.is_none_or(|n| entry_network == n)
 }
 
+/// RAII guard ensuring active stream gauge is decremented when the stream consumer terminates.
+struct ActiveStreamGuard;
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        crate::metrics::decrement_active_streams();
+    }
+}
+
 /// Consume the indexer's Redis stream and push matching events to one
 /// subscriber until the client goes away.
 ///
@@ -322,6 +331,9 @@ async fn run_stream_consumer(
     tx: tokio::sync::mpsc::Sender<Result<Event, Status>>,
     subscription: StreamSubscription,
 ) {
+    crate::metrics::increment_active_streams();
+    let _guard = ActiveStreamGuard;
+
     let StreamSubscription {
         contract_id,
         topic_0,
@@ -404,9 +416,8 @@ async fn run_stream_consumer(
 // gRPC service implementation
 // ---------------------------------------------------------------------------
 
-#[tonic::async_trait]
-impl Events for EventsServiceImpl {
-    async fn list_events(
+impl EventsServiceImpl {
+    async fn list_events_inner(
         &self,
         request: Request<ListEventsRequest>,
     ) -> Result<Response<ListEventsResponse>, Status> {
@@ -489,7 +500,7 @@ impl Events for EventsServiceImpl {
         .await
     }
 
-    async fn get_event(
+    async fn get_event_inner(
         &self,
         request: Request<GetEventRequest>,
     ) -> Result<Response<Event>, Status> {
@@ -535,12 +546,10 @@ impl Events for EventsServiceImpl {
         .await
     }
 
-    type StreamEventsStream = tokio_stream::wrappers::ReceiverStream<Result<Event, Status>>;
-
-    async fn stream_events(
+    async fn stream_events_inner(
         &self,
         request: Request<StreamEventsRequest>,
-    ) -> Result<Response<Self::StreamEventsStream>, Status> {
+    ) -> Result<Response<<Self as Events>::StreamEventsStream>, Status> {
         let parent_cx = extract_context(request.metadata());
         let span = tracing::info_span!("stream_events", "rpc.system" = "grpc");
         span.set_parent(parent_cx);
@@ -586,6 +595,53 @@ impl Events for EventsServiceImpl {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+}
+
+#[tonic::async_trait]
+impl Events for EventsServiceImpl {
+    type StreamEventsStream = tokio_stream::wrappers::ReceiverStream<Result<Event, Status>>;
+
+    async fn list_events(
+        &self,
+        request: Request<ListEventsRequest>,
+    ) -> Result<Response<ListEventsResponse>, Status> {
+        let start = std::time::Instant::now();
+        let res = self.list_events_inner(request).await;
+        let duration = start.elapsed().as_secs_f64();
+        match &res {
+            Ok(_) => crate::metrics::record_rpc_success("list_events", duration),
+            Err(status) => crate::metrics::record_rpc_error("list_events", status, duration),
+        }
+        res
+    }
+
+    async fn get_event(
+        &self,
+        request: Request<GetEventRequest>,
+    ) -> Result<Response<Event>, Status> {
+        let start = std::time::Instant::now();
+        let res = self.get_event_inner(request).await;
+        let duration = start.elapsed().as_secs_f64();
+        match &res {
+            Ok(_) => crate::metrics::record_rpc_success("get_event", duration),
+            Err(status) => crate::metrics::record_rpc_error("get_event", status, duration),
+        }
+        res
+    }
+
+    async fn stream_events(
+        &self,
+        request: Request<StreamEventsRequest>,
+    ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        let start = std::time::Instant::now();
+        let res = self.stream_events_inner(request).await;
+        let duration = start.elapsed().as_secs_f64();
+        match &res {
+            Ok(_) => crate::metrics::record_rpc_success("stream_events", duration),
+            Err(status) => crate::metrics::record_rpc_error("stream_events", status, duration),
+        }
+        res
     }
 }
 

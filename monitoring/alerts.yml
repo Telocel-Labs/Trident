@@ -367,6 +367,56 @@ groups:
           runbook_url: "docs/runbooks/alerts.md#tridentapiprocessdown"
 
   # ---------------------------------------------------------------------------
+  # Internal gRPC API (Rust, crates/api) alerts (issue #790)
+  # ---------------------------------------------------------------------------
+  - name: trident.grpc_api
+    rules:
+      - alert: TridentGrpcAPIProcessDown
+        expr: up{job="trident-grpc-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: grpc-api
+        annotations:
+          summary: "Trident gRPC API scrape target is down"
+          description: "Prometheus has not been able to scrape trident-grpc-api for 2 minutes."
+          runbook_url: "docs/runbooks/alerts.md#tridentgrpcapiprocessdown"
+
+      - alert: TridentGrpcAPIErrorRateHigh
+        expr: >
+          (
+            sum(rate(trident_grpc_api_errors_total[5m]))
+            /
+            (sum(rate(trident_grpc_api_requests_total[5m])) + 0.0001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: grpc-api
+        annotations:
+          summary: "Elevated Trident gRPC API error rate ({{ $value | humanizePercentage }})"
+          description: >
+            Over 5% of internal gRPC requests returned an error status in the last 5 minutes.
+          runbook_url: "docs/runbooks/alerts.md#tridentgrpcapierrorratehigh"
+
+      - alert: TridentGrpcAPIDBPoolSaturated
+        expr: >
+          (
+            (trident_grpc_api_db_pool_size - trident_grpc_api_db_pool_idle_connections)
+            /
+            (trident_grpc_api_db_pool_size + 0.0001)
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          service: grpc-api
+        annotations:
+          summary: "Trident gRPC API Postgres pool is close to exhausted ({{ $value | humanizePercentage }} in-use)"
+          description: >
+            Over 90% of the gRPC API's Postgres connection pool has been in-use for 5 minutes.
+          runbook_url: "docs/runbooks/alerts.md#tridentgrpcapidbpoolsaturated"
+
+  # ---------------------------------------------------------------------------
   # Dependency health — Postgres and Redis, as seen through the Go API.
   # GET /v1/health checks both (and gRPC) directly; the Helm chart's
   # liveness/readiness probes already poll it every 10s, which is what keeps
@@ -766,4 +816,5 @@ groups:
         annotations:
           summary: "Database backup has not succeeded in over 26 hours"
           description: "Automated PostgreSQL backup job has failed or failed to run, risking data loss."
+          runbook_url: "docs/runbooks/alerts.md#tridentdatabasebackupfailed"
 

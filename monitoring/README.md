@@ -12,12 +12,15 @@ scrape_configs:
   - job_name: trident-indexer
     static_configs:
       - targets: ["indexer:9090"] # crates/indexer/src/metrics.rs, METRICS_PORT
+  - job_name: trident-grpc-api
+    static_configs:
+      - targets: ["grpc-api:9092"] # crates/api/src/metrics.rs, METRICS_PORT / GRPC_METRICS_PORT
   - job_name: trident-api
     static_configs:
       - targets: ["api:3000"] # GET /metrics, services/api
 ```
 
-The `job=` labels above (`trident-indexer`, `trident-api`) must match what
+The `job=` labels above (`trident-indexer`, `trident-grpc-api`, `trident-api`) must match what
 `alerts.yml`'s `up{job="..."}` rules expect — rename both sides together if
 you use different job names.
 

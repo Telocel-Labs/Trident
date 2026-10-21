@@ -161,9 +161,11 @@ grpcApi:
   replicaCount: 1
   service:
     port: 5000
+  metricsPort: 9092
   env:
     # Address the gRPC server binds to. Must match service.port.
     GRPC_ADDR: "0.0.0.0:5000"
+    METRICS_PORT: "9092"
     # In-flight event buffer per StreamEvents subscriber. A full buffer blocks
     # that subscriber's Redis consumer — deliberate backpressure, so a slow
     # client throttles itself instead of growing an unbounded server-side queue.
