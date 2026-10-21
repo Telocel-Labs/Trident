@@ -1,0 +1,199 @@
+{
+  "description": "Representative corpus of Stellar Soroban mainnet event shapes (issue #673). Covers SAC tokens, NFTs, AMM/DEX pools, governance/DAO protocols, and system/diagnostic events.",
+  "event_mix_ratio": {
+    "sac_tokens": 0.50,
+    "amm_dex": 0.20,
+    "nft": 0.15,
+    "governance": 0.10,
+    "system_and_diagnostic": 0.05
+  },
+  "event_templates": [
+    {
+      "category": "sac_token",
+      "name": "sac_transfer",
+      "event_type": "contract",
+      "contract_id": "CAS3J7GYLGXMF6TDJBBYYSE3VBMN6SFQ5XNVTOV5GOG22EWNOK3FRS3L",
+      "topics": [
+        "transfer",
+        "GDL6WJ6U7X5O5H2G5F6Z2YV4R3K1T0M9B8A7C6D5E4F3G2H1I0J9K8L7",
+        "GBZXN7PIRZGNMHGA728VY3CW2QLL4EPYQRSUV7U5225WK62ZNNOJNQ26"
+      ],
+      "data": {
+        "amount": "1500000000",
+        "asset": "USDC"
+      }
+    },
+    {
+      "category": "sac_token",
+      "name": "sac_mint",
+      "event_type": "contract",
+      "contract_id": "CAS3J7GYLGXMF6TDJBBYYSE3VBMN6SFQ5XNVTOV5GOG22EWNOK3FRS3L",
+      "topics": [
+        "mint",
+        "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M",
+        "GBZXN7PIRZGNMHGA728VY3CW2QLL4EPYQRSUV7U5225WK62ZNNOJNQ26"
+      ],
+      "data": {
+        "amount": "5000000000"
+      }
+    },
+    {
+      "category": "sac_token",
+      "name": "sac_burn",
+      "event_type": "contract",
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "topics": [
+        "burn",
+        "GBZXN7PIRZGNMHGA728VY3CW2QLL4EPYQRSUV7U5225WK62ZNNOJNQ26"
+      ],
+      "data": {
+        "amount": "250000000"
+      }
+    },
+    {
+      "category": "sac_token",
+      "name": "sac_clawback",
+      "event_type": "contract",
+      "contract_id": "CAS3J7GYLGXMF6TDJBBYYSE3VBMN6SFQ5XNVTOV5GOG22EWNOK3FRS3L",
+      "topics": [
+        "clawback",
+        "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M",
+        "GDL6WJ6U7X5O5H2G5F6Z2YV4R3K1T0M9B8A7C6D5E4F3G2H1I0J9K8L7"
+      ],
+      "data": {
+        "amount": "100000000"
+      }
+    },
+    {
+      "category": "nft",
+      "name": "nft_mint",
+      "event_type": "contract",
+      "contract_id": "CA4B5Q7K6P2T9R8S1V3X5Z7M9N0B2D4F6H8J1L3N5P7R9T1V3X5Z7A2C",
+      "topics": [
+        "mint",
+        "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M",
+        "GDL6WJ6U7X5O5H2G5F6Z2YV4R3K1T0M9B8A7C6D5E4F3G2H1I0J9K8L7",
+        "1042"
+      ],
+      "data": {
+        "token_id": 1042,
+        "name": "Stellar Voyager #1042",
+        "uri": "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+      }
+    },
+    {
+      "category": "nft",
+      "name": "nft_transfer",
+      "event_type": "contract",
+      "contract_id": "CA4B5Q7K6P2T9R8S1V3X5Z7M9N0B2D4F6H8J1L3N5P7R9T1V3X5Z7A2C",
+      "topics": [
+        "transfer",
+        "GDL6WJ6U7X5O5H2G5F6Z2YV4R3K1T0M9B8A7C6D5E4F3G2H1I0J9K8L7",
+        "GBZXN7PIRZGNMHGA728VY3CW2QLL4EPYQRSUV7U5225WK62ZNNOJNQ26",
+        "1042"
+      ],
+      "data": null
+    },
+    {
+      "category": "amm_dex",
+      "name": "dex_swap",
+      "event_type": "contract",
+      "contract_id": "CCW67TSZV3SSS2HXMBQ5AC6KJ1UO8K3W8W9V5N4B2D1F3G5H7J9K1L3M",
+      "topics": [
+        "swap",
+        "CCW67TSZV3SSS2HXMBQ5AC6KJ1UO8K3W8W9V5N4B2D1F3G5H7J9K1L3M",
+        "GDL6WJ6U7X5O5H2G5F6Z2YV4R3K1T0M9B8A7C6D5E4F3G2H1I0J9K8L7"
+      ],
+      "data": {
+        "amount_in": "1000000000",
+        "amount_out": "994020000",
+        "fee_paid": "3000000",
+        "path": [
+          "CAS3J7GYLGXMF6TDJBBYYSE3VBMN6SFQ5XNVTOV5GOG22EWNOK3FRS3L",
+          "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        ]
+      }
+    },
+    {
+      "category": "amm_dex",
+      "name": "dex_deposit",
+      "event_type": "contract",
+      "contract_id": "CCW67TSZV3SSS2HXMBQ5AC6KJ1UO8K3W8W9V5N4B2D1F3G5H7J9K1L3M",
+      "topics": [
+        "deposit",
+        "CCW67TSZV3SSS2HXMBQ5AC6KJ1UO8K3W8W9V5N4B2D1F3G5H7J9K1L3M",
+        "GBZXN7PIRZGNMHGA728VY3CW2QLL4EPYQRSUV7U5225WK62ZNNOJNQ26"
+      ],
+      "data": {
+        "lp_shares_minted": "4500000",
+        "token_a_deposited": "500000000",
+        "token_b_deposited": "500000000"
+      }
+    },
+    {
+      "category": "governance",
+      "name": "proposal_created",
+      "event_type": "contract",
+      "contract_id": "CGOV8T7M1K3N5P7R9T1V3X5Z7A2C4E6G8I0K2M4O6Q8S0U2W4Y6A8C0E",
+      "topics": [
+        "gov",
+        "proposal",
+        "create",
+        "42"
+      ],
+      "data": {
+        "proposal_id": 42,
+        "proposer": "GDL6WJ6U7X5O5H2G5F6Z2YV4R3K1T0M9B8A7C6D5E4F3G2H1I0J9K8L7",
+        "title": "Upgrade protocol parameters for Wave 10",
+        "voting_deadline_ledger": 52500000
+      }
+    },
+    {
+      "category": "governance",
+      "name": "vote_cast",
+      "event_type": "contract",
+      "contract_id": "CGOV8T7M1K3N5P7R9T1V3X5Z7A2C4E6G8I0K2M4O6Q8S0U2W4Y6A8C0E",
+      "topics": [
+        "gov",
+        "vote",
+        "42",
+        "GBZXN7PIRZGNMHGA728VY3CW2QLL4EPYQRSUV7U5225WK62ZNNOJNQ26"
+      ],
+      "data": {
+        "proposal_id": 42,
+        "support": true,
+        "voting_weight": "50000000"
+      }
+    },
+    {
+      "category": "system_and_diagnostic",
+      "name": "system_config_change",
+      "event_type": "system",
+      "contract_id": "CSYSTEM00000000000000000000000000000000000000000000000001",
+      "topics": [
+        "core",
+        "protocol_upgrade"
+      ],
+      "data": {
+        "version": 21,
+        "max_tx_set_size": 1000
+      }
+    },
+    {
+      "category": "system_and_diagnostic",
+      "name": "diagnostic_invocation_trace",
+      "event_type": "diagnostic",
+      "contract_id": "CAS3J7GYLGXMF6TDJBBYYSE3VBMN6SFQ5XNVTOV5GOG22EWNOK3FRS3L",
+      "topics": [
+        "fn_call",
+        "invoke_contract"
+      ],
+      "data": {
+        "fn": "transfer",
+        "cpu_instructions": 234150,
+        "mem_bytes": 65536,
+        "auth_entries": 1
+      }
+    }
+  ]
+}

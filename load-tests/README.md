@@ -54,6 +54,32 @@ allows more than that limit, does not reject the excess, or returns any status
 other than 200/429. Run it against an otherwise idle key so earlier requests in
 the same sliding window do not affect the expected boundary.
 
+## Mainnet Event Payload Variety (issue #673)
+
+Earlier load and soak tests generated only synthetic single-shape token mint events against a local contract. Mainnet traffic exhibits high payload and schema diversity across deployed contracts, including multi-topic events, SAC tokens, NFTs, AMMs, DAO governance, and system/diagnostic events.
+
+To realistically benchmark the indexer, database query planner, and API layer, Trident includes a representative mainnet event corpus and generation tooling:
+
+- **Corpus Fixtures**: [`load-tests/fixtures/mainnet_event_corpus.json`](./fixtures/mainnet_event_corpus.json) defines 12+ real event shapes across 5 categories:
+  - **SAC Tokens (50%)**: `transfer`, `mint`, `burn`, `clawback` with standard 2-3 topics and i128 amounts.
+  - **AMM / DEX (20%)**: `swap`, `deposit` with multi-asset paths, token pairs, and nested payload objects.
+  - **NFTs (15%)**: `mint`, `transfer` with 4 topics `[Symbol, Address, Address, U64]` and metadata URIs.
+  - **DAO Governance (10%)**: `proposal_created`, `vote_cast` with custom multi-topic hierarchy.
+  - **System & Diagnostic (5%)**: protocol configuration updates and diagnostic execution traces.
+
+### Generating and Seeding Varied Mainnet Events
+
+```bash
+# Generate 5,000 realistic mainnet events as JSON or SQL
+python3 load-tests/generate_mainnet_events.py --count 5000 --format json --out varied-events.json
+python3 load-tests/generate_mainnet_events.py --count 5000 --format sql --out varied-events.sql
+
+# Seed directly into target PostgreSQL database:
+DATABASE_URL="postgresql://trident:password@localhost:5432/trident" ./load-tests/seed-varied-events.sh 5000
+```
+
+`events-load.js` automatically executes the `varied` scenario across topic, contract, and type query shapes. Ingest soak testing (`ingest-soak.sh`) defaults to cycling through diverse operations (`ENABLE_VARIED_EVENTS=true`).
+
 ## Launch Verification Runs
 
 ### Combined launch soak (`launch-soak.sh`)
