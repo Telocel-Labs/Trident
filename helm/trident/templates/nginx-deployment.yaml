@@ -48,9 +48,18 @@ spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.nginx.securityContextUid) | nindent 8 }}
+      {{- if .Values.nginx.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.nginx.topologySpreadConstraints.maxSkew }}
+          topologyKey: {{ .Values.nginx.topologySpreadConstraints.topologyKey }}
+          whenUnsatisfiable: {{ .Values.nginx.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 14 }}
+      {{- end }}
       containers:
         - name: nginx
-          image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}"
+          image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}{{ if .Values.nginx.image.digest }}@{{ .Values.nginx.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}
@@ -116,7 +125,7 @@ spec:
       port: {{ .Values.nginx.service.port }}
       targetPort: http
       protocol: TCP
-{{- if and .Values.nginx.podDisruptionBudget.enabled (gt (int .Values.nginx.replicaCount) 1) }}
+{{- if .Values.nginx.podDisruptionBudget.enabled }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -126,7 +135,11 @@ metadata:
     {{- include "trident.labels" . | nindent 4 }}
     app.kubernetes.io/component: nginx
 spec:
-  minAvailable: {{ .Values.nginx.podDisruptionBudget.minAvailable }}
+  # maxUnavailable (issue #766), not minAvailable: unlike minAvailable,
+  # this stays safe to evict from regardless of replicaCount — it never
+  # forbids every voluntary disruption outright the way minAvailable: 1
+  # did at replicaCount: 1.
+  maxUnavailable: {{ .Values.nginx.podDisruptionBudget.maxUnavailable }}
   selector:
     matchLabels:
       {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 6 }}
