@@ -220,12 +220,8 @@ impl Config {
         let explicit_network = std::env::var("NETWORK")
             .ok()
             .filter(|v| !v.trim().is_empty());
-        let explicit_network = std::env::var("NETWORK")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let network = explicit_network.clone().unwrap_or_else(|| "testnet".into());
-        validate_network_against_rpc(explicit_network.as_deref(), &stellar_rpc_urls)?;
-        // Normalise exactly once, here (issue #736). Every later consumer —
+
+        // Normalise exactly once, here (issue #736, #630). Every later consumer —
         // the cursor key, the network column on every write, the passphrase
         // default and the RPC timeout defaults — reads this one value, so an
         // alias like `pubnet` cannot produce a `latest_ledger_cursor:pubnet`
@@ -239,9 +235,13 @@ impl Config {
                 Err(e) => {
                     errors.push(e);
                     // Placeholder: `errors` is non-empty, so from_env bails below.
-                    String::new()
+                    "testnet".to_string()
                 }
             };
+
+        if let Err(e) = validate_network_against_rpc(explicit_network.as_deref(), &stellar_rpc_urls) {
+            errors.push(e.to_string());
+        }
 
         // Network passphrase for SAC contract id derivation (issue #262).
         let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {
@@ -484,10 +484,14 @@ impl Config {
             }
         }
 
-        // ── Optional settings (parsed but not fatal on failure) ──────────────
-        let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // ── Optional settings (issue #630) ──────────────────────────────────
+        let index_diagnostic = match parse_bool("INDEX_DIAGNOSTIC", false) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(e.to_string());
+                false
+            }
+        };
 
         // Enabled unless explicitly turned off: the reconciler is the proof
         // that indexed data matches the chain, so it defaults on (issue #511).
@@ -1055,6 +1059,25 @@ fn parse_bounded_u64_raw(key: &str, raw: &str, min: u64, max: u64) -> Result<u64
         )));
     }
     Ok(v)
+}
+
+/// Parse an env var as boolean with a default value (issue #630).
+///
+/// Accepts standard truthy/falsy strings case-insensitively. A present but
+/// malformed value (like "maybe" or "2") fails startup naming the variable
+/// rather than falling back silently.
+fn parse_bool(key: &str, default: bool) -> Result<bool, TridentError> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(v) if v.trim().is_empty() => Ok(default),
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            other => Err(TridentError::config(anyhow::anyhow!(
+                "[indexer] {key} must be a boolean ('true'/'false', '1'/'0', 'yes'/'no'), got {other:?}"
+            ))),
+        },
+    }
 }
 
 /// Parse an optional positive pool-size env var, falling back to `default`.
@@ -2058,6 +2081,122 @@ mod tests {
             env::remove_var("NETWORK");
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.network, "testnet");
+        });
+    }
+    #[test]
+    fn from_env_rejects_malformed_network_even_with_passphrase_set() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "mainet"));
+        vars.push(("NETWORK_PASSPHRASE", "Custom Passphrase ; September 2015"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("NETWORK"), "error should name NETWORK: {err}");
+            assert!(err.to_string().contains("mainet"), "error should mention bad value mainet: {err}");
+        });
+    }
+
+    #[test]
+    fn from_env_validates_index_diagnostic_boolean() {
+        // Valid truthy variants
+        for val in ["true", "1", "yes", "on", "TRUE", "Yes"] {
+            let mut vars = required_vars();
+            vars.push(("INDEX_DIAGNOSTIC", val));
+            with_env(&vars, || {
+                let cfg = Config::from_env().unwrap();
+                assert!(cfg.index_diagnostic, "INDEX_DIAGNOSTIC={val} should be true");
+            });
+        }
+
+        // Valid falsy variants
+        for val in ["false", "0", "no", "off", "FALSE", "No"] {
+            let mut vars = required_vars();
+            vars.push(("INDEX_DIAGNOSTIC", val));
+            with_env(&vars, || {
+                let cfg = Config::from_env().unwrap();
+                assert!(!cfg.index_diagnostic, "INDEX_DIAGNOSTIC={val} should be false");
+            });
+        }
+
+        // Malformed values must fail
+        for bad in ["maybe", "invalid", "2"] {
+            let mut vars = required_vars();
+            vars.push(("INDEX_DIAGNOSTIC", bad));
+            with_env(&vars, || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.to_string().contains("INDEX_DIAGNOSTIC"), "error should name INDEX_DIAGNOSTIC: {err}");
+            });
+        }
+    }
+
+    #[test]
+    fn from_env_validates_redis_stream_maxlen() {
+        let mut vars = required_vars();
+        vars.push(("REDIS_STREAM_MAXLEN", "notanumber"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("REDIS_STREAM_MAXLEN"), "error should name REDIS_STREAM_MAXLEN: {err}");
+        });
+
+        let mut vars2 = required_vars();
+        vars2.push(("REDIS_STREAM_MAXLEN", "0"));
+        with_env(&vars2, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("REDIS_STREAM_MAXLEN"), "error should name REDIS_STREAM_MAXLEN: {err}");
+        });
+
+        let mut vars3 = required_vars();
+        vars3.push(("REDIS_STREAM_MAXLEN", "50000"));
+        with_env(&vars3, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.redis_stream_maxlen, 50000);
+        });
+    }
+
+    #[test]
+    fn from_env_validates_metrics_port() {
+        let mut vars = required_vars();
+        vars.push(("METRICS_PORT", "notaport"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("METRICS_PORT"), "error should name METRICS_PORT: {err}");
+        });
+
+        let mut vars2 = required_vars();
+        vars2.push(("METRICS_PORT", "70000"));
+        with_env(&vars2, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("METRICS_PORT"), "error should name METRICS_PORT: {err}");
+        });
+
+        let mut vars3 = required_vars();
+        vars3.push(("METRICS_PORT", "9191"));
+        with_env(&vars3, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.metrics_port, 9191);
+        });
+    }
+
+    #[test]
+    fn from_env_validates_health_port() {
+        let mut vars = required_vars();
+        vars.push(("HEALTH_PORT", "notaport"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("HEALTH_PORT"), "error should name HEALTH_PORT: {err}");
+        });
+
+        let mut vars2 = required_vars();
+        vars2.push(("HEALTH_PORT", "0"));
+        with_env(&vars2, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("HEALTH_PORT"), "error should name HEALTH_PORT: {err}");
+        });
+
+        let mut vars3 = required_vars();
+        vars3.push(("HEALTH_PORT", "8181"));
+        with_env(&vars3, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.health_port, 8181);
         });
     }
 }
