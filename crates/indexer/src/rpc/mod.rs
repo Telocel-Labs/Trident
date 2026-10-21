@@ -850,7 +850,23 @@ impl RpcClient {
                 // Check for stale ledger
                 self.scorer.check_and_record_stale(&url);
             }
-            Err(e) => self.record_error(&url, e),
+            Err(e) => {
+                let err_str = e.to_string().to_lowercase();
+                if (err_str.contains("limit") || err_str.contains("page"))
+                    && (err_str.contains("exceed")
+                        || err_str.contains("too large")
+                        || err_str.contains("maximum")
+                        || err_str.contains("invalid"))
+                {
+                    tracing::warn!(
+                        limit,
+                        error = %e,
+                        "[indexer] RPC provider rejected getEvents limit (MAX_EVENTS_PER_POLL = {}).                          Adjust MAX_EVENTS_PER_POLL to a smaller value supported by the provider.",
+                        limit
+                    );
+                }
+                self.record_error(&url, e);
+            }
         }
 
         let result = result?;

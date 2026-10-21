@@ -101,6 +101,8 @@ pub struct Streamer {
     /// Trips after sustained RPC failures so the run loop stops attempting
     /// polls during an outage instead of retrying every interval (issue #197).
     rpc_breaker: CircuitBreaker,
+    /// Detected actual page size cap imposed by the RPC provider (issue #674).
+    pub(crate) detected_page_size_cap: Option<usize>,
 }
 
 /// One contract-storage snapshot change observed during a poll cycle,
@@ -207,6 +209,7 @@ impl Streamer {
             adaptive_poll,
             token_contracts: Arc::new(std::sync::RwLock::new(HashSet::new())),
             rpc_breaker,
+            detected_page_size_cap: None,
         })
     }
 
@@ -885,6 +888,7 @@ impl Streamer {
         };
         let mut page_cursor: Option<String> = None;
         let mut total = 0;
+        let mut potential_page_cap: Option<usize> = None;
 
         // Snapshot the server-side filters for the whole cycle (issue #203) so
         // the request shape is stable across pages and the borrow does not
@@ -919,6 +923,24 @@ impl Streamer {
 
             if page.events.is_empty() {
                 break;
+            }
+
+            // If a previous page was shorter than requested_limit and we now received
+            // another non-empty page, this confirms the provider capped the page size (issue #674).
+            if let Some(capped_size) = potential_page_cap {
+                if self.detected_page_size_cap.is_none() {
+                    self.detected_page_size_cap = Some(capped_size);
+                    metrics::record_rpc_page_size_cap_mismatch();
+                    tracing::warn!(
+                        configured_limit = self.config.max_events_per_poll,
+                        detected_cap = capped_size,
+                        next_page_events = page.events.len(),
+                        "[indexer] MAX_EVENTS_PER_POLL ({}) exceeds RPC provider page-size cap (detected {} events/page). \
+                         Adjust MAX_EVENTS_PER_POLL to match provider limits.",
+                        self.config.max_events_per_poll,
+                        capped_size
+                    );
+                }
             }
 
             let last_paging_token = page.events.last().map(|e| e.page_cursor());
@@ -1308,11 +1330,26 @@ impl Streamer {
             // commit and the XADD leaves the event in Postgres and off the
             // stream, with nothing to replay it.
 
+            let requested_limit = self.config.max_events_per_poll as usize;
+            let page_len = page.events.len();
+            let effective_threshold = self.detected_page_size_cap.unwrap_or(requested_limit);
+
             // An incomplete page means we have caught up to the chain tip.
-            if page.events.len() < self.config.max_events_per_poll as usize {
+            if page_len < effective_threshold {
+                // If we haven't locked in a detected cap yet, this shorter-than-requested
+                // page might either be a provider-imposed cap or simply the chain tip.
+                // If the provider capped the page, subsequent pages will have more events;
+                // so we tentatively continue with potential_page_cap set instead of
+                // breaking immediately and causing silent truncation (issue #674).
+                if self.detected_page_size_cap.is_none() && page_len > 0 {
+                    potential_page_cap = Some(page_len);
+                    page_cursor = last_paging_token;
+                    continue;
+                }
                 break;
             }
 
+            potential_page_cap = None;
             page_cursor = last_paging_token;
         }
 
@@ -2855,6 +2892,7 @@ mod tests {
             s.db.clone(),
             conn.clone(),
             RelayConfig {
+                network: "testnet".into(),
                 interval: Duration::from_millis(10),
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
@@ -4384,5 +4422,52 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// Issue #674: When the RPC provider enforces a page-size cap smaller than
+    /// MAX_EVENTS_PER_POLL, ensure the indexer detects the cap, produces diagnostics,
+    /// and continues paging rather than prematurely terminating with silent truncation.
+    #[tokio::test]
+    async fn max_events_per_poll_provider_cap_detected_without_silent_truncation() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // Mock RPC provider returning 4 events on page 1, 2 on page 2, 0 on page 3.
+        // Even though max_events_per_poll is 10, the provider caps each full page at 4.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 4)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 2)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        s.config.max_events_per_poll = 10;
+        reset_db(&s.db).await;
+
+        assert_eq!(s.detected_page_size_cap, None);
+
+        let mut cursor = 0u64;
+        let events = s.poll_once(&mut cursor).await.unwrap();
+
+        // Must process all 6 events across pages rather than truncating at 4
+        assert_eq!(events, 6, "all events across capped pages must be ingested");
+        // Must have detected the provider's cap at 4
+        assert_eq!(
+            s.detected_page_size_cap,
+            Some(4),
+            "provider cap of 4 must be diagnosed"
+        );
     }
 }
