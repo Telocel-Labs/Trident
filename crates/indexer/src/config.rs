@@ -5,6 +5,12 @@ use trident_common::TridentError;
 pub struct Config {
     pub database_url: String,
     pub db_pool_size: u32,
+    /// Dedicated pool size for event ingestion and cursor advance (issue #797).
+    pub db_ingest_pool_size: u32,
+    /// Dedicated pool size for the outbox relay background task (issue #797).
+    pub db_relay_pool_size: u32,
+    /// Dedicated pool size for maintenance (reconciler, retention, partitions, health) (issue #797).
+    pub db_maintenance_pool_size: u32,
     pub redis_url: String,
     /// Primary RPC endpoint — always the first entry of `stellar_rpc_urls`.
     pub stellar_rpc_url: String,
@@ -159,9 +165,12 @@ impl std::fmt::Debug for RpcHeaderConfig {
     }
 }
 
-/// Default Postgres pool size for the indexer. It is a single writer with low
-/// write concurrency, so a small pool is correct (issue #87).
-const DEFAULT_DB_POOL_SIZE: u32 = 3;
+/// Default Postgres pool sizes across the indexer (issue #797).
+/// Sized to prevent contention between live ingest, outbox relay passes and background maintenance.
+pub const DEFAULT_DB_POOL_SIZE: u32 = 10;
+pub const DEFAULT_DB_INGEST_POOL_SIZE: u32 = 5;
+pub const DEFAULT_DB_RELAY_POOL_SIZE: u32 = 3;
+pub const DEFAULT_DB_MAINTENANCE_POOL_SIZE: u32 = 4;
 
 impl Config {
     pub fn from_env() -> Result<Self, TridentError> {
@@ -220,10 +229,6 @@ impl Config {
         let explicit_network = std::env::var("NETWORK")
             .ok()
             .filter(|v| !v.trim().is_empty());
-        let explicit_network = std::env::var("NETWORK")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let network = explicit_network.clone().unwrap_or_else(|| "testnet".into());
         validate_network_against_rpc(explicit_network.as_deref(), &stellar_rpc_urls)?;
         // Normalise exactly once, here (issue #736). Every later consumer —
         // the cursor key, the network column on every write, the passphrase
@@ -388,6 +393,18 @@ impl Config {
                 .ok()
                 .map(|raw| parse_bounded_u64_raw("EVENT_RETENTION_DAYS", &raw, 1, 3_650));
         let db_pool_size = parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE);
+        let db_ingest_pool_size = parse_pool_size(
+            "INDEXER_DB_INGEST_POOL_SIZE",
+            DEFAULT_DB_INGEST_POOL_SIZE,
+        );
+        let db_relay_pool_size = parse_pool_size(
+            "INDEXER_DB_RELAY_POOL_SIZE",
+            DEFAULT_DB_RELAY_POOL_SIZE,
+        );
+        let db_maintenance_pool_size = parse_pool_size(
+            "INDEXER_DB_MAINTENANCE_POOL_SIZE",
+            DEFAULT_DB_MAINTENANCE_POOL_SIZE,
+        );
         // #215 names redis_stream_maxlen among the knobs that must be
         // range-checked. These three previously used
         // `.ok().and_then(|s| s.parse().ok()).unwrap_or(default)`, which
@@ -457,9 +474,19 @@ impl Config {
                 errors.push(format!("[indexer] {key}: {e}"));
             }
         }
-        // db_pool_size is u32, separate from the u64 batch above.
-        if let Err(e) = db_pool_size.as_ref() {
-            errors.push(format!("[indexer] INDEXER_DB_POOL_SIZE: {e}"));
+        // Pool sizes are u32, separate from the u64 batch above.
+        for (name, res) in [
+            ("INDEXER_DB_POOL_SIZE", db_pool_size.as_ref()),
+            ("INDEXER_DB_INGEST_POOL_SIZE", db_ingest_pool_size.as_ref()),
+            ("INDEXER_DB_RELAY_POOL_SIZE", db_relay_pool_size.as_ref()),
+            (
+                "INDEXER_DB_MAINTENANCE_POOL_SIZE",
+                db_maintenance_pool_size.as_ref(),
+            ),
+        ] {
+            if let Err(e) = res {
+                errors.push(format!("[indexer] {name}: {e}"));
+            }
         }
         // Presence-optional: unset stays None (retention disabled), but a set
         // value that is malformed or out of range is fatal like every other
@@ -556,12 +583,18 @@ impl Config {
         let idle_in_transaction_timeout_ms = idle_in_transaction_timeout_ms.unwrap();
         let token_metadata_refresh_interval_secs = token_metadata_refresh_interval_secs.unwrap();
         let db_pool_size = db_pool_size.unwrap();
+        let db_ingest_pool_size = db_ingest_pool_size.unwrap();
+        let db_relay_pool_size = db_relay_pool_size.unwrap();
+        let db_maintenance_pool_size = db_maintenance_pool_size.unwrap();
         // Safe: any Err above was pushed into `errors` and we bailed.
         let event_retention_days = event_retention_days.and_then(Result::ok);
 
         Ok(Self {
             database_url: database_url.unwrap(),
             db_pool_size,
+            db_ingest_pool_size,
+            db_relay_pool_size,
+            db_maintenance_pool_size,
             redis_url: redis_url.unwrap(),
             stellar_rpc_url: stellar_rpc_urls[0].clone(),
             stellar_rpc_urls,
@@ -632,6 +665,9 @@ impl Config {
             max_events_per_poll = self.max_events_per_poll,
             db_batch_size = self.db_batch_size,
             db_pool_size = self.db_pool_size,
+            db_ingest_pool_size = self.db_ingest_pool_size,
+            db_relay_pool_size = self.db_relay_pool_size,
+            db_maintenance_pool_size = self.db_maintenance_pool_size,
             redis_stream_maxlen = self.redis_stream_maxlen,
             metrics_port = self.metrics_port,
             health_port = self.health_port,
@@ -711,7 +747,7 @@ pub(crate) fn redact_url(url: &str) -> String {
     if let Some(qmark) = tail.find('?') {
         // Check if this is an RPC-style URL that might need special handling?
         // For now preserve for DB URLs as before
-        let (path_part, query_part) = tail.split_at(qmark);
+        let (path_part, _query_part) = tail.split_at(qmark);
         // But issue #734 says redact path tokens and query strings for RPC URLs
         // This function is used generally - but tests expect specific behavior
         // Tests are for postgres URLs - don't change those

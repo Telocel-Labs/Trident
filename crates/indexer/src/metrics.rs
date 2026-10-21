@@ -116,6 +116,8 @@ pub const LEDGER_GAPS_TOTAL: &str = "trident_indexer_ledger_gaps_total";
 /// Indexer's own Postgres pool, documented in docs/metrics-catalog.md.
 pub const DB_POOL_SIZE: &str = "trident_indexer_db_pool_size";
 pub const DB_POOL_IDLE_CONNECTIONS: &str = "trident_indexer_db_pool_idle_connections";
+/// Duration waiting to acquire a connection from a database pool (issue #797).
+pub const DB_POOL_ACQUIRE_WAIT_SECONDS: &str = "trident_indexer_db_pool_acquire_wait_seconds";
 /// Backfill rate in ledgers per second, measured over each poll cycle that
 /// made forward progress while behind the chain tip (issue #420).
 ///
@@ -385,6 +387,9 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
+    histogram!(DB_POOL_ACQUIRE_WAIT_SECONDS, "pool" => "ingest").record(0.0);
+    histogram!(DB_POOL_ACQUIRE_WAIT_SECONDS, "pool" => "relay").record(0.0);
+    histogram!(DB_POOL_ACQUIRE_WAIT_SECONDS, "pool" => "maintenance").record(0.0);
     // Seed at 0 so the gauge is present from the first scrape and fails safe.
     // Seeding at i64::MAX would report infinite headroom, so an indexer that
     // crash-loops before its first successful poll would leave both partition
@@ -447,6 +452,15 @@ pub fn record_heartbeat() {
 pub fn set_db_pool_stats(size: u32, idle: u32) {
     gauge!(DB_POOL_SIZE).set(size as f64);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(idle as f64);
+}
+
+pub fn set_db_pool_stats_for_pool(pool: &'static str, size: u32, idle: u32) {
+    gauge!(DB_POOL_SIZE, "pool" => pool).set(size as f64);
+    gauge!(DB_POOL_IDLE_CONNECTIONS, "pool" => pool).set(idle as f64);
+}
+
+pub fn record_db_pool_acquire_wait(pool: &'static str, duration_secs: f64) {
+    histogram!(DB_POOL_ACQUIRE_WAIT_SECONDS, "pool" => pool).record(duration_secs);
 }
 
 /// Minimum ledger lag before a poll cycle counts as "catching up" (issue #420).

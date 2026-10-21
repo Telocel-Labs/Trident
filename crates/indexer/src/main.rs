@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::time;
@@ -395,33 +394,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     metrics::install(cfg.metrics_port)?;
 
-    // Set statement_timeout and idle_in_transaction_session_timeout on every
-    // new connection so a pathological query or leaked transaction cannot hold
-    // the pool indefinitely (#249).
+    // Dedicated database connection pools for ingest, relay and background maintenance (issue #797).
+    // Separating pools prevents heavy maintenance queries (reconciliation, retention, partition maintenance)
+    // or rapid relay outbox scans from starving the critical event ingestion poll loop.
     let stmt_timeout = cfg.statement_timeout_ms;
     let idle_timeout = cfg.idle_in_transaction_timeout_ms;
-    let db_pool = PgPoolOptions::new()
-        .max_connections(cfg.db_pool_size)
-        .after_connect(move |conn, _| {
-            Box::pin(async move {
-                sqlx::query(&format!("SET statement_timeout = '{stmt_timeout}ms'"))
+
+    async fn create_dedicated_pool(
+        url: &str,
+        size: u32,
+        stmt_timeout: u64,
+        idle_timeout: u64,
+        purpose: &'static str,
+    ) -> Result<sqlx::PgPool, trident_common::TridentError> {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(size)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    sqlx::query(&format!("SET statement_timeout = '{stmt_timeout}ms'"))
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query(&format!(
+                        "SET idle_in_transaction_session_timeout = '{idle_timeout}ms'"
+                    ))
                     .execute(&mut *conn)
                     .await?;
-                sqlx::query(&format!(
-                    "SET idle_in_transaction_session_timeout = '{idle_timeout}ms'"
-                ))
-                .execute(&mut *conn)
-                .await?;
-                Ok(())
+                    Ok(())
+                })
             })
-        })
-        .connect(&cfg.database_url)
-        .await?;
+            .connect(url)
+            .await
+            .map_err(|e| trident_common::TridentError::storage(anyhow::anyhow!("Failed to connect {purpose} pool: {e}")))
+    }
+
+    let ingest_pool = create_dedicated_pool(&cfg.database_url, cfg.db_ingest_pool_size, stmt_timeout, idle_timeout, "ingest").await?;
+    let relay_pool = create_dedicated_pool(&cfg.database_url, cfg.db_relay_pool_size, stmt_timeout, idle_timeout, "relay").await?;
+    let maintenance_pool = create_dedicated_pool(&cfg.database_url, cfg.db_maintenance_pool_size, stmt_timeout, idle_timeout, "maintenance").await?;
+
     tracing::info!(
-        pool_size = cfg.db_pool_size,
+        ingest_pool_size = cfg.db_ingest_pool_size,
+        relay_pool_size = cfg.db_relay_pool_size,
+        maintenance_pool_size = cfg.db_maintenance_pool_size,
         statement_timeout_ms = stmt_timeout,
         idle_in_transaction_timeout_ms = idle_timeout,
-        "Database connected with timeout defaults"
+        "Dedicated database pools connected"
     );
 
     // Redis connection is owned by the outbox relay which can reconnect with backoff (issue #732).
@@ -440,7 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn health and readiness endpoints on HEALTH_PORT (default 8080, separate
     // from the Prometheus /metrics listener on METRICS_PORT) (#206).
     let health_addr: SocketAddr = ([0, 0, 0, 0], cfg.health_port).into();
-    let health_db = db_pool.clone();
+    let health_db = maintenance_pool.clone();
     let health_redis_url = cfg.redis_url.clone();
     tokio::spawn(async move {
         health::serve(health_addr, health_db, health_redis_url).await;
@@ -478,7 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // delivers them to Redis. It runs alongside the streamer and stops on the
     // same shutdown signal. Relay manages its own Redis connection with reconnect.
     let mut relay = redis_stream::relay::OutboxRelay::new_with_config(
-        db_pool.clone(),
+        relay_pool,
         cfg.redis_url.clone(),
         redis_conn,
         redis_stream::relay::RelayConfig {
@@ -514,7 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect(),
             },
         )?;
-        let reconciler = reconcile::Reconciler::new(&cfg, db_pool.clone(), reconcile_rpc);
+        let reconciler = reconcile::Reconciler::new(&cfg, maintenance_pool.clone(), reconcile_rpc);
         let reconcile_shutdown = shutdown.clone();
         tokio::spawn(async move { reconciler.run(reconcile_shutdown).await });
     } else {
@@ -525,11 +541,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Daily partition maintenance (issue #431): keeps the events table's
     // partition ceiling ahead of the live chain tip.
-    tokio::spawn(maintain_partitions(db_pool.clone()));
+    tokio::spawn(maintain_partitions(maintenance_pool.clone()));
 
     // Daily event-retention pruning (issue #482), opt-in via EVENT_RETENTION_DAYS.
     if let Some(days) = cfg.event_retention_days {
-        tokio::spawn(run_retention_job(db_pool.clone(), days));
+        tokio::spawn(run_retention_job(maintenance_pool, days));
     }
 
     // Allow the shutdown drain to finish its in-flight work before the process
@@ -537,7 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // value + a small buffer (recommended: SHUTDOWN_GRACE_SECS + 5).
     const SHUTDOWN_GRACE_SECS: u64 = 30;
 
-    let mut s = streamer::Streamer::new(cfg, db_pool).await?;
+    let mut s = streamer::Streamer::new(cfg, ingest_pool).await?;
     let result = s.run(shutdown).await;
 
     // Let the relay drain its current pass before the process exits, bounded

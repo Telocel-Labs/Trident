@@ -799,10 +799,12 @@ where
 pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), TridentError> {
     let batch_size = commit.batch_size.max(1);
 
+    let acquire_start = std::time::Instant::now();
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page begin")))?;
+    crate::metrics::record_db_pool_acquire_wait("ingest", acquire_start.elapsed().as_secs_f64());
 
     for chunk in commit.events.chunks(batch_size) {
         insert_events_batch(&mut *tx, commit.network, chunk).await?;
