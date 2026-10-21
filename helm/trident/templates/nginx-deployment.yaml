@@ -17,6 +17,19 @@ data:
       }
       server {
         listen 80;
+        # Block internal and admin routes from public ingress (issue #792)
+        location /internal/ {
+          deny all;
+          return 403;
+        }
+        location /v1/admin/ {
+          deny all;
+          return 403;
+        }
+        location /v1/api-keys {
+          deny all;
+          return 403;
+        }
         location / {
           proxy_pass         http://go_api;
           proxy_set_header   Host $host;

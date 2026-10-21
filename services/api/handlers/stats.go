@@ -96,6 +96,9 @@ func RecordWebhookDelivery(success bool, deadLetter bool, durationMs int64) {
 func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = fmt.Fprintf(w, "# HELP trident_admin_auth_failures_total Total failed admin authentication attempts.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_admin_auth_failures_total counter\n")
+		// Output metric
 		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_lag_ledgers gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())

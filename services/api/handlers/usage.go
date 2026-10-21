@@ -242,13 +242,23 @@ func KeyUsage(cfg UsageConfig) http.HandlerFunc {
 // of how far back `from` reaches.
 func AdminKeyUsageRollup(cfg AdminConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.AdminKey == "" || cfg.DB == nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
-			return
-		}
-		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
-			return
+		if cfg.Auth != nil {
+			if _, ok := cfg.Auth.Authorize(w, r); !ok {
+				return
+			}
+			if cfg.DB == nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
+				return
+			}
+		} else {
+			if cfg.AdminKey == "" || cfg.DB == nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
+				return
+			}
+			if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+				return
+			}
 		}
 
 		if verr := validation.RejectUnknownParams(r.URL.Query(), "from", "to"); verr != nil {

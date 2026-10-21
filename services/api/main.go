@@ -251,9 +251,12 @@ func main() {
 		go runUsageRollupCleanup(ctx, pool)
 	}
 
+	adminAuth := handlers.NewAdminAuthFromEnv()
+
 	adminCfg := handlers.AdminConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
 		DB:       pool,
+		Auth:     adminAuth,
 	}
 	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
 		adminCfg.StatsFunc = newPgbouncerStats(adminURL)
@@ -275,6 +278,7 @@ func main() {
 		DB:             pool,
 		Redis:          redisClient,
 		InvalidateTier: tierCache.Invalidate,
+		Auth:           adminAuth,
 	}
 
 	webhookDB, err := newDB()
@@ -331,7 +335,7 @@ func main() {
 		redisClient:      redisClient,
 		grpcClient:       grpcClient,
 		adminCfg:         adminCfg,
-		contractCfg:      handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool},
+		contractCfg:      handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool, Auth: adminAuth},
 		apiKeyCfg:        apiKeyCfg,
 		sorobanCaller:    sorobanCaller,
 		webhookDB:        webhookDB,
