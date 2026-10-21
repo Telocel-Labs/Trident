@@ -1,6 +1,7 @@
 import type { APIRoute } from "astro";
 import { ApiError, listEvents } from "../../lib/api";
 import type { Network, UnreachableReason } from "../../lib/types";
+import { serverCache } from "../../lib/cache";
 
 export interface RecentEventsResponse {
   status: "ok" | "api_unreachable";
@@ -11,23 +12,33 @@ export interface RecentEventsResponse {
 
 const jsonHeaders = {
   "Content-Type": "application/json",
-  "Cache-Control": "public, max-age=10, s-maxage=10",
+  "Cache-Control": "public, max-age=3, s-maxage=3",
 };
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: jsonHeaders });
+function json(body: unknown, status = 200, cached = false): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...jsonHeaders,
+      "X-Cache": cached ? "HIT" : "MISS",
+    },
+  });
 }
 
 export const GET: APIRoute = async ({ url }) => {
   const rawNetwork = url.searchParams.get("network");
   const network: Network = rawNetwork === "mainnet" ? "mainnet" : "testnet";
+  const cacheKey = `recent-events:${network}`;
 
   try {
-    const result = await listEvents({ limit: 10, network });
+    const { data: result, cached } = await serverCache.getOrSet(cacheKey, 3000, async () => {
+      return await listEvents({ limit: 10, network });
+    });
+
     return json({
       status: "ok",
       events: result.events,
-    } satisfies RecentEventsResponse);
+    } satisfies RecentEventsResponse, 200, cached);
   } catch (err) {
     if (!(err instanceof ApiError)) {
       return json({
@@ -58,15 +69,11 @@ export const GET: APIRoute = async ({ url }) => {
 
     const httpStatus =
       reason === "rate_limited" ? 429 : reason === "unauthorized" ? status : 502;
-
-    return json(
-      {
-        status: "api_unreachable",
-        events: [],
-        reason,
-        message: messages[reason],
-      } satisfies RecentEventsResponse,
-      httpStatus,
-    );
+    return json({
+      status: "api_unreachable",
+      events: [],
+      reason,
+      message: messages[reason] ?? "Something went wrong.",
+    } satisfies RecentEventsResponse, httpStatus);
   }
 };

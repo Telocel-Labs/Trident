@@ -10,6 +10,7 @@
     "build": "astro build",
     "preview": "astro preview",
     "lint": "astro check",
+    "test:load-200": "node scripts/load-test-200-visitors.test.js",
     "perf-test": "npx ts-node scripts/perf-test.ts",
     "a11y-test": "npx ts-node scripts/a11y-test.ts"
   },
