@@ -57,13 +57,12 @@ async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: Strin
         }
     }
 
-    let path = first_line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("/")
-        .split('?')
-        .next()
-        .unwrap_or("/");
+    let raw_target = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+    let (path, query_str) = match raw_target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (raw_target, ""),
+    };
 
     let (code, phrase, content_type, body): (u16, &str, &str, String) = match path {
         "/healthz" => (200, "OK", "text/plain", "ok\n".into()),
@@ -72,11 +71,19 @@ async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: Strin
             (code, phrase, "text/plain", body)
         }
         // Admin endpoint: return recent dead-lettered (parse error) events
-        // for operational inspection (issue #414).
-        "/admin/dead-letter" => {
-            let (code, phrase, body) = dead_letter_summary(&db).await;
-            (code, phrase, "application/json", body)
-        }
+        // for operational inspection (issue #414, #679).
+        "/admin/dead-letter" => match parse_pagination(query_str) {
+            Ok((limit, offset)) => {
+                let (code, phrase, body) = dead_letter_summary(&db, limit, offset).await;
+                (code, phrase, "application/json", body)
+            }
+            Err(err) => (
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::json!({ "error": err }).to_string(),
+            ),
+        },
         _ => (404, "Not Found", "text/plain", "not found\n".into()),
     };
 
@@ -104,11 +111,7 @@ async fn readyz(db: &PgPool, redis_url: &str) -> (u16, &'static str, String) {
             (200, "OK", "ready (redis degraded)\n".into())
         }
     } else {
-        (
-            503,
-            "Service Unavailable",
-            "not ready: db\n".into(),
-        )
+        (503, "Service Unavailable", "not ready: db\n".into())
     }
 }
 
@@ -126,21 +129,67 @@ async fn check_redis(redis_url: &str) -> bool {
     }
 }
 
-/// Return the 20 most recent dead-lettered events as a JSON array.
+pub const DEFAULT_DEAD_LETTER_LIMIT: i64 = 20;
+pub const MAX_DEAD_LETTER_LIMIT: i64 = 100;
+
+/// Parse pagination query parameters (`limit` and `offset`) for `/admin/dead-letter`.
+pub fn parse_pagination(query: &str) -> Result<(i64, i64), String> {
+    let mut limit = DEFAULT_DEAD_LETTER_LIMIT;
+    let mut offset = 0i64;
+
+    if query.is_empty() {
+        return Ok((limit, offset));
+    }
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, val) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+
+        match key {
+            "limit" => match val.parse::<i64>() {
+                Ok(v) if v > 0 => {
+                    limit = v.min(MAX_DEAD_LETTER_LIMIT);
+                }
+                _ => return Err("limit must be a positive integer".into()),
+            },
+            "offset" => match val.parse::<i64>() {
+                Ok(v) if v >= 0 => {
+                    offset = v;
+                }
+                _ => return Err("offset must be a non-negative integer".into()),
+            },
+            _ => {}
+        }
+    }
+
+    Ok((limit, offset))
+}
+
+/// Return dead-lettered events as a JSON array with offset/limit pagination (#679).
 ///
 /// Generic over the executor (rather than `&PgPool`) so tests can drive it
 /// against a transaction they always roll back, instead of mutating the
 /// shared test database directly.
-async fn dead_letter_summary<'e, E>(db: E) -> (u16, &'static str, String)
+async fn dead_letter_summary<'e, E>(db: E, limit: i64, offset: i64) -> (u16, &'static str, String)
 where
     E: sqlx::PgExecutor<'e>,
 {
+    let limit = limit.clamp(1, MAX_DEAD_LETTER_LIMIT);
+    let offset = offset.max(0);
+
     match sqlx::query_as::<_, DeadLetterRow>(
         r#"SELECT id, ledger_sequence, event_index, error_message, occurred_at
            FROM parse_errors
-           ORDER BY occurred_at DESC
-           LIMIT 20"#,
+           ORDER BY occurred_at DESC, id DESC
+           LIMIT $1 OFFSET $2"#,
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(db)
     .await
     {
@@ -213,7 +262,7 @@ mod tests {
         .await
         .expect("seed parse_errors row");
 
-        let (code, phrase, body) = dead_letter_summary(&pool).await;
+        let (code, phrase, body) = dead_letter_summary(&pool, DEFAULT_DEAD_LETTER_LIMIT, 0).await;
 
         assert_eq!(
             code, 200,
@@ -269,12 +318,138 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        let (code, _, body) = dead_letter_summary(&mut *tx).await;
+        let (code, _, body) = dead_letter_summary(&mut *tx, DEFAULT_DEAD_LETTER_LIMIT, 0).await;
 
         assert_eq!(code, 200);
         assert_eq!(body, "[]");
 
         // Never commit: this DELETE must not outlive the test.
+        tx.rollback().await.unwrap();
+    }
+
+    #[test]
+    fn parse_pagination_defaults_when_empty() {
+        let (limit, offset) = parse_pagination("").expect("empty query should yield defaults");
+        assert_eq!(limit, DEFAULT_DEAD_LETTER_LIMIT);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn parse_pagination_valid_custom_values() {
+        let (limit, offset) =
+            parse_pagination("limit=10&offset=30").expect("valid pagination query");
+        assert_eq!(limit, 10);
+        assert_eq!(offset, 30);
+
+        let (limit, offset) =
+            parse_pagination("offset=50&limit=5").expect("valid reversed order query");
+        assert_eq!(limit, 5);
+        assert_eq!(offset, 50);
+
+        let (limit, offset) = parse_pagination("limit=42").expect("valid limit only");
+        assert_eq!(limit, 42);
+        assert_eq!(offset, 0);
+
+        let (limit, offset) = parse_pagination("offset=15").expect("valid offset only");
+        assert_eq!(limit, DEFAULT_DEAD_LETTER_LIMIT);
+        assert_eq!(offset, 15);
+    }
+
+    #[test]
+    fn parse_pagination_clamps_to_max_limit() {
+        let (limit, offset) =
+            parse_pagination("limit=500&offset=10").expect("query above max limit");
+        assert_eq!(limit, MAX_DEAD_LETTER_LIMIT);
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn parse_pagination_rejects_invalid_values() {
+        assert!(
+            parse_pagination("limit=0").is_err(),
+            "limit 0 must be rejected"
+        );
+        assert!(
+            parse_pagination("limit=-10").is_err(),
+            "negative limit must be rejected"
+        );
+        assert!(
+            parse_pagination("limit=foo").is_err(),
+            "non-numeric limit must be rejected"
+        );
+        assert!(
+            parse_pagination("offset=-1").is_err(),
+            "negative offset must be rejected"
+        );
+        assert!(
+            parse_pagination("offset=bar").is_err(),
+            "non-numeric offset must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_letter_summary_pagination_pages_beyond_limit() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+
+        // Seed 5 parse error rows with distinctive ledger sequences
+        for i in 1..=5 {
+            sqlx::query(
+                "INSERT INTO parse_errors (ledger_sequence, event_index, raw_payload, error_message, occurred_at)
+                 VALUES ($1, 0, 'raw-payload', 'pagination-test', NOW() - ($2 || ' seconds')::interval)",
+            )
+            .bind(9_998_000i64 + i)
+            .bind(5 - i)
+            .execute(&mut *tx)
+            .await
+            .expect("seed parse_errors row");
+        }
+
+        // Fetch page 1: limit 2, offset 0
+        let (code, phrase, body1) = dead_letter_summary(&mut *tx, 2, 0).await;
+        assert_eq!(code, 200);
+        assert_eq!(phrase, "OK");
+        let entries1: Vec<serde_json::Value> = serde_json::from_str(&body1).unwrap();
+        assert_eq!(entries1.len(), 2, "first page must return exactly 2 items");
+
+        // Fetch page 2: limit 2, offset 2
+        let (code, phrase, body2) = dead_letter_summary(&mut *tx, 2, 2).await;
+        assert_eq!(code, 200);
+        assert_eq!(phrase, "OK");
+        let entries2: Vec<serde_json::Value> = serde_json::from_str(&body2).unwrap();
+        assert_eq!(entries2.len(), 2, "second page must return exactly 2 items");
+
+        // Verify page 1 and page 2 do not overlap
+        let ids1: Vec<&str> = entries1.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        let ids2: Vec<&str> = entries2.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        for id in &ids1 {
+            assert!(
+                !ids2.contains(id),
+                "page 1 and page 2 must not contain the same row id"
+            );
+        }
+
+        // Fetch beyond available rows: offset 100
+        let (code, phrase, body_empty) = dead_letter_summary(&mut *tx, 2, 100).await;
+        assert_eq!(code, 200);
+        assert_eq!(phrase, "OK");
+        let entries_empty: Vec<serde_json::Value> = serde_json::from_str(&body_empty).unwrap();
+        assert_eq!(
+            entries_empty.len(),
+            0,
+            "offset beyond records must return empty array"
+        );
+
         tx.rollback().await.unwrap();
     }
 }

@@ -2855,6 +2855,7 @@ mod tests {
             s.db.clone(),
             conn.clone(),
             RelayConfig {
+                network: "testnet".into(),
                 interval: Duration::from_millis(10),
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
