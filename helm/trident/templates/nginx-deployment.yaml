@@ -48,9 +48,18 @@ spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.nginx.securityContextUid) | nindent 8 }}
+      {{- if .Values.nginx.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.nginx.topologySpreadConstraints.maxSkew }}
+          topologyKey: {{ .Values.nginx.topologySpreadConstraints.topologyKey }}
+          whenUnsatisfiable: {{ .Values.nginx.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 14 }}
+      {{- end }}
       containers:
         - name: nginx
-          image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}"
+          image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}{{ if .Values.nginx.image.digest }}@{{ .Values.nginx.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}
@@ -126,7 +135,11 @@ metadata:
     {{- include "trident.labels" . | nindent 4 }}
     app.kubernetes.io/component: nginx
 spec:
+{{- if .Values.nginx.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.nginx.podDisruptionBudget.maxUnavailable }}
+{{- else }}
   minAvailable: {{ .Values.nginx.podDisruptionBudget.minAvailable }}
+{{- end }}
   selector:
     matchLabels:
       {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 6 }}

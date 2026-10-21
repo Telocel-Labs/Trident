@@ -50,6 +50,8 @@ nginx:
   replicaCount: 1
   podDisruptionBudget:
     enabled: false
+  topologySpreadConstraints:
+    enabled: false
 
 ingress:
   enabled: false
