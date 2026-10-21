@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/cursor"
@@ -48,6 +49,7 @@ type APIKeyConfig struct {
 	// an admin tier change so the new limit applies promptly instead of after
 	// the tier-cache TTL. Wired to middleware.TierCache.Invalidate; nil-safe.
 	InvalidateTier func(keyHash string)
+	Auth           *AdminAuth
 }
 
 // APIKeyResponse is returned for list/create operations.
@@ -151,6 +153,16 @@ func writeBodyDecodeError(w http.ResponseWriter, r *http.Request, err error) {
 // requireAdmin checks admin key and DB availability, writing an appropriate
 // error response and returning false when the handler should abort.
 func requireAdmin(cfg APIKeyConfig, w http.ResponseWriter, r *http.Request) bool {
+	if cfg.Auth != nil {
+		if _, ok := cfg.Auth.Authorize(w, r); !ok {
+			return false
+		}
+		if cfg.DB == nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			return false
+		}
+		return true
+	}
 	if cfg.AdminKey == "" {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusForbidden, httputil.UNAUTHORIZED, "admin API key is not configured")
 		return false
@@ -180,6 +192,11 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeBodyDecodeError(w, r, err)
 			return
+		}
+		if req.CreatedBy == "" {
+			if authSrc := middleware.AuditAuthSourceFromContext(r.Context()); strings.HasPrefix(authSrc, "admin:") {
+				req.CreatedBy = strings.TrimPrefix(authSrc, "admin:")
+			}
 		}
 		network, verr := validation.ValidateNetwork("network", req.Network, "mainnet")
 		if verr != nil {

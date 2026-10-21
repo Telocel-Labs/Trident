@@ -36,6 +36,7 @@ type AdminConfig struct {
 	AdminKey  string
 	StatsFunc func(ctx context.Context) (*DBStats, error)
 	DB        *pgxpool.Pool // for audit log queries
+	Auth      *AdminAuth
 }
 
 // AdminDB handles GET /v1/admin/db.
@@ -45,14 +46,23 @@ type AdminConfig struct {
 // valid admin key in the X-Admin-Key header.
 func AdminDB(cfg AdminConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.AdminKey == "" || cfg.StatsFunc == nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin DB endpoint is not configured")
-			return
-		}
-
-		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
-			return
+		if cfg.Auth != nil {
+			if _, ok := cfg.Auth.Authorize(w, r); !ok {
+				return
+			}
+			if cfg.StatsFunc == nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin DB endpoint is not configured")
+				return
+			}
+		} else {
+			if cfg.AdminKey == "" || cfg.StatsFunc == nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin DB endpoint is not configured")
+				return
+			}
+			if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+				return
+			}
 		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), adminStatsTimeout)
@@ -101,14 +111,23 @@ type AdminEndpointUsage struct {
 // Query params: from (RFC3339, required), to (RFC3339, required).
 func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.AdminKey == "" || cfg.DB == nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
-			return
-		}
-
-		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
-			return
+		if cfg.Auth != nil {
+			if _, ok := cfg.Auth.Authorize(w, r); !ok {
+				return
+			}
+			if cfg.DB == nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
+				return
+			}
+		} else {
+			if cfg.AdminKey == "" || cfg.DB == nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
+				return
+			}
+			if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+				return
+			}
 		}
 
 		q := r.URL.Query()

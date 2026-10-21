@@ -18,6 +18,29 @@ import (
 type ContractConfig struct {
 	AdminKey string
 	DB       *pgxpool.Pool
+	Auth     *AdminAuth
+}
+
+func requireContractAdmin(cfg ContractConfig, w http.ResponseWriter, r *http.Request) bool {
+	if cfg.Auth != nil {
+		if _, ok := cfg.Auth.Authorize(w, r); !ok {
+			return false
+		}
+		if cfg.DB == nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
+			return false
+		}
+		return true
+	}
+	if cfg.AdminKey == "" || cfg.DB == nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
+		return false
+	}
+	if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+		return false
+	}
+	return true
 }
 
 // ContractResponse is the JSON representation of an indexed_contracts row.
@@ -59,13 +82,7 @@ type ListContractsResponse struct {
 // Admin-auth required. Registers a new contract for indexing.
 func CreateContract(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.AdminKey == "" || cfg.DB == nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
-			return
-		}
-
-		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+		if !requireContractAdmin(cfg, w, r) {
 			return
 		}
 
@@ -126,13 +143,7 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 // Admin-auth required. Returns a keyset-paginated list of registered contracts.
 func ListContracts(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.AdminKey == "" || cfg.DB == nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
-			return
-		}
-
-		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+		if !requireContractAdmin(cfg, w, r) {
 			return
 		}
 
@@ -213,13 +224,7 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 // Admin-auth required. Idempotent — deleting a non-existent contract returns 204.
 func DeleteContract(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.AdminKey == "" || cfg.DB == nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
-			return
-		}
-
-		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+		if !requireContractAdmin(cfg, w, r) {
 			return
 		}
 

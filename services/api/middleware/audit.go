@@ -345,8 +345,22 @@ func AuditMiddleware(writer *AuditWriter) func(http.Handler) http.Handler {
 
 			var attemptedKeyPrefix, failureReason string
 			if wrapped.statusCode == http.StatusUnauthorized {
-				attemptedKeyPrefix = keyPrefixForAudit(r.Header.Get("X-API-Key"))
-				failureReason = authFailureReason(r.Header.Get("X-API-Key"))
+				if r.Header.Get("X-Admin-Key") != "" || strings.HasPrefix(r.URL.Path, "/v1/admin") || strings.HasPrefix(r.URL.Path, "/v1/api-keys") {
+					adminKey := r.Header.Get("X-Admin-Key")
+					attemptedKeyPrefix = keyPrefixForAudit(adminKey)
+					if adminKey == "" {
+						failureReason = "missing X-Admin-Key header"
+					} else {
+						failureReason = "key not recognized"
+					}
+				} else {
+					attemptedKeyPrefix = keyPrefixForAudit(r.Header.Get("X-API-Key"))
+					failureReason = authFailureReason(r.Header.Get("X-API-Key"))
+				}
+			} else if wrapped.statusCode == http.StatusForbidden && (strings.HasPrefix(r.URL.Path, "/v1/admin") || strings.HasPrefix(r.URL.Path, "/v1/api-keys")) {
+				failureReason = "ip_not_allowed"
+			} else if wrapped.statusCode == http.StatusTooManyRequests && (strings.HasPrefix(r.URL.Path, "/v1/admin") || strings.HasPrefix(r.URL.Path, "/v1/api-keys")) {
+				failureReason = "rate_limited"
 			}
 
 			entry := AuditEntry{

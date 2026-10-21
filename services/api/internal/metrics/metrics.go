@@ -130,6 +130,13 @@ var (
 		Help: "Total handler-chain panics caught by the recovery middleware.",
 	})
 
+	// AdminAuthFailuresTotal counts failed admin authentication attempts (issue #792),
+	// partitioned by failure reason (missing_key, invalid_key, rate_limited, ip_not_allowed).
+	AdminAuthFailuresTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_admin_auth_failures_total",
+		Help: "Total failed admin authentication attempts, by reason.",
+	}, []string{"reason"})
+
 	// DB pool saturation metrics (issue #238), sourced from pgxpool.Pool.Stat()
 	// by PollDBPool. All exposed as Gauges — Stat() itself only returns
 	// point-in-time cumulative totals (not deltas), which Set() reflects
@@ -280,4 +287,11 @@ func Shutdown(srv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+}
+
+// RecordAdminAuthFailure increments trident_admin_auth_failures_total for the given reason.
+func RecordAdminAuthFailure(reason string) {
+	if AdminAuthFailuresTotal != nil {
+		AdminAuthFailuresTotal.WithLabelValues(reason).Inc()
+	}
 }
