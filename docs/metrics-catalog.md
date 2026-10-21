@@ -43,6 +43,7 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_reconcile_window_end_ledger` | gauge | - | ledger | Highest ledger covered by the most recent completed pass. |
 | `trident_indexer_catchup_ledgers_per_second` | gauge | — | ledgers/sec | Backfill rate while behind the chain tip (issue #420). **Only exported while catching up** — absent, not zero, once the lag drops below 10 ledgers. See [performance.md](performance.md#indexer-catch-up-throughput). |
 | `trident_indexer_catchup_events_per_second` | gauge | — | events/sec | Backfill rate in events, over the same window as the gauge above. Reported alongside it because ledgers/sec alone hides whether a sparse or dense range is being processed. |
+| `trident_indexer_poll_cycle_failures_total` | counter | `failure_class` | failures | Swallowed failures in the streamer poll cycle (issue #631). |
 
 ## Go API (`services/api`)
 

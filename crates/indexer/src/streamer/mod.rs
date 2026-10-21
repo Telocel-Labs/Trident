@@ -262,8 +262,9 @@ impl Streamer {
             }
             Err(e) => {
                 // Non-fatal: keep the existing filter, log the error.
+                metrics::record_poll_cycle_failure("contract_filter_refresh");
                 tracing::warn!(error = %e, "Failed to refresh contract filter; keeping existing");
-                Ok(())
+                Err(e)
             }
         }
     }
@@ -431,7 +432,9 @@ impl Streamer {
             if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 // Spec sync reloads the allowlist itself on every pass, so it
                 // needs no coupling to this refresh (issue #725).
-                self.refresh_contract_filter().await?;
+                if let Err(e) = self.refresh_contract_filter().await {
+                    tracing::warn!(error = %e, "Periodic contract filter refresh failed; will retry next interval");
+                }
             }
 
             // Periodically scan for gaps in the processed ledger range and
@@ -601,6 +604,7 @@ impl Streamer {
         let resp = match self.rpc.get_transaction(tx_hash).await {
             Ok(resp) => resp,
             Err(e) => {
+                metrics::record_poll_cycle_failure("get_transaction_failed");
                 tracing::warn!(
                     tx_hash,
                     error = %e,
@@ -611,6 +615,7 @@ impl Streamer {
         };
 
         if resp.status == "NOT_FOUND" {
+            metrics::record_poll_cycle_failure("get_transaction_not_found");
             tracing::warn!(
                 tx_hash,
                 "getTransaction returned NOT_FOUND for a just-indexed event; skipping invocation metrics"
@@ -621,6 +626,7 @@ impl Streamer {
         let (envelope_xdr, result_xdr) = match (resp.envelope_xdr, resp.result_xdr) {
             (Some(envelope), Some(result)) => (envelope, result),
             _ => {
+                metrics::record_poll_cycle_failure("get_transaction_missing_xdr");
                 tracing::warn!(
                     tx_hash,
                     status = %resp.status,
@@ -636,6 +642,7 @@ impl Streamer {
         ) {
             Ok(metrics) => Some(metrics),
             Err(e) => {
+                metrics::record_poll_cycle_failure("invocation_metrics_decode");
                 tracing::warn!(tx_hash, error = %e, "Failed to decode invocation metrics");
                 None
             }
@@ -675,6 +682,7 @@ impl Streamer {
         {
             Ok(fresh) => fresh,
             Err(e) => {
+                metrics::record_poll_cycle_failure("token_metadata_freshness_query");
                 tracing::warn!(error = %e, "Failed to load fresh token_metadata contract ids; skipping this cycle's resolution");
                 return;
             }
@@ -688,6 +696,7 @@ impl Streamer {
             let resolution = match token_metadata::resolve(&self.rpc, &contract_id).await {
                 Ok(resolution) => resolution,
                 Err(e) => {
+                    metrics::record_poll_cycle_failure("token_metadata_resolve");
                     tracing::warn!(
                         contract_id = %contract_id,
                         error = %e,
@@ -701,6 +710,7 @@ impl Streamer {
                 db::upsert_token_metadata(&self.db, &contract_id, &self.config.network, &resolution)
                     .await
             {
+                metrics::record_poll_cycle_failure("token_metadata_cache_write");
                 tracing::warn!(
                     contract_id = %contract_id,
                     error = %e,
@@ -1087,10 +1097,12 @@ impl Streamer {
                     ledger_hash = match self.rpc.get_ledger(seq).await {
                         Ok(Some(h)) => h,
                         Ok(None) => {
+                            metrics::record_poll_cycle_failure("get_ledgers_failed");
                             tracing::warn!(seq, "getLedgers returned no ledger for sequence");
                             String::new()
                         }
                         Err(e) => {
+                            metrics::record_poll_cycle_failure("get_ledgers_failed");
                             tracing::warn!(seq, error = %e, "getLedgers failed, storing empty hash");
                             String::new()
                         }
@@ -1224,6 +1236,7 @@ impl Streamer {
                     {
                         Ok(obs) => obs,
                         Err(e) => {
+                            metrics::record_poll_cycle_failure("storage_snapshot_fetch");
                             tracing::warn!(contract_id, error = %e, "Failed to fetch storage snapshot");
                             continue;
                         }
@@ -1376,6 +1389,7 @@ impl Streamer {
         )
         .await
         {
+            metrics::record_poll_cycle_failure("health_stats_write");
             tracing::warn!(error = %e, "Failed to update health stats");
         }
 
@@ -1411,10 +1425,12 @@ impl Streamer {
                     if let Err(e) =
                         db::set_alert_state(&self.db, &self.config.network, &alert_state).await
                     {
+                        metrics::record_poll_cycle_failure("alert_state_read_write");
                         tracing::warn!(error = %e, "Failed to persist alert state");
                     }
                 }
                 Err(e) => {
+                    metrics::record_poll_cycle_failure("alert_state_read_write");
                     tracing::warn!(error = %e, "Failed to read alert state");
                 }
             }
@@ -2859,6 +2875,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
@@ -4385,4 +4402,16 @@ mod tests {
             .await
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn refresh_contract_filter_returns_error_on_db_failure() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        // Close DB pool to induce failure
+        s.db.close().await;
+        let res = s.refresh_contract_filter().await;
+        assert!(res.is_err(), "refresh_contract_filter must report error rather than silent Ok(())");
+    }
+
 }

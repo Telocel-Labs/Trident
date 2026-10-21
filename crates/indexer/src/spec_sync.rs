@@ -22,6 +22,7 @@ use trident_common::TridentError;
 
 use crate::db;
 use crate::rpc::RpcClient;
+use crate::metrics;
 use crate::spec::{self, SpecCache};
 
 /// How often a sync pass runs.
@@ -136,6 +137,7 @@ impl SpecSync {
         let specs = match spec::fetch_contract_specs(&self.rpc, &self.cache, &contract_ids).await {
             Ok(specs) => specs,
             Err(e) => {
+                metrics::record_poll_cycle_failure("contract_spec_fetch");
                 tracing::warn!(
                     error = %e,
                     "Contract spec fetch failed; will retry next pass"
@@ -191,6 +193,7 @@ impl SpecSync {
                     }
                 }
                 Err(e) => {
+                    metrics::record_poll_cycle_failure("contract_spec_persist");
                     tracing::warn!(
                         contract_id = %contract_id,
                         error = %e,

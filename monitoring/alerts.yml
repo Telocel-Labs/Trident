@@ -766,4 +766,23 @@ groups:
         annotations:
           summary: "Database backup has not succeeded in over 26 hours"
           description: "Automated PostgreSQL backup job has failed or failed to run, risking data loss."
+          runbook_url: "docs/runbooks/alerts.md#tridentdatabasebackupfailed"
 
+  # ---------------------------------------------------------------------------
+  # Poll cycle failures (issue #631)
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.poll_failures
+    rules:
+      - alert: TridentIndexerPollCycleFailuresSustained
+        expr: |
+          sum by (failure_class) (rate(trident_indexer_poll_cycle_failures_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer poll cycle failure rate is non-zero for {{ $labels.failure_class }}"
+          description: >
+            trident_indexer_poll_cycle_failures_total with failure_class="{{ $labels.failure_class }}"
+            has been increasing for 10 minutes on {{ $labels.instance }}. Poll cycle operations are degraded.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpollcyclefailuressustained"
