@@ -3,7 +3,7 @@
     "collect": {
       "numberOfRuns": 3,
       "settings": {
-        "configPath": "./explorer/.lighthouse.config.js"
+        "configPath": "./.lighthouse.config.js"
       },
       "url": [
         "http://localhost:3000/",

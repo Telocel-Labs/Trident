@@ -40,13 +40,13 @@ All measurements assume **realistic testnet volumes** (10,000+ events per contra
 
 ## Measurement Strategy
 
-1. **Baseline**: Measure all routes on testnet against real data (min 10k events/contract)
-2. **Frequency**: Run weekly via scheduled test or on-demand before releases
+1. **Baseline**: Measured and tracked in `explorer/PERFORMANCE_BASELINE.json`. Can be re-measured and updated via `npm run perf-test -- --record-baseline`.
+2. **Frequency**: Run weekly via scheduled CI (`.github/workflows/explorer-perf.yml`) or on-demand before releases.
 3. **Tools**: 
-   - Lighthouse CI for Core Web Vitals (FCP, LCP)
-   - Custom query latency tests via `npm run perf-test`
-   - API timing instrumentation in production logs
-4. **Threshold**: Any regression > 10% triggers CI failure
+   - Lighthouse CI configured via `explorer/.lighthouserc.json` and `explorer/.lighthouse.config.js` for Core Web Vitals (FCP, LCP).
+   - Custom query latency and regression tests via `npm run perf-test`.
+   - API timing instrumentation in production logs.
+4. **Threshold**: Any regression > 10% vs baseline or exceeding target budget triggers CI failure.
 
 ## Known Bottlenecks
 
@@ -62,4 +62,3 @@ If a budget is exceeded:
 3. If API slow: optimize query filters (add indexes, pagination limits)
 4. If rendering slow: reduce data payload, defer non-critical fields, or paginate
 5. If SSR slow: cache responses, reduce upstream calls, or use streaming
-

@@ -10,8 +10,9 @@
     "build": "astro build",
     "preview": "astro preview",
     "lint": "astro check",
-    "perf-test": "npx ts-node scripts/perf-test.ts",
-    "a11y-test": "npx ts-node scripts/a11y-test.ts"
+    "perf-test": "ts-node --esm scripts/perf-test.ts",
+    "test:perf-regression": "node scripts/verify-perf-budget.test.js",
+    "a11y-test": "ts-node --esm scripts/a11y-test.ts"
   },
   "dependencies": {
     "@astrojs/node": "^11.1.4",
@@ -35,6 +36,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "axe-playwright": "^2.2.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.5.4"
   }
 }

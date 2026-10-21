@@ -15,26 +15,34 @@ npm run perf-test -- \
   --contract-id CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
 ```
 
-Exit code 0 = all budgets met. Exit code 1 = budget exceeded.
+Record/update baseline metrics:
+
+```bash
+npm run perf-test -- --record-baseline
+```
+
+Exit code 0 = all budgets met and regression ≤ 10%. Exit code 1 = budget exceeded or regression detected.
 
 ### CI Testing
 
 Performance tests run automatically:
 - **Schedule**: Weekly, every Monday at 9 AM UTC
-- **Trigger**: Manual via `workflow_dispatch` with custom API URL
-- **Budget**: See `PERFORMANCE_BUDGET.md`
+- **Trigger**: Manual via `workflow_dispatch` with custom API URL or baseline update flag
+- **Budget**: Enforces absolute targets in `PERFORMANCE_BUDGET.md` and regression limits against `PERFORMANCE_BASELINE.json`
 
-Failures create comments on related PRs/issues.
+Failures notify through GitHub Step Summaries and create/comment on performance issues or pull requests.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `PERFORMANCE_BUDGET.md` | Explicit targets (FCP, LCP, API latency) |
+| `PERFORMANCE_BASELINE.json` | Committed baseline measurements |
 | `SCALE_BOTTLENECKS.md` | Known issues and mitigation strategies |
-| `scripts/perf-test.ts` | Node.js test suite (run locally or in CI) |
-| `.github/workflows/explorer-perf.yml` | Weekly scheduled GitHub Actions workflow |
-| `.lighthouserc.json` | Lighthouse CI config (optional, future) |
+| `scripts/perf-test.ts` | Node.js test suite with regression detection |
+| `.github/workflows/explorer-perf.yml` | Weekly scheduled GitHub Actions workflow with notifications |
+| `.lighthouserc.json` | Lighthouse CI config |
+| `.lighthouse.config.js` | Lighthouse configuration presets (desktop, throttling) |
 
 ## Measurement
 
@@ -49,73 +57,12 @@ Failures create comments on related PRs/issues.
    - Excludes network latency to API
    - Includes rendering + template processing
 
-3. **Core Web Vitals** (optional, Lighthouse)
+3. **Core Web Vitals** (Lighthouse CI)
    - FCP: First Contentful Paint
    - LCP: Largest Contentful Paint
    - CLS: Cumulative Layout Shift
 
-### Budget Thresholds
+### Budget & Regression Thresholds
 
 All budgets assume **realistic testnet data** (10k+ events/contract, 100k+ total).
-
-- **Home page**: ≤1.0s FCP, ≤2.0s LCP
-- **Contract list**: ≤1.5s FCP, ≤3.0s LCP
-- **Event detail**: ≤1.0s FCP, ≤2.0s LCP
-- **API latency**: 300-500ms p50, 500-800ms p95
-
-See `PERFORMANCE_BUDGET.md` for full details.
-
-## Remediation
-
-If a budget is exceeded:
-
-1. **Identify the bottleneck**
-   - API slow? Check backend query + indexes
-   - Render slow? Check Astro template, reduce payload
-   - SSR slow? Consider caching or streaming
-
-2. **Check the logs**
-   ```bash
-   npm run perf-test 2>&1 | grep -E "latency|budget"
-   ```
-
-3. **Profile locally**
-   ```bash
-   npm run dev
-   # Open Chrome DevTools > Network tab, throttle to Slow 3G
-   # Navigate pages, check response times
-   ```
-
-4. **Update the budget** (if intentional)
-   - Edit `PERFORMANCE_BUDGET.md`
-   - Document the reason
-   - Get team review
-
-## Integration with Development
-
-### Before Committing
-
-Run tests locally to catch regressions early:
-
-```bash
-npm run perf-test
-```
-
-### Before Releasing
-
-1. Run full performance suite against production testnet
-2. Compare results to baseline (stored in repo or CI artifacts)
-3. Regression > 10% = blocker
-
-### Continuous Monitoring
-
-- Production: Set up APM (e.g., Datadog, New Relic) to track real user metrics
-- Alerts: Configure alerts if API latency > 1s p95 or error rate > 5%
-
-## Future Improvements
-
-- [ ] Add Lighthouse CI integration for Core Web Vitals
-- [ ] Compare p50/p95 against historical baseline
-- [ ] Export metrics to monitoring dashboard
-- [ ] Add synthetic user journey tests (contract detail → load more → event detail)
-- [ ] Profile memory usage at scale
+Any measurement exceeding the absolute budget limit or regressing >10% compared to `PERFORMANCE_BASELINE.json` triggers a failure.
