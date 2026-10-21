@@ -196,6 +196,47 @@ grpcApi:
   securityContextUid: 1001
 
 # ---------------------------------------------------------------------------
+# Rust Backfill Queue Worker — 1 replica (issue #805)
+# ---------------------------------------------------------------------------
+backfill:
+  image:
+    repository: ghcr.io/telocel-labs/trident-backfill
+    tag: ""
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+  env:
+    LOG_LEVEL: "info"
+    STALE_RUNNING_TIMEOUT_SECS: "900"
+  metricsPort: 9092
+  healthPort: 8082
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 8082
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    failureThreshold: 3
+    timeoutSeconds: 2
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: 8082
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 2
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContextUid: 1001
+
+# ---------------------------------------------------------------------------
 # Go API — configurable replicas with HPA
 # ---------------------------------------------------------------------------
 goApi:

@@ -95,3 +95,20 @@ Both should return `# HELP` / `# TYPE` lines followed by samples in
 Prometheus text exposition format (`# TYPE ... gauge|counter|histogram`).
 See [`monitoring/README.md`](../monitoring/README.md) for a scrape config
 that wires both into Prometheus.
+
+## Backfill Worker (`crates/backfill`)
+
+Scrapeable at `GET http://<backfill-host>:<METRICS_PORT>/metrics` (default
+port `9092`, set via `METRICS_PORT`). Defined in
+[`crates/backfill/src/metrics.rs`](../crates/backfill/src/metrics.rs).
+
+| Name | Type | Labels | Unit | Meaning |
+|---|---|---|---|---|
+| `trident_backfill_pending_jobs` | gauge | — | jobs | Number of pending backfill jobs currently in the queue table. |
+| `trident_backfill_oldest_pending_age_seconds` | gauge | — | seconds | Age in seconds of the oldest pending backfill job. |
+| `trident_backfill_stale_running_jobs` | gauge | — | jobs | Number of backfill jobs marked running whose `claimed_at` exceeds the timeout threshold without completion. |
+| `trident_backfill_failed_jobs` | gauge | — | jobs | Number of backfill jobs in the queue marked with `failed` status. |
+| `trident_backfill_jobs_completed_total` | counter | — | jobs | Cumulative backfill jobs successfully completed by this worker. |
+| `trident_backfill_jobs_failed_total` | counter | — | jobs | Cumulative backfill jobs that failed after retrying. |
+| `trident_backfill_events_indexed_total` | counter | — | events | Total historical events indexed and written to `soroban_events` by this backfill worker. |
+

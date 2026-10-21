@@ -99,6 +99,70 @@ pub async fn fail_job(pool: &PgPool, id: Uuid, error: &str) -> Result<(), Triden
     Ok(())
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BackfillQueueMetrics {
+    pub pending_count: i64,
+    pub oldest_pending_age_secs: f64,
+    pub stale_running_count: i64,
+    pub failed_count: i64,
+}
+
+/// Query current queue health metrics: pending count, oldest pending age,
+/// stale running jobs (> stale_threshold_secs), and failed jobs count (issue #805).
+pub async fn query_queue_metrics(
+    pool: &PgPool,
+    stale_threshold_secs: i64,
+) -> Result<BackfillQueueMetrics, TridentError> {
+    let pending_row: Option<(i64, Option<f64>)> = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*)::bigint,
+            EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))
+        FROM backfill_jobs
+        WHERE status = 'pending'
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("query_queue_metrics pending")))?;
+
+    let (pending_count, oldest_pending_age_secs) = match pending_row {
+        Some((count, age)) => (count, age.unwrap_or(0.0)),
+        None => (0, 0.0),
+    };
+
+    let stale_row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM backfill_jobs
+        WHERE status = 'running'
+          AND claimed_at < NOW() - ($1::float8 * INTERVAL '1 second')
+        "#,
+    )
+    .bind(stale_threshold_secs as f64)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("query_queue_metrics stale")))?;
+
+    let failed_row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM backfill_jobs
+        WHERE status = 'failed'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("query_queue_metrics failed")))?;
+
+    Ok(BackfillQueueMetrics {
+        pending_count,
+        oldest_pending_age_secs,
+        stale_running_count: stale_row.0,
+        failed_count: failed_row.0,
+    })
+}
+
 /// Insert a backfilled event.
 ///
 /// Duplicate handling uses two complementary strategies:

@@ -8,6 +8,8 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
 mod db;
+mod health;
+mod metrics;
 mod parser;
 mod rpc_client;
 
@@ -46,6 +48,18 @@ struct Args {
     /// (--from-queue mode only).
     #[arg(long, default_value_t = 5_000)]
     queue_poll_interval_ms: u64,
+
+    /// Port serving Prometheus /metrics (default 9092, or METRICS_PORT env var).
+    #[arg(long, env = "METRICS_PORT", default_value_t = 9092)]
+    metrics_port: u16,
+
+    /// Port serving /healthz and /readyz (default 8082, or HEALTH_PORT env var).
+    #[arg(long, env = "HEALTH_PORT", default_value_t = 8082)]
+    health_port: u16,
+
+    /// Timeout in seconds before a running job is flagged as stale.
+    #[arg(long, env = "STALE_RUNNING_TIMEOUT_SECS", default_value_t = 900)]
+    stale_running_timeout_secs: i64,
 }
 
 /// Backfill one ledger range against the RPC, inserting events (or just
@@ -163,6 +177,16 @@ async fn backfill_range(
 /// `backfill_range` path the single-range CLI uses, and mark it done/failed.
 /// Runs until Ctrl-C.
 async fn run_from_queue(args: Args, db: PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    if args.metrics_port > 0 {
+        if let Err(e) = metrics::install(args.metrics_port) {
+            tracing::warn!(error = %e, "Failed to start backfill metrics exporter");
+        }
+    }
+    if args.health_port > 0 {
+        let health_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.health_port));
+        tokio::spawn(health::serve(health_addr, db.clone()));
+    }
+
     let rpc = rpc_client::RpcClient::new(std::env::var("STELLAR_RPC_URL")?)?;
     let parser = parser::Parser::new(false);
     let events_indexed = AtomicU64::new(0);
@@ -170,10 +194,22 @@ async fn run_from_queue(args: Args, db: PgPool) -> Result<(), Box<dyn std::error
 
     tracing::info!(
         poll_interval_ms = args.queue_poll_interval_ms,
+        metrics_port = args.metrics_port,
+        health_port = args.health_port,
         "Starting backfill queue worker"
     );
 
     loop {
+        // Refresh queue metrics every loop iteration (issue #805)
+        if let Ok(stats) = db::query_queue_metrics(&db, args.stale_running_timeout_secs).await {
+            metrics::set_queue_metrics(
+                stats.pending_count,
+                stats.oldest_pending_age_secs,
+                stats.stale_running_count,
+                stats.failed_count,
+            );
+        }
+
         match db::claim_next_job(&db).await {
             Ok(Some(job)) => {
                 tracing::info!(
@@ -184,9 +220,8 @@ async fn run_from_queue(args: Args, db: PgPool) -> Result<(), Box<dyn std::error
                     "Claimed backfill job"
                 );
 
-                // Bounded, unlike CLI mode: an unattended queue worker must
-                // not spin forever on one bad range.
                 const MAX_CONSECUTIVE_RPC_FAILURES: u32 = 10;
+                let prev_indexed = events_indexed.load(Ordering::Relaxed);
                 let result = backfill_range(
                     &db,
                     &rpc,
@@ -204,8 +239,14 @@ async fn run_from_queue(args: Args, db: PgPool) -> Result<(), Box<dyn std::error
                 )
                 .await;
 
+                let new_indexed = events_indexed.load(Ordering::Relaxed);
+                if new_indexed > prev_indexed {
+                    metrics::record_events_indexed(new_indexed - prev_indexed);
+                }
+
                 match result {
                     Ok(()) => {
+                        metrics::record_job_completed();
                         if let Err(e) = db::complete_job(&db, job.id).await {
                             tracing::error!(id = %job.id, error = %e, "Failed to mark job complete");
                         } else {
@@ -213,6 +254,7 @@ async fn run_from_queue(args: Args, db: PgPool) -> Result<(), Box<dyn std::error
                         }
                     }
                     Err(e) => {
+                        metrics::record_job_failed();
                         tracing::error!(id = %job.id, error = %e, "Backfill job failed");
                         if let Err(fail_err) = db::fail_job(&db, job.id, &e.to_string()).await {
                             tracing::error!(id = %job.id, error = %fail_err, "Failed to mark job failed");

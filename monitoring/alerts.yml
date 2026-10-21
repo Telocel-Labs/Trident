@@ -766,4 +766,48 @@ groups:
         annotations:
           summary: "Database backup has not succeeded in over 26 hours"
           description: "Automated PostgreSQL backup job has failed or failed to run, risking data loss."
+  # ---------------------------------------------------------------------------
+  # Backfill worker alerts (issue #805)
+  # ---------------------------------------------------------------------------
+  - name: trident.backfill
+    rules:
+      - alert: TridentBackfillJobStale
+        expr: trident_backfill_stale_running_jobs > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: backfill
+        annotations:
+          summary: "Trident backfill worker has stale running job(s)"
+          description: >
+            trident_backfill_stale_running_jobs is {{ $value }}. One or more backfill
+            jobs have remained in running status longer than the stale timeout threshold,
+            likely indicating a crashed or stuck worker.
+          runbook_url: "docs/runbooks/alerts.md#tridentbackfilljobstale"
+
+      - alert: TridentBackfillPendingJobAgeHigh
+        expr: trident_backfill_oldest_pending_age_seconds > 3600
+        for: 10m
+        labels:
+          severity: warning
+          service: backfill
+        annotations:
+          summary: "Trident backfill pending job has aged over 1 hour"
+          description: >
+            The oldest pending backfill job has been waiting for {{ $value | humanizeDuration }}.
+            Queue throughput may be insufficient or the worker is inactive.
+          runbook_url: "docs/runbooks/alerts.md#tridentbackfillpendingjobagehigh"
+
+      - alert: TridentBackfillJobFailureRate
+        expr: increase(trident_backfill_jobs_failed_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: backfill
+        annotations:
+          summary: "Trident backfill job failed in the last hour"
+          description: >
+            trident_backfill_jobs_failed_total increased in the last hour.
+            A backfill range failed after exhausting RPC retries.
+          runbook_url: "docs/runbooks/alerts.md#tridentbackfilljobfailurerate"
 

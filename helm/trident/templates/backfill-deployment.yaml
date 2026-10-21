@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "trident.fullname" . }}-backfill
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backfill
+spec:
+  replicas: {{ .Values.backfill.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "backfill") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "trident.selectorLabels" (dict "root" . "component" "backfill") | nindent 8 }}
+    spec:
+      {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "trident.podSecurityContext" (dict "uid" .Values.backfill.securityContextUid) | nindent 8 }}
+      containers:
+        - name: backfill
+          image: "{{ .Values.backfill.image.repository }}:{{ .Values.backfill.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- include "trident.containerSecurityContext" . | nindent 12 }}
+          args: ["--from-queue"]
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.backfill.metricsPort }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ .Values.backfill.healthPort }}
+              protocol: TCP
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: DATABASE_URL
+            - name: STELLAR_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: STELLAR_RPC_URL
+            - name: METRICS_PORT
+              value: {{ .Values.backfill.metricsPort | quote }}
+            - name: HEALTH_PORT
+              value: {{ .Values.backfill.healthPort | quote }}
+            {{- range $k, $v := .Values.backfill.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.backfill.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.backfill.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.backfill.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.backfill.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backfill.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backfill.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

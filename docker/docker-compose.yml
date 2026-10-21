@@ -166,6 +166,31 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  backfill:
+    build:
+      context: ..
+      dockerfile: crates/backfill/Dockerfile
+    environment:
+      # Route through PgBouncer, never postgres:5432 directly.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      STELLAR_RPC_URL: ${STELLAR_RPC_URL}
+      METRICS_PORT: ${BACKFILL_METRICS_PORT:-9092}
+      HEALTH_PORT: ${BACKFILL_HEALTH_PORT:-8082}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${BACKFILL_METRICS_PORT:-9092}:${BACKFILL_METRICS_PORT:-9092}"
+      - "${BACKFILL_HEALTH_PORT:-8082}:${BACKFILL_HEALTH_PORT:-8082}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:

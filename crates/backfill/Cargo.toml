@@ -39,4 +39,8 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 tokio-retry = "0.3"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"

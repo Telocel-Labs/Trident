@@ -1193,3 +1193,48 @@ considers this endpoint close to unusable, not merely degraded.
 
 **Escalation:** `severity: page` — this endpoint is near-unusable by the
 scorer's own floor.
+
+---
+
+## TridentBackfillJobStale
+
+**Means:** `trident_backfill_stale_running_jobs` is greater than 0 for 5 minutes.
+A backfill job has been marked `running` longer than `STALE_RUNNING_TIMEOUT_SECS` (default 15 minutes)
+without updating or finishing.
+
+**Why this threshold:** Indicates a worker process crashed, timed out, or encountered an unhandled deadlock
+while holding a lock on the job.
+
+**First steps:**
+1. Check backfill worker process logs for OOM or panic messages.
+2. Query `SELECT id, from_ledger, to_ledger, claimed_at, status FROM backfill_jobs WHERE status = 'running';` in Postgres.
+3. If the worker was killed, reset the stuck job back to `pending` or fail it manually so another worker can claim it.
+
+---
+
+## TridentBackfillPendingJobAgeHigh
+
+**Means:** `trident_backfill_oldest_pending_age_seconds` exceeds 3600 seconds (1 hour).
+
+**Why this threshold:** Pending gap-fill or historical replay jobs should be processed promptly once enqueued.
+An age over 1 hour indicates the worker queue is backlogged or not running.
+
+**First steps:**
+1. Verify the backfill queue worker container/pod is running (`kubectl get pods -l app.kubernetes.io/component=backfill` or `docker compose ps backfill`).
+2. Check worker logs to verify if it is actively indexing large ledger ranges.
+3. Review whether RPC rate limits or network issues are throttling throughput.
+
+---
+
+## TridentBackfillJobFailureRate
+
+**Means:** `trident_backfill_jobs_failed_total` increased in the last hour.
+
+**Why this threshold:** Jobs only fail after exhausting RPC retries (`MAX_CONSECUTIVE_RPC_FAILURES`),
+indicating permanent RPC errors or bad ledger parameters.
+
+**First steps:**
+1. Inspect the error column: `SELECT id, from_ledger, to_ledger, error FROM backfill_jobs WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 5;`
+2. Test RPC endpoint health for the requested ledger range.
+3. Fix the underlying root cause and re-enqueue the job by setting `status = 'pending'`.
+
