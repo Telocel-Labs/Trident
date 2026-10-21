@@ -558,6 +558,48 @@ any of these, redact the credential portion — don't log the raw env var value.
    ```
    (A future improvement would be [Reloader](https://github.com/stakater/Reloader) to automate this step.)
 
+## Monitoring & Prometheus Operator {#monitoring}
+
+Trident's Helm chart includes optional integration with the [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator) (`kube-prometheus-stack`), enabled via `monitoring.enabled=true` (issue #768).
+
+When enabled, the chart provisions:
+
+1. **ServiceMonitor (`trident-api`)**:
+   - Scrapes the Go API Service endpoint `/metrics` on port `http`.
+   - Injects metric relabeling `targetLabel: job` with replacement `trident-api`, ensuring all API metrics match alert rule expectations (e.g., `up{job="trident-api"}`).
+
+2. **PodMonitor (`trident-indexer`)**:
+   - Scrapes the single-writer Indexer Pod directly at `/metrics` on port `metrics` (9090).
+   - Injects metric relabeling `targetLabel: job` with replacement `trident-indexer`, ensuring indexer metrics match alert rule expectations (e.g., `up{job="trident-indexer"}`).
+
+3. **PrometheusRule (`trident`)**:
+   - Dynamically loads and renders alert and SLO rule definitions from `helm/trident/rules/*.yml` (including `alerts.yml`, `burn-rate-alerts.yml`, and `rpc-alerts.yml`).
+   - Supports extra custom rule groups via `monitoring.prometheusRule.additionalGroups`.
+
+### Configuration in `values.yaml`
+
+```yaml
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+    labels:
+      release: prometheus-stack
+  podMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+    labels:
+      release: prometheus-stack
+  prometheusRule:
+    enabled: true
+    labels:
+      release: prometheus-stack
+    additionalGroups: []
+```
+
 ## Health checks
 
 The Go API exposes two endpoints for Kubernetes' liveness and readiness probes, split per issue #243 so a dependency outage never causes a restart loop that can't fix it:

@@ -363,3 +363,28 @@ internalMTLS:
   #   INTERNAL_CLIENT_CERT  - Go API client leaf cert
   #   INTERNAL_CLIENT_KEY   - Go API client private key
   mountPath: /etc/trident/mtls
+
+# ---------------------------------------------------------------------------
+# Monitoring (issue #768) — Prometheus Operator integration
+# Deploys ServiceMonitor, PodMonitor, and PrometheusRule CRDs.
+# ---------------------------------------------------------------------------
+monitoring:
+  # Enable Prometheus Operator resources
+  enabled: false
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+    labels:
+      release: prometheus-stack
+  podMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+    labels:
+      release: prometheus-stack
+  prometheusRule:
+    enabled: true
+    labels:
+      release: prometheus-stack
+    additionalGroups: []
