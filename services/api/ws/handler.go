@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
@@ -25,7 +26,7 @@ const (
 	pingInterval = 30 * time.Second
 
 	// readDeadline is how long the server waits for any data (including pong)
-	// before declaring the connection dead (issue #15 requires ≤ 60 s).
+	// before declaring the connection dead (issue #15, #806 requires ≤ 60 s).
 	readDeadline = 60 * time.Second
 
 	// writeDeadline bounds a single frame write. A stuck TCP socket (full
@@ -46,8 +47,13 @@ const (
 //	contractId – required; only events for this contract are delivered.
 //	topic0     – optional filter (reserved for future use by the consumer).
 //
-// Issue #15: the server sends a ping frame every 30 s and enforces a 60 s
-// read deadline so dead connections are detected and goroutines do not leak.
+// Issue #15 & #806: the server sends a ping frame every 30 s and enforces a 60 s
+// read deadline. Client frames (ping, pong, close, unsolicited data) are actively
+// read by a dedicated reader goroutine so:
+//   - Client pings receive RFC 6455 compliant pongs with identical payload;
+//   - Client pongs refresh read deadlines so dead/idle clients are reaped;
+//   - Client close frames are answered to complete the RFC 6455 close handshake;
+//   - Socket receive buffers never overflow with unread client frames.
 func Handler(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -84,58 +90,80 @@ func Handler(hub *Hub) http.HandlerFunc {
 		hub.register(c)
 		defer hub.unregister(c)
 
-		// Set initial read deadline. It is refreshed on every successful write
-		// so that an active connection is never incorrectly timed out.
-		if err := conn.SetDeadline(time.Now().Add(readDeadline)); err != nil {
-			slog.Warn("ws: failed to set initial deadline", "err", err)
+		writer := newWSWriter(conn, bufrw)
+
+		// Set initial read deadline.
+		if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+			slog.Warn("ws: failed to set initial read deadline", "err", err)
 			return
 		}
+
+		done := make(chan struct{})
+		var once sync.Once
+		closeDone := func() {
+			once.Do(func() {
+				close(done)
+			})
+		}
+
+		// Read loop: continuously reads client frames (RFC 6455 RFC §5).
+		go func() {
+			defer closeDone()
+			for {
+				payload, opcode, err := readClientFrame(bufrw.Reader)
+				if err != nil {
+					return
+				}
+
+				// Any valid incoming frame proves peer liveness: refresh read deadline.
+				_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
+
+				switch opcode {
+				case 0x8: // Close frame
+					var code uint16 = 1000
+					if len(payload) >= 2 {
+						code = binary.BigEndian.Uint16(payload[:2])
+					}
+					// Respond with close frame to complete the close handshake (RFC 6455 §5.5.1).
+					_ = writer.writeClose(code, "")
+					return
+				case 0x9: // Ping frame -> respond with pong containing the exact payload (RFC 6455 §5.5.3).
+					_ = writer.writePong(payload)
+				case 0xA: // Pong frame -> keep-alive acknowledged; deadline refreshed above.
+				default:
+					// Any other frames (text/binary) are discarded to avoid receive buffer saturation.
+				}
+			}
+		}()
 
 		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 
 		for {
 			select {
+			case <-done:
+				// Connection terminated by client close, network failure, or read deadline expiration.
+				return
+
 			case msg, ok := <-c.send:
 				if !ok {
 					// Hub closed the channel — client was unregistered.
 					return
 				}
-				if err := conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
-					slog.Warn("ws: failed to set write deadline", "err", err)
-					return
-				}
-				if err := writeTextFrame(bufrw, msg); err != nil {
+				if err := writer.writeText(msg); err != nil {
 					slog.Warn("ws: write error, closing connection", "err", err)
-					return
-				}
-				// Refresh deadline after a successful write.
-				if err := conn.SetDeadline(time.Now().Add(readDeadline)); err != nil {
-					slog.Warn("ws: failed to refresh deadline", "err", err)
 					return
 				}
 
 			case <-ticker.C:
-				if err := conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
-					slog.Warn("ws: failed to set write deadline", "err", err)
-					return
-				}
-				if err := writePingFrame(bufrw); err != nil {
+				if err := writer.writePing(); err != nil {
 					slog.Warn("ws: ping write error, closing connection", "err", err)
-					return
-				}
-				// Refresh deadline: if no pong or data arrives within readDeadline
-				// the next I/O call will return a timeout error and exit the loop.
-				if err := conn.SetDeadline(time.Now().Add(readDeadline)); err != nil {
-					slog.Warn("ws: failed to refresh deadline", "err", err)
 					return
 				}
 
 			case <-c.closeSlow:
-				// Fill-policy disconnect (issue #224): tell the client why
-				// before dropping the connection.
-				_ = conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-				_ = writeCloseFrame(bufrw, closeStatusPolicyViolation, "slow consumer: buffer exceeded")
+				// Fill-policy disconnect (issue #224): tell the client why before dropping connection.
+				_ = writer.writeClose(closeStatusPolicyViolation, "slow consumer: buffer exceeded")
 				return
 			}
 		}
@@ -143,8 +171,7 @@ func Handler(hub *Hub) http.HandlerFunc {
 }
 
 // upgradeWebSocket performs a minimal RFC 6455 HTTP→WebSocket upgrade using
-// net/http's Hijack interface. This avoids an external dependency while
-// remaining spec-compliant for server-to-client text frames.
+// net/http's Hijack interface.
 func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, error) {
 	key := r.Header.Get("Sec-Websocket-Key")
 	if key == "" {
@@ -187,57 +214,4 @@ func computeAccept(key string) string {
 	h := sha1.New()
 	h.Write([]byte(key + wsGUID))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
-}
-
-// writeTextFrame encodes payload as a WebSocket text frame (opcode 0x1, FIN set)
-// and writes it to bufrw.
-func writeTextFrame(bufrw *bufio.ReadWriter, payload []byte) error {
-	return writeFrame(bufrw, 0x81, payload)
-}
-
-// writePingFrame writes an RFC 6455 ping frame (opcode 0x9, FIN set, empty payload).
-func writePingFrame(bufrw *bufio.ReadWriter) error {
-	return writeFrame(bufrw, 0x89, nil)
-}
-
-// writeCloseFrame writes an RFC 6455 close frame (opcode 0x8) carrying a
-// 2-byte status code followed by a UTF-8 reason string (issue #224).
-func writeCloseFrame(bufrw *bufio.ReadWriter, code uint16, reason string) error {
-	payload := make([]byte, 2+len(reason))
-	binary.BigEndian.PutUint16(payload, code)
-	copy(payload[2:], reason)
-	return writeFrame(bufrw, 0x88, payload)
-}
-
-// writeFrame writes a single WebSocket frame with the given first-byte opcode
-// and payload. Supports payloads up to 2^63-1 bytes.
-func writeFrame(bufrw *bufio.ReadWriter, opcode byte, payload []byte) error {
-	length := len(payload)
-
-	header := []byte{opcode}
-
-	switch {
-	case length <= 125:
-		header = append(header, byte(length))
-	case length <= 65535:
-		header = append(header, 126)
-		b := make([]byte, 2)
-		binary.BigEndian.PutUint16(b, uint16(length))
-		header = append(header, b...)
-	default:
-		header = append(header, 127)
-		b := make([]byte, 8)
-		binary.BigEndian.PutUint64(b, uint64(length))
-		header = append(header, b...)
-	}
-
-	if _, err := bufrw.Write(header); err != nil {
-		return err
-	}
-	if len(payload) > 0 {
-		if _, err := bufrw.Write(payload); err != nil {
-			return err
-		}
-	}
-	return bufrw.Flush()
 }
