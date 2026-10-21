@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::time;
@@ -99,7 +98,7 @@ async fn run_replay(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL must be set to use `trident-indexer replay`")?;
-    let db = sqlx::PgPool::connect(&database_url).await?;
+    let db = db::connect_pool(&database_url, 5, None, None).await?;
 
     // Replayed rows must be tagged with this deployment's actual network
     // (issue #595) — `failed_events` has no network column of its own, so
@@ -397,26 +396,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set statement_timeout and idle_in_transaction_session_timeout on every
     // new connection so a pathological query or leaked transaction cannot hold
-    // the pool indefinitely (#249).
+    // the pool indefinitely (#249). connect_pool ensures statement_cache_capacity(0)
+    // is set for PgBouncer transaction pooling mode (#634).
     let stmt_timeout = cfg.statement_timeout_ms;
     let idle_timeout = cfg.idle_in_transaction_timeout_ms;
-    let db_pool = PgPoolOptions::new()
-        .max_connections(cfg.db_pool_size)
-        .after_connect(move |conn, _| {
-            Box::pin(async move {
-                sqlx::query(&format!("SET statement_timeout = '{stmt_timeout}ms'"))
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query(&format!(
-                    "SET idle_in_transaction_session_timeout = '{idle_timeout}ms'"
-                ))
-                .execute(&mut *conn)
-                .await?;
-                Ok(())
-            })
-        })
-        .connect(&cfg.database_url)
-        .await?;
+    let db_pool = db::connect_pool(
+        &cfg.database_url,
+        cfg.db_pool_size,
+        Some(stmt_timeout),
+        Some(idle_timeout),
+    )
+    .await?;
     tracing::info!(
         pool_size = cfg.db_pool_size,
         statement_timeout_ms = stmt_timeout,

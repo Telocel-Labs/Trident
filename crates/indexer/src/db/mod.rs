@@ -10,25 +10,59 @@ use uuid::Uuid;
 
 use crate::parser::token_events::TokenEvent;
 
-/// Build a bounded Postgres connection pool sized for this service.
+/// Build a bounded Postgres connection pool configured for PgBouncer transaction mode.
 ///
 /// `statement_cache_capacity(0)` disables sqlx's named-prepared-statement cache.
 /// This is mandatory when connecting through PgBouncer in transaction pooling
 /// mode: a cached prepared statement is bound to one server connection, but in
 /// transaction mode the next transaction may be routed to a different server
 /// connection where that statement does not exist, which makes the query fail.
-/// See docs/deployment.md (issue #87).
-#[allow(dead_code)]
-pub async fn connect_pool(database_url: &str, pool_size: u32) -> Result<PgPool, TridentError> {
-    let connect_options = PgConnectOptions::from_str(database_url)
-        .map_err(|e| TridentError::config(anyhow::Error::new(e).context("invalid DATABASE_URL")))?
-        .statement_cache_capacity(0);
+/// See docs/deployment.md (issue #87, #634).
+pub async fn connect_pool(
+    database_url: &str,
+    pool_size: u32,
+    statement_timeout_ms: Option<u64>,
+    idle_in_transaction_timeout_ms: Option<u64>,
+) -> Result<PgPool, TridentError> {
+    let connect_options = build_connect_options(database_url)?;
 
-    PgPoolOptions::new()
-        .max_connections(pool_size)
+    let mut pool_options = PgPoolOptions::new().max_connections(pool_size);
+
+    if statement_timeout_ms.is_some() || idle_in_transaction_timeout_ms.is_some() {
+        let stmt_timeout = statement_timeout_ms.unwrap_or(0);
+        let idle_timeout = idle_in_transaction_timeout_ms.unwrap_or(0);
+
+        pool_options = pool_options.after_connect(move |conn, _| {
+            Box::pin(async move {
+                if stmt_timeout > 0 {
+                    sqlx::query("SELECT set_config('statement_timeout', $1 || 'ms', false)")
+                        .bind(stmt_timeout.to_string())
+                        .execute(&mut *conn)
+                        .await?;
+                }
+                if idle_timeout > 0 {
+                    sqlx::query("SELECT set_config('idle_in_transaction_session_timeout', $1 || 'ms', false)")
+                        .bind(idle_timeout.to_string())
+                        .execute(&mut *conn)
+                        .await?;
+                }
+                Ok(())
+            })
+        });
+    }
+
+    pool_options
         .connect_with(connect_options)
         .await
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("connect_pool")))
+}
+
+/// Helper to build PgConnectOptions with PgBouncer-safe settings (issue #634).
+pub fn build_connect_options(database_url: &str) -> Result<PgConnectOptions, TridentError> {
+    let connect_options = PgConnectOptions::from_str(database_url)
+        .map_err(|e| TridentError::config(anyhow::Error::new(e).context("invalid DATABASE_URL")))?
+        .statement_cache_capacity(0);
+    Ok(connect_options)
 }
 
 /// Classify a storage failure as permanent (the data itself is unpersistable —
@@ -4186,5 +4220,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, ReplayOutcome::AlreadyReplayedOrMissing);
+    }
+}
+
+#[cfg(test)]
+mod tests_pgbouncer {
+    use super::*;
+
+    #[test]
+    fn test_build_connect_options_disables_statement_cache() {
+        let url = "postgres://user:password@localhost:5432/trident_test";
+        let opts = build_connect_options(url).expect("valid connect options");
+        let debug_str = format!("{:?}", opts);
+        assert!(debug_str.contains("statement_cache_capacity: 0"));
     }
 }
