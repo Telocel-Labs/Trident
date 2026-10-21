@@ -29,9 +29,12 @@ pub const MAX_CONTRACT_IDS_PER_FILTER: usize = 5;
 /// Maximum filter objects the Soroban RPC accepts in one `getEvents` request.
 pub const MAX_FILTERS_PER_REQUEST: usize = 5;
 
-/// Largest allowlist that can be expressed server-side before we degrade to
-/// index-all plus client-side filtering.
+/// Largest allowlist that can be expressed in a single getEvents request.
 pub const MAX_FILTERABLE_CONTRACTS: usize = MAX_CONTRACT_IDS_PER_FILTER * MAX_FILTERS_PER_REQUEST;
+pub const MAX_CONTRACTS_PER_SHARD: usize = MAX_FILTERABLE_CONTRACTS;
+
+/// Maximum number of shards supported before degrading to index-all fallback.
+pub const MAX_FILTER_SHARDS: usize = 40; // 1,000 contracts
 
 /// Wildcard segment matching exactly one topic position.
 const SEGMENT_ANY: &str = "*";
@@ -54,9 +57,13 @@ pub struct EventFilter {
 /// server-side filtering for this allowlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterPlan {
+    /// Combined list of filters for single request or first shard (backward compatibility).
     pub filters: Vec<EventFilter>,
+    /// Shards of filters: each shard contains up to MAX_FILTERS_PER_REQUEST (5)
+    /// filters, covering at most MAX_CONTRACTS_PER_SHARD (25) contracts.
+    pub shards: Vec<Vec<EventFilter>>,
     /// True when an allowlist was present but could not be expressed within the
-    /// RPC's filter caps, so the request falls back to index-all.
+    /// RPC filter caps (e.g. exceeds MAX_FILTER_SHARDS), falling back to index-all.
     pub degraded: bool,
 }
 
@@ -65,6 +72,7 @@ impl FilterPlan {
     pub fn index_all() -> Self {
         Self {
             filters: Vec::new(),
+            shards: Vec::new(),
             degraded: false,
         }
     }
@@ -86,27 +94,38 @@ pub fn build_event_filters(
         return FilterPlan::index_all();
     };
 
-    if set.len() > MAX_FILTERABLE_CONTRACTS {
+    let mut ids: Vec<String> = set.iter().cloned().collect();
+    ids.sort();
+
+    let contract_chunks: Vec<&[String]> = ids.chunks(MAX_CONTRACTS_PER_SHARD).collect();
+
+    if contract_chunks.len() > MAX_FILTER_SHARDS {
         return FilterPlan {
             filters: Vec::new(),
+            shards: Vec::new(),
             degraded: true,
         };
     }
 
-    let mut ids: Vec<String> = set.iter().cloned().collect();
-    ids.sort();
-
-    let filters = ids
-        .chunks(MAX_CONTRACT_IDS_PER_FILTER)
-        .map(|chunk| EventFilter {
-            event_type: "contract",
-            contract_ids: chunk.to_vec(),
-            topics: topics.to_vec(),
+    let shards: Vec<Vec<EventFilter>> = contract_chunks
+        .into_iter()
+        .map(|chunk| {
+            chunk
+                .chunks(MAX_CONTRACT_IDS_PER_FILTER)
+                .map(|filter_chunk| EventFilter {
+                    event_type: "contract",
+                    contract_ids: filter_chunk.to_vec(),
+                    topics: topics.to_vec(),
+                })
+                .collect()
         })
         .collect();
 
+    let first_shard_filters = shards.first().cloned().unwrap_or_default();
+
     FilterPlan {
-        filters,
+        filters: first_shard_filters,
+        shards,
         degraded: false,
     }
 }
@@ -240,13 +259,42 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_beyond_the_request_limit_degrades_to_index_all() {
+    fn allowlist_beyond_the_request_limit_is_sharded() {
         let ids: Vec<String> = (0..MAX_FILTERABLE_CONTRACTS + 1)
             .map(|i| format!("C{i:03}"))
             .collect();
         let set: HashSet<String> = ids.into_iter().collect();
         let plan = build_event_filters(Some(&set), &[]);
+        assert_eq!(plan.shards.len(), 2, "26 contracts must produce 2 shards");
+        assert_eq!(plan.shards[0].len(), MAX_FILTERS_PER_REQUEST);
+        assert_eq!(plan.shards[1].len(), 1);
+        assert!(!plan.degraded);
+    }
+
+    #[test]
+    fn allowlist_with_100_contracts_produces_four_shards() {
+        let ids: Vec<String> = (0..100).map(|i| format!("C{i:03}")).collect();
+        let set: HashSet<String> = ids.into_iter().collect();
+        let plan = build_event_filters(Some(&set), &[]);
+        assert_eq!(plan.shards.len(), 4, "100 contracts must produce 4 shards");
+        assert!(!plan.degraded);
+        for shard in &plan.shards {
+            assert_eq!(shard.len(), MAX_FILTERS_PER_REQUEST);
+            for f in shard {
+                assert_eq!(f.contract_ids.len(), MAX_CONTRACT_IDS_PER_FILTER);
+            }
+        }
+    }
+
+    #[test]
+    fn allowlist_beyond_max_shards_degrades_to_index_all() {
+        let ids: Vec<String> = (0..(MAX_FILTER_SHARDS * MAX_CONTRACTS_PER_SHARD + 1))
+            .map(|i| format!("C{i:05}"))
+            .collect();
+        let set: HashSet<String> = ids.into_iter().collect();
+        let plan = build_event_filters(Some(&set), &[]);
         assert!(plan.filters.is_empty());
+        assert!(plan.shards.is_empty());
         assert!(plan.degraded, "oversized allowlist must flag degradation");
     }
 

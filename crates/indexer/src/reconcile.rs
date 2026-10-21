@@ -248,9 +248,34 @@ impl Reconciler {
         });
         let plan = build_event_filters(contract_ids.as_ref(), &self.topic_filters);
 
-        let rpc_counts = self
-            .count_rpc_events(window_start, window_end, &plan.filters, allowlist.as_ref())
-            .await?;
+        let rpc_counts = if plan.shards.len() <= 1 {
+            let filters = plan.shards.first().map(|s| s.as_slice()).unwrap_or(&[]);
+            self.count_rpc_events(window_start, window_end, filters, allowlist.as_ref())
+                .await?
+        } else {
+            let mut combined_per_ledger: HashMap<u64, u64> = HashMap::new();
+            let mut truncated = false;
+            let mut last_seen_ledger = 0u64;
+            for shard in &plan.shards {
+                let counts = self
+                    .count_rpc_events(window_start, window_end, shard, allowlist.as_ref())
+                    .await?;
+                for (ledger, count) in counts.per_ledger {
+                    *combined_per_ledger.entry(ledger).or_default() += count;
+                }
+                if counts.truncated {
+                    truncated = true;
+                }
+                if counts.last_seen_ledger > last_seen_ledger {
+                    last_seen_ledger = counts.last_seen_ledger;
+                }
+            }
+            RpcCounts {
+                per_ledger: combined_per_ledger,
+                truncated,
+                last_seen_ledger,
+            }
+        };
 
         // A walk that hit the page cap covered only part of the window. The
         // comparable range ends one ledger BEFORE the interruption point (the
