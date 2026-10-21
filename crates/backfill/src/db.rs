@@ -115,11 +115,20 @@ pub async fn fail_job(pool: &PgPool, id: Uuid, error: &str) -> Result<(), Triden
 /// deployment (e.g. `"mainnet"` or `"testnet"`); the natural-key constraint is
 /// network-scoped because the same transaction hash can legitimately appear on
 /// more than one network.
+/// Outcome of an event insertion attempt (issue #772).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// A new event row was inserted.
+    Inserted,
+    /// An identical event already existed; ON CONFLICT DO NOTHING triggered.
+    Duplicate,
+}
+
 pub async fn insert_event(
     pool: &PgPool,
     event: &SorobanEvent,
     network: &str,
-) -> Result<(), TridentError> {
+) -> Result<InsertOutcome, TridentError> {
     let id = event_uuid(&event.transaction_hash, event.raw_event_index);
     let event_type = match event.event_type {
         trident_common::EventType::Contract => "contract",
@@ -132,7 +141,7 @@ pub async fn insert_event(
         TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
     })?;
 
-    sqlx::query(
+    let res = sqlx::query(
         r#"
         INSERT INTO soroban_events
             (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
@@ -155,7 +164,11 @@ pub async fn insert_event(
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
 
-    Ok(())
+    if res.rows_affected() > 0 {
+        Ok(InsertOutcome::Inserted)
+    } else {
+        Ok(InsertOutcome::Duplicate)
+    }
 }
 
 #[cfg(test)]
