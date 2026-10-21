@@ -215,7 +215,7 @@ func TestContractsStatsUsesNetworkFromContext_NotQueryString(t *testing.T) {
 	t.Cleanup(mr.Close)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?from_ledger=0&to_ledger=1000000&limit=10", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?from_ledger=0&to_ledger=100000&limit=10", nil)
 	req = req.WithContext(middleware.WithNetwork(req.Context(), "testnet"))
 	rec := httptest.NewRecorder()
 

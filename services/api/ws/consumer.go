@@ -3,8 +3,10 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,16 +20,110 @@ import (
 // copy of the literal that could drift from this one.
 const StreamKey = "trident:events"
 
-const groupName = "trident-api"
+// DefaultGroupName is the base consumer group name for Trident API WebSocket readers.
+const DefaultGroupName = "trident-api"
 
 // streamKey is a private alias for StreamKey, kept so this file's many
 // internal references don't all need renaming.
 const streamKey = StreamKey
 
-// streamEntry is the JSON structure expected in each Redis Stream message value.
-type streamEntry struct {
-	ContractID string          `json:"contract_id"`
-	Payload    json.RawMessage `json:"payload"`
+// consumerGroupName resolves the consumer group name to use for this replica.
+// If WS_CONSUMER_GROUP is set, that explicit group is used. Otherwise, in a
+// multi-replica fan-out deployment, each replica requires its own consumer group
+// so all replicas receive every published event rather than Redis load-balancing
+// messages across them (issue #807).
+func consumerGroupName(consumerName string) string {
+	if g := os.Getenv("WS_CONSUMER_GROUP"); g != "" {
+		return g
+	}
+	return DefaultGroupName + "-" + consumerName
+}
+
+// parseStreamEntry extracts the contractID and event payload from a Redis stream entry (issue #793).
+// Supports both:
+// 1. Canonical Indexer schema: top-level fields "contract_id", "data", "topics", "id", "network", etc.
+// 2. Legacy wrapper schema: "data" -> {"contract_id": "...", "payload": ...}
+func parseStreamEntry(values map[string]interface{}) (string, []byte, bool) {
+	// 1. Canonical Indexer schema: contract_id is a top-level field in Redis stream entry.
+	if cidRaw, ok := values["contract_id"]; ok {
+		contractID := redisString(cidRaw)
+		if contractID != "" {
+			eventMap := make(map[string]interface{}, len(values)+6)
+			for k, v := range values {
+				eventMap[k] = v
+			}
+			id := redisString(values["id"])
+			if id == "" {
+				id = redisString(values["event_id"])
+			}
+			if id != "" {
+				eventMap["id"] = id
+				eventMap["eventId"] = id
+			}
+			eventMap["contractId"] = contractID
+			eventMap["contract_id"] = contractID
+
+			if netVal := redisString(values["network"]); netVal != "" {
+				eventMap["network"] = netVal
+			}
+			if txHash := redisString(values["transaction_hash"]); txHash != "" {
+				eventMap["txHash"] = txHash
+				eventMap["transaction_hash"] = txHash
+			}
+			if seqStr := redisString(values["ledger_sequence"]); seqStr != "" {
+				if seq, err := strconv.ParseInt(seqStr, 10, 64); err == nil {
+					eventMap["ledger_sequence"] = seq
+					eventMap["ledgerSequence"] = seq
+				}
+			}
+			if topicsStr := redisString(values["topics"]); topicsStr != "" {
+				var topicsArr []interface{}
+				if err := json.Unmarshal([]byte(topicsStr), &topicsArr); err == nil {
+					eventMap["topics"] = topicsArr
+				}
+			}
+			if dataStr := redisString(values["data"]); dataStr != "" {
+				var dataVal interface{}
+				if err := json.Unmarshal([]byte(dataStr), &dataVal); err == nil {
+					eventMap["data"] = dataVal
+				} else {
+					eventMap["data"] = dataStr
+				}
+			}
+
+			payload, err := json.Marshal(eventMap)
+			if err == nil {
+				return contractID, payload, true
+			}
+		}
+	}
+
+	// 2. Legacy wrapper schema: "data" field contains JSON with contract_id and payload.
+	if raw, ok := values["data"]; ok {
+		rawStr := redisString(raw)
+		if rawStr != "" {
+			var legacy struct {
+				ContractID string          `json:"contract_id"`
+				Payload    json.RawMessage `json:"payload"`
+			}
+			if err := json.Unmarshal([]byte(rawStr), &legacy); err == nil && legacy.ContractID != "" {
+				return legacy.ContractID, legacy.Payload, true
+			}
+		}
+	}
+
+	return "", nil, false
+}
+
+func redisString(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // StartConsumer begins a Redis Streams consumer group reader. It creates the
@@ -41,6 +137,7 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 	if consumerName == "" {
 		consumerName = uuid.NewString()
 	}
+	groupName := consumerGroupName(consumerName)
 
 	slog.Info("ws: Redis Streams consumer starting (consumer group)", "stream", streamKey, "group", groupName, "consumer", consumerName)
 
@@ -55,8 +152,18 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 		}
 	}
 
+	// Clean up dynamic consumer group on shutdown to avoid Redis stream metadata accumulation.
+	if os.Getenv("WS_CONSUMER_GROUP") == "" {
+		go func() {
+			<-ctx.Done()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = rdb.XGroupDestroy(cleanupCtx, streamKey, groupName).Err()
+		}()
+	}
+
 	// Run PEL recovery (XAUTOCLAIM) once at startup.
-	recoverPending(ctx, rdb, hub, consumerName)
+	recoverPending(ctx, rdb, hub, groupName, consumerName)
 
 	// Periodic PEL recovery every 30 seconds in background.
 	go func() {
@@ -65,7 +172,7 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 		for {
 			select {
 			case <-ticker.C:
-				recoverPending(ctx, rdb, hub, consumerName)
+				recoverPending(ctx, rdb, hub, groupName, consumerName)
 			case <-ctx.Done():
 				slog.Info("ws: PEL recovery goroutine stopping")
 				return
@@ -101,44 +208,16 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 
 		for _, stream := range entries {
 			for _, msg := range stream.Messages {
-				// msg.ID is the message id we must XACK after processing.
-				raw, ok := msg.Values["data"]
+				contractID, payload, ok := parseStreamEntry(msg.Values)
 				if !ok {
-					slog.Warn("ws: stream message missing 'data' field", "id", msg.ID)
-					// Acknowledge to avoid stuck messages, since we can't process it.
+					slog.Warn("ws: failed to parse stream entry", "id", msg.ID)
 					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
 						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
 					}
 					continue
 				}
 
-				rawStr, ok := raw.(string)
-				if !ok {
-					slog.Warn("ws: stream message 'data' is not a string", "id", msg.ID)
-					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
-						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
-					}
-					continue
-				}
-
-				var entry streamEntry
-				if err := json.Unmarshal([]byte(rawStr), &entry); err != nil {
-					slog.Warn("ws: failed to unmarshal stream entry", "id", msg.ID, "err", err)
-					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
-						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
-					}
-					continue
-				}
-
-				if entry.ContractID == "" {
-					slog.Warn("ws: stream entry missing contract_id", "id", msg.ID)
-					if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
-						slog.Warn("ws: failed to XACK malformed message", "id", msg.ID, "err", err)
-					}
-					continue
-				}
-
-				hub.Broadcast(entry.ContractID, entry.Payload)
+				hub.Broadcast(contractID, payload)
 
 				// Acknowledge the message after successful broadcast.
 				if err := rdb.XAck(ctx, streamKey, groupName, msg.ID).Err(); err != nil {
@@ -151,7 +230,7 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 
 // recoverPending claims pending messages older than 30s using XAUTOCLAIM and
 // reprocesses them locally so no messages stay stuck in the PEL.
-func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, consumerName string) {
+func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, groupName, consumerName string) {
 	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -172,43 +251,16 @@ func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, consumerNa
 	}
 
 	for _, msg := range messages {
-		raw, ok := msg.Values["data"]
+		contractID, payload, ok := parseStreamEntry(msg.Values)
 		if !ok {
-			slog.Warn("ws: recovered message missing 'data'", "id", msg.ID)
-			// Acknowledge to avoid loops.
+			slog.Warn("ws: failed to parse recovered message", "id", msg.ID)
 			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
 				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
 			}
 			continue
 		}
 
-		rawStr, ok := raw.(string)
-		if !ok {
-			slog.Warn("ws: recovered message 'data' not string", "id", msg.ID)
-			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
-				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
-			}
-			continue
-		}
-
-		var entry streamEntry
-		if err := json.Unmarshal([]byte(rawStr), &entry); err != nil {
-			slog.Warn("ws: failed to unmarshal recovered entry", "id", msg.ID, "err", err)
-			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
-				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
-			}
-			continue
-		}
-
-		if entry.ContractID == "" {
-			slog.Warn("ws: recovered entry missing contract_id", "id", msg.ID)
-			if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
-				slog.Warn("ws: failed to XACK recovered malformed message", "id", msg.ID, "err", err)
-			}
-			continue
-		}
-
-		hub.Broadcast(entry.ContractID, entry.Payload)
+		hub.Broadcast(contractID, payload)
 		if err := rdb.XAck(ctx2, streamKey, groupName, msg.ID).Err(); err != nil {
 			slog.Warn("ws: failed to XACK recovered message", "id", msg.ID, "err", err)
 		}

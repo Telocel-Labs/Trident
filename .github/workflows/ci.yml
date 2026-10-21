@@ -1060,6 +1060,7 @@ jobs:
             -- mint --to "$RECIPIENT_ADDR" --amount 4200000
 
           echo "recipient_addr=$RECIPIENT_ADDR" >> "$GITHUB_OUTPUT"
+          echo "admin_addr=$ADMIN_ADDR" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
@@ -1151,6 +1152,25 @@ jobs:
           done
           echo "Mint event was not indexed within the bounded wait." >&2
           exit 1
+
+      - name: Set up Go toolchain
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version-file: services/api/go.mod
+          cache-dependency-path: services/api/go.sum
+
+      - name: Run E2E multi-subscriber stream test (REST, WebSocket, GraphQL, SSE, gRPC, Webhook)
+        working-directory: services/api
+        env:
+          E2E_SUBSCRIBERS_BASE_URL: http://localhost:3000
+          E2E_CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          E2E_API_KEY: ci-test-api-key-do-not-use-in-production
+          E2E_GRPC_ADDR: localhost:50051
+          E2E_WEBHOOK_TARGET_HOST: host.docker.internal
+          E2E_TRIGGER_CMD: |
+            stellar contract invoke --id "${{ steps.deploy.outputs.contract_id }}" --source recipient --network local -- transfer --from "${{ steps.deploy.outputs.recipient_addr }}" --to "${{ steps.deploy.outputs.admin_addr }}" --amount 1000000
+        run: |
+          go test -v -count=1 -timeout=120s ./internal/e2estreams -run TestE2EAllSubscribersPipeline
 
       - name: Dump service logs
         if: always()

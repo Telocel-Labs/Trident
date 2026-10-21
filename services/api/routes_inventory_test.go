@@ -221,6 +221,7 @@ func TestErrorCodeEnumMatchesHttputil(t *testing.T) {
 	goCodes := map[string]bool{
 		string(httputil.NOT_FOUND):         true,
 		string(httputil.UNAUTHORIZED):      true,
+		string(httputil.API_KEY_EXPIRED):   true,
 		string(httputil.RATE_LIMITED):      true,
 		string(httputil.INVALID_ARGUMENT):  true,
 		string(httputil.UNAVAILABLE):       true,
