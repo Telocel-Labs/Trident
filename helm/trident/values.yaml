@@ -116,7 +116,7 @@ indexer:
       memory: "512Mi"
   env:
     # GRPC_ADDR of the Rust gRPC service (in-cluster DNS)
-    GRPC_ADDR: "trident-grpc-api:5000"
+    GRPC_ADDR: "trident-grpc-api-headless:5000"
     # Rows per batched INSERT when a page is committed. The page is always one
     # transaction; this caps statement size, not transaction scope.
     DB_BATCH_SIZE: "1000"
@@ -158,9 +158,15 @@ grpcApi:
     # See migrations.image.tag above for why this defaults to empty rather
     # than "latest" (issue #622).
     tag: ""
-  replicaCount: 1
+  # Multi-replica HA deployment (issue #765)
+  replicaCount: 2
   service:
     port: 5000
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
   env:
     # Address the gRPC server binds to. Must match service.port.
     GRPC_ADDR: "0.0.0.0:5000"
@@ -194,6 +200,16 @@ grpcApi:
   affinity: {}
   # Matches the `USER trident` (uid 1001) added to crates/api/Dockerfile.
   securityContextUid: 1001
+  # PodDisruptionBudget: keep at least 1 gRPC API replica up through disruptions (issue #765).
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # Spread replicas across nodes so a single node loss doesn't take out the read tier (issue #765).
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
 
 # ---------------------------------------------------------------------------
 # Go API — configurable replicas with HPA

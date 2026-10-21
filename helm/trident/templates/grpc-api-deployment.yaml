@@ -18,6 +18,15 @@ spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.grpcApi.securityContextUid) | nindent 8 }}
+      {{- if .Values.grpcApi.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.grpcApi.topologySpreadConstraints.maxSkew }}
+          topologyKey: {{ .Values.grpcApi.topologySpreadConstraints.topologyKey }}
+          whenUnsatisfiable: {{ .Values.grpcApi.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 14 }}
+      {{- end }}
       containers:
         - name: grpc-api
           image: "{{ .Values.grpcApi.image.repository }}:{{ .Values.grpcApi.image.tag | default .Chart.AppVersion }}"
@@ -115,3 +124,36 @@ spec:
       port: {{ .Values.grpcApi.service.port }}
       targetPort: grpc
       protocol: TCP
+---
+# Issue #765: Headless Service for round_robin client load balancing across gRPC pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "trident.fullname" . }}-grpc-api-headless
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grpc-api
+spec:
+  clusterIP: None
+  selector:
+    {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.grpcApi.service.port }}
+      targetPort: grpc
+      protocol: TCP
+{{- if .Values.grpcApi.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "trident.fullname" . }}-grpc-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grpc-api
+spec:
+  minAvailable: {{ .Values.grpcApi.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 6 }}
+{{- end }}
