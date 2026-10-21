@@ -156,6 +156,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: cargo deny (Rust workspace)
+        uses: EmbarkStudios/cargo-deny-action@e0a44094b918f93be0c812e52b012a33b688b9dc # v2.0.12
+        with:
+          command: check advisories
+
       - name: Set up Go
         uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
         with:
@@ -184,20 +189,12 @@ jobs:
         with:
           node-version: "20"
 
-      # Reports but does not block. #466 moved explorer to Astro 5 and removed
-      # continue-on-error on the assumption that cleared the HIGH advisories.
-      # It does not: resolving this package.json on Astro 5 still leaves HIGH
-      # findings in esbuild and sharp, and npm's own remediation is
-      # `astro@7`. Verified 2026-08-26 by resolving the manifest in isolation.
-      #
-      # Astro 7 + Tailwind 4 does audit clean (0 vulnerabilities), but that is
-      # a two-major jump plus the Tailwind v4 migration (@astrojs/tailwind is
-      # replaced by @tailwindcss/vite), which needs its own change against
-      # #402 rather than riding along here.
+      # Explorer audit gate enforced against production dependencies.
+      # Resolving secure patched transitive dependencies in package-lock.json clears all
+      # high-severity advisories, allowing the gate to block regressions (issue #627).
       - name: npm audit (explorer)
         working-directory: explorer
         run: npm audit --audit-level=high --omit=dev
-        continue-on-error: true
 
       - name: npm audit (sdk/typescript)
         working-directory: sdk/typescript
