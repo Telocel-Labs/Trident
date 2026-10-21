@@ -30,7 +30,7 @@ use tracing::Instrument;
 use trident_common::{Severity, TridentError};
 
 use crate::{
-    alerting::{AlertContext, Alerter},
+    alerting::{AlertWorker, Alerter},
     config::Config,
     db, metrics,
     parser::Parser,
@@ -85,9 +85,12 @@ pub struct Streamer {
     /// Counts poll cycles so we know when to refresh the filter.
     poll_count: u32,
     /// Outbound webhook alerter (issue #75). No-op when URL is not configured.
-    alerter: Alerter,
+    alerter: Arc<Alerter>,
     /// Chain tip ledger from the most recent RPC response (issue #75).
     last_chain_tip: u64,
+    /// Shared cursor and chain tip for independent alert worker (issue #786).
+    shared_cursor: Arc<std::sync::atomic::AtomicU64>,
+    shared_chain_tip: Arc<std::sync::atomic::AtomicU64>,
     /// Adaptive poll-interval controller driven by chain-tip lag (issue #198).
     adaptive_poll: AdaptivePoll,
     /// Tracked contracts most recently classified as SEP-41 tokens (issue
@@ -202,8 +205,10 @@ impl Streamer {
             contract_filter,
             filter_plan,
             poll_count: 0,
-            alerter,
+            alerter: Arc::new(alerter),
             last_chain_tip: 0,
+            shared_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            shared_chain_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             adaptive_poll,
             token_contracts: Arc::new(std::sync::RwLock::new(HashSet::new())),
             rpc_breaker,
@@ -412,6 +417,21 @@ impl Streamer {
         );
         let spec_sync_handle = tokio::spawn(spec_sync.run(shutdown.clone()));
 
+        // Independent alert evaluation task (issue #786)
+        let alert_worker = AlertWorker::new(
+            self.db.clone(),
+            Arc::clone(&self.rpc),
+            Arc::clone(&self.alerter),
+            self.config.network.clone(),
+            self.config.alert_lag_threshold,
+            Arc::clone(&self.shared_cursor),
+            Arc::clone(&self.shared_chain_tip),
+            Duration::from_secs(5),
+            None,
+        );
+        let alert_handle = tokio::spawn(alert_worker.run(shutdown.clone()));
+        self.shared_cursor.store(cursor, std::sync::atomic::Ordering::Relaxed);
+
         loop {
             // Check for shutdown before starting a new poll so we never begin
             // a batch we can't finish atomically.
@@ -463,6 +483,7 @@ impl Streamer {
                 match self.poll_once(&mut cursor).instrument(poll_span).await {
                     Ok(events_processed) => {
                         self.rpc_breaker.record(Outcome::Success);
+                        self.shared_cursor.store(cursor, std::sync::atomic::Ordering::Relaxed);
                         if events_processed > 0 {
                             tracing::info!(events_processed, cursor, "Batch processed");
                         } else {
@@ -581,6 +602,7 @@ impl Streamer {
 
         // Shutdown was requested, so the task is already on its way out; abort
         // rather than await it so a pass caught mid-RPC cannot delay exit.
+        alert_handle.abort();
         spec_sync_handle.abort();
 
         tracing::info!(cursor, "Streamer stopped cleanly; cursor persisted");
@@ -916,6 +938,7 @@ impl Streamer {
 
             metrics::set_ledger_lag(page.latest_ledger.saturating_sub(*cursor) as i64);
             self.last_chain_tip = page.latest_ledger;
+            self.shared_chain_tip.store(page.latest_ledger, std::sync::atomic::Ordering::Relaxed);
 
             if page.events.is_empty() {
                 break;
@@ -1379,46 +1402,7 @@ impl Streamer {
             tracing::warn!(error = %e, "Failed to update health stats");
         }
 
-        // Alerting (issue #75) — best-effort, never aborts the poll cycle.
-        if self.alerter.is_enabled() {
-            match db::get_alert_state(&self.db, &self.config.network).await {
-                Ok(mut alert_state) => {
-                    // issue #605: checked on the same cadence as lag/RPC-degraded.
-                    // A query failure (other than the view being absent, which
-                    // default_partition_row_count itself already turns into
-                    // Ok(None)) must not abort alerting for the checks above —
-                    // logged and treated as "no signal this cycle".
-                    let default_partition_row_count =
-                        match db::default_partition_row_count(&self.db).await {
-                            Ok(count) => count,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Failed to read soroban_events_default row count"
-                                );
-                                None
-                            }
-                        };
-                    let ctx = AlertContext {
-                        last_ledger_indexed: *cursor,
-                        chain_tip_ledger: self.last_chain_tip,
-                        lag_threshold: self.config.alert_lag_threshold,
-                        network: self.config.network.clone(),
-                        rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
-                        default_partition_row_count,
-                    };
-                    self.alerter.evaluate(&ctx, &mut alert_state).await;
-                    if let Err(e) =
-                        db::set_alert_state(&self.db, &self.config.network, &alert_state).await
-                    {
-                        tracing::warn!(error = %e, "Failed to persist alert state");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read alert state");
-                }
-            }
-        }
+        // Alert evaluation decoupled to independent AlertWorker (issue #786)
 
         Ok(total)
     }
@@ -2859,6 +2843,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
