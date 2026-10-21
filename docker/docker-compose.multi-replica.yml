@@ -1,0 +1,159 @@
+# Multi-replica integration overlay (issue #807) — layered on top of
+# docker-compose.yml + docker-compose.ci.yml.
+#
+# Runs:
+#   - Two Go REST API replicas behind nginx (api-1 on :3001, api-2 on :3002);
+#   - Nginx reverse proxy load-balancing the two Go API replicas on :8080;
+#   - Two Rust gRPC API replicas (grpc-api-1 and grpc-api-2);
+#   - Shared Postgres and Redis instances.
+#
+# Usage:
+#   docker compose \
+#     -f docker/docker-compose.yml \
+#     -f docker/docker-compose.ci.yml \
+#     -f docker/docker-compose.multi-replica.yml \
+#     --env-file .env.ci \
+#     up -d
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  # Opt out the single-replica services from starting in multi-replica mode.
+  api:
+    profiles:
+      - single-replica
+
+  grpc-api:
+    profiles:
+      - single-replica
+
+  # ---------------------------------------------------------------------------
+  # Rust gRPC API Replicas
+  # ---------------------------------------------------------------------------
+  grpc-api-1:
+    build:
+      context: ..
+      dockerfile: crates/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GRPC_ADDR: 0.0.0.0:50051
+      REDIS_URL: ${REDIS_URL}
+      RUST_LOG: ${LOG_LEVEL:-info}
+      GRPC_API_DB_POOL_SIZE: ${GRPC_API_DB_POOL_SIZE:-5}
+      STREAM_CHANNEL_BUFFER: ${STREAM_CHANNEL_BUFFER:-128}
+    expose:
+      - "50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: "no"
+
+  grpc-api-2:
+    build:
+      context: ..
+      dockerfile: crates/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GRPC_ADDR: 0.0.0.0:50051
+      REDIS_URL: ${REDIS_URL}
+      RUST_LOG: ${LOG_LEVEL:-info}
+      GRPC_API_DB_POOL_SIZE: ${GRPC_API_DB_POOL_SIZE:-5}
+      STREAM_CHANNEL_BUFFER: ${STREAM_CHANNEL_BUFFER:-128}
+    expose:
+      - "50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Go REST API Replica 1
+  # ---------------------------------------------------------------------------
+  api-1:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: ${REDIS_URL}
+      GRPC_ADDR: grpc-api-1:50051
+      PORT: 3001
+      API_KEY_SALT: ${API_KEY_SALT}
+      API_KEY_HASHES: ${API_KEY_HASHES}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
+      IDEMPOTENCY_ENCRYPTION_KEY: ${IDEMPOTENCY_ENCRYPTION_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      grpc-api-1:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3001/v1/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Go REST API Replica 2
+  # ---------------------------------------------------------------------------
+  api-2:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: ${REDIS_URL}
+      GRPC_ADDR: grpc-api-2:50051
+      PORT: 3002
+      API_KEY_SALT: ${API_KEY_SALT}
+      API_KEY_HASHES: ${API_KEY_HASHES}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
+      IDEMPOTENCY_ENCRYPTION_KEY: ${IDEMPOTENCY_ENCRYPTION_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      grpc-api-2:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3002/v1/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Nginx Load Balancer
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.multi-replica.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-1
+      - api-2
+    restart: "no"
