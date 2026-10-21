@@ -23,6 +23,6 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Run actionlint
-        uses: reviewdog/action-actionlint@db582178857c72655ae56107b83146600e62ae74 # v1.65.0
+        uses: reviewdog/action-actionlint@723b43e281169876cbcd247431484753fb341f0d # v1.65.0
         with:
           actionlint_flags: -color
