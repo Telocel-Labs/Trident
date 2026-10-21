@@ -106,3 +106,108 @@ fi
 
 echo "OK: every env var read by indexer/backfill/grpc-api/go-api is documented in $DOC"
 echo "OK: every Config field is read outside config.rs (no dead knobs)"
+# ── Deployment config validation (Fly & Helm) (issue #777) ───────────────
+# Neither Fly toml [env] blocks nor Helm chart values/templates may supply
+# environment variables that config validation rejects (e.g. POLL_INTERVAL_MS,
+# MAX_REORG_REWIND_DEPTH, RPC_FAILOVER_THRESHOLD, RPC_ENDPOINT_COOLDOWN_MS),
+# or variables that are not documented in docs/ENVIRONMENT.md.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
+    PYTHON="python3"
+  else
+    PYTHON="python"
+  fi
+fi
+
+FLY_DIR="${1:-fly}"
+HELM_DIR="${2:-helm/trident}"
+
+"$PYTHON" - "$DOC" "$FLY_DIR" "$HELM_DIR" <<'PYEOF'
+import glob, os, re, sys, tomllib, yaml
+
+doc_path = sys.argv[1]
+fly_dir = sys.argv[2]
+helm_dir = sys.argv[3]
+
+with open(doc_path, "r", encoding="utf-8") as f:
+    doc_text = f.read()
+
+# Variables explicitly rejected by indexer/service config validation (issue #629, #737, #777)
+rejected_vars = {
+    "POLL_INTERVAL_MS": "no longer used — use POLL_INTERVAL_FLOOR_MS / POLL_INTERVAL_CEILING_MS / LAG_HIGH_WATERMARK instead",
+    "MAX_REORG_REWIND_DEPTH": "no longer used — use MAX_REORG_DEPTH instead",
+    "RPC_FAILOVER_THRESHOLD": "no longer used — use RPC_BREAKER_FAILURE_THRESHOLD instead",
+    "RPC_ENDPOINT_COOLDOWN_MS": "no longer used — use RPC_BREAKER_COOLDOWN_MS instead",
+}
+
+failures = []
+
+# 1. Fly toml [env] blocks
+for toml_path in sorted(glob.glob(os.path.join(fly_dir, "*.toml"))):
+    try:
+        with open(toml_path, "r", encoding="utf-8-sig") as f:
+            data = tomllib.loads(f.read())
+    except Exception as e:
+        failures.append(f"{toml_path}: failed to parse TOML: {e}")
+        continue
+
+    env_map = data.get("env", {})
+    if not isinstance(env_map, dict):
+        continue
+
+    for var_name in env_map:
+        if var_name in rejected_vars:
+            failures.append(
+                f"{toml_path}: sets rejected env var `{var_name}` ({rejected_vars[var_name]})"
+            )
+        elif f"`{var_name}`" not in doc_text:
+            failures.append(
+                f"{toml_path}: sets env var `{var_name}` which is not documented in {doc_path}"
+            )
+
+# 2. Helm chart values
+for val_path in sorted(glob.glob(os.path.join(helm_dir, "values*.yaml"))):
+    try:
+        with open(val_path, "r", encoding="utf-8-sig") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        failures.append(f"{val_path}: failed to parse YAML: {e}")
+        continue
+
+    for comp in ["indexer", "grpcApi", "goApi"]:
+        comp_obj = data.get(comp)
+        if isinstance(comp_obj, dict) and "env" in comp_obj and isinstance(comp_obj["env"], dict):
+            for var_name in comp_obj["env"]:
+                if var_name in rejected_vars:
+                    failures.append(
+                        f"{val_path} ({comp}.env): sets rejected env var `{var_name}` ({rejected_vars[var_name]})"
+                    )
+                elif f"`{var_name}`" not in doc_text:
+                    failures.append(
+                        f"{val_path} ({comp}.env): sets env var `{var_name}` which is not documented in {doc_path}"
+                    )
+
+# 3. Helm templates (hardcoded env definitions)
+for tmpl_path in sorted(glob.glob(os.path.join(helm_dir, "templates", "*.yaml"))):
+    try:
+        with open(tmpl_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        continue
+    for match in re.finditer(r"^\s+-\s+name:\s+([A-Z0-9_]+)", content, re.M):
+        var_name = match.group(1)
+        if var_name in rejected_vars:
+            failures.append(
+                f"{tmpl_path}: template defines rejected env var `{var_name}` ({rejected_vars[var_name]})"
+            )
+
+if failures:
+    print(f"ERROR: {len(failures)} deployment configuration issue(s) found in Fly/Helm env vars:", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+PYEOF
+
+echo "OK: all Fly and Helm env declarations reference documented, non-rejected env vars"

@@ -6,21 +6,21 @@ primary_region = "iad"
   dockerfile = "crates/indexer/Dockerfile"
 
 [env]
-  POLL_INTERVAL_MS  = "5000"
-  INDEX_DIAGNOSTIC  = "false"
-  METRICS_PORT      = "9090"
+  POLL_INTERVAL_FLOOR_MS   = "250"
+  POLL_INTERVAL_CEILING_MS = "5000"
+  NETWORK                  = "testnet"
+  INDEX_DIAGNOSTIC         = "false"
+  METRICS_PORT             = "9090"
   # crates/indexer/src/health.rs serves /healthz and /readyz on this port,
   # separate from the Prometheus listener on METRICS_PORT (crates/indexer/src/
   # config.rs defaults HEALTH_PORT to 8080 if unset; set explicitly here so the
   # checks below stay in sync with it).
-  HEALTH_PORT       = "8080"
-  LOG_LEVEL         = "info"
+  HEALTH_PORT              = "8080"
+  LOG_LEVEL                = "info"
 
 # Secrets are sourced exclusively from Fly's encrypted secrets store
 # (set via: fly secrets set -a trident-indexer KEY=value), never from [env].
 # Required: DATABASE_URL, REDIS_URL, STELLAR_RPC_URL (or STELLAR_RPC_URLS)
-# Optional (defaults to "testnet" if unset — crates/indexer/src/config.rs):
-# NETWORK
 
 # No public HTTP — indexer is a worker process. Both the Prometheus listener
 # and the health/readiness listener are reachable only on the private 6PN
