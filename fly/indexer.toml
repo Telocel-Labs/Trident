@@ -1,4 +1,4 @@
-﻿# fly/indexer.toml — Trident Stellar event indexer (Rust)
+# fly/indexer.toml — Trident Stellar event indexer (Rust)
 app = "trident-indexer"
 primary_region = "iad"
 
@@ -22,27 +22,14 @@ primary_region = "iad"
 # Optional (defaults to "testnet" if unset — crates/indexer/src/config.rs):
 # NETWORK
 
-# No public HTTP — indexer is a worker process. Both the Prometheus listener
-# and the health/readiness listener are reachable only on the private 6PN
-# network. Fly's top-level [checks] section (rather than a [[services]] http
-# check) is used because it does not require a services.ports entry, i.e. it
-# does not force the port to be publicly routable.
-[[services]]
-  protocol      = "tcp"
-  internal_port = 9090
+# No public HTTP or ports — indexer is an internal background worker (issue #778).
+# Both the Prometheus metrics listener (9090) and health server (8080) are reachable
+# exclusively over Fly's private 6PN mesh (`trident-indexer.internal:9090`).
+# Omission of [[services]] and [[services.ports]] guarantees no public IP or listener is bound.
 
-  [[services.ports]]
-    port = 9090
-
-  [[services.tcp_checks]]
-    interval     = "15s"
-    timeout      = "2s"
-    grace_period = "30s"
-
-# Readiness check: verifies the process is alive AND that it can reach both
-# Postgres and Redis (crates/indexer/src/health.rs readyz() runs `SELECT 1`
-# and a Redis PING). A bare TCP check on METRICS_PORT only proves the process
-# has a socket open, not that it is actually able to do its job.
+# Readiness and liveness checks:
+# Uses Fly's top-level [checks] section which evaluates health directly within the
+# private network without requiring or creating public ports.
 [checks]
   [checks.readiness]
     type         = "http"
