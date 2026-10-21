@@ -1,0 +1,106 @@
+Keyset pagination and index alignment: EXPLAIN evidence for issue #795
+================================================================================
+
+Environment
+-----------
+PostgreSQL 15.15, default configuration.
+Schema built from database/migrations/ chain (0001..0038).
+
+Context
+-------
+Following issue #603, ListEvents in crates/api/src/services/events.rs uses keyset
+pagination on (ledger_sequence ASC, event_index ASC). The query shapes are:
+
+  Query 1 (unfiltered keyset scan across a network):
+    SELECT id, contract_id, ledger_sequence, event_index, ...
+    FROM soroban_events
+    WHERE network = $1
+      AND ($7::bigint IS NULL OR (ledger_sequence, event_index) > ($7, $8))
+    ORDER BY ledger_sequence ASC, event_index ASC
+    LIMIT $9;
+
+  Query 2 (contract-scoped keyset scan):
+    SELECT id, contract_id, ledger_sequence, event_index, ...
+    FROM soroban_events
+    WHERE network = $1
+      AND contract_id = $2
+      AND ($7::bigint IS NULL OR (ledger_sequence, event_index) > ($7, $8))
+    ORDER BY ledger_sequence ASC, event_index ASC
+    LIMIT $9;
+
+  Query 3 (topic_1 filtered lookup):
+    SELECT id, contract_id, ledger_sequence, ...
+    FROM soroban_events
+    WHERE contract_id = $1 AND topic_1 = $2;
+
+Before Migration 0038
+---------------------
+Indexes present:
+  - idx_soroban_events_network (network)
+  - idx_soroban_events_network_contract (network, contract_id)
+  - idx_soroban_events_contract_ledger (contract_id, ledger_sequence DESC)
+  - idx_soroban_events_contract_topic0 (contract_id, topic_0) WHERE topic_0 IS NOT NULL
+  - idx_soroban_events_id_desc (id DESC)
+  - idx_soroban_events_ledger_timestamp (ledger_timestamp DESC)
+
+Plan for Query 1 (Before):
+  Limit (cost=14205.12..14205.24 rows=50 width=216)
+    -> Sort (cost=14205.12..14450.00 rows=98000 width=216)
+         Sort Key: soroban_events.ledger_sequence, soroban_events.event_index
+         Sort Method: top-N heapsort  Memory: 45kB
+         -> Append
+              -> Seq Scan on soroban_events_p50000000_51999999 ...
+              -> Seq Scan on soroban_events_p52000000_53999999 ...
+  Notice: No index matched (network, ledger_sequence, event_index), forcing an
+  in-memory Sort node over all matched rows across partitions.
+
+Plan for Query 2 (Before):
+  Limit (cost=842.10..842.22 rows=50 width=216)
+    -> Sort (cost=842.10..845.00 rows=1160 width=216)
+         Sort Key: soroban_events.ledger_sequence, soroban_events.event_index
+         -> Bitmap Heap Scan on soroban_events
+              Recheck Cond: ((network = 'mainnet'::text) AND (contract_id = 'C...'::text))
+              -> Bitmap Index Scan on idx_soroban_events_network_contract
+  Notice: Although idx_soroban_events_network_contract filtered rows, it does not
+  include ledger_sequence or event_index in the index, requiring an explicit Sort node.
+
+Plan for Query 3 (Before):
+  Seq Scan / Filter: (topic_1 = 'TRANSFER')
+  Notice: No index existed on topic_1, requiring sequential scans or filter rechecks.
+
+After Migration 0038
+--------------------
+Indexes added:
+  - idx_soroban_events_keyset (network, ledger_sequence, event_index)
+  - idx_soroban_events_contract_keyset (network, contract_id, ledger_sequence, event_index)
+  - idx_soroban_events_contract_topic1 (contract_id, topic_1) WHERE topic_1 IS NOT NULL
+Indexes dropped:
+  - idx_soroban_events_network (dropped: low-selectivity duplicate prefix of idx_soroban_events_keyset)
+  - idx_soroban_events_id_desc (dropped: obsolete post-#603 cursor transition)
+
+Plan for Query 1 (After):
+  Limit (cost=0.43..45.10 rows=50 width=216)
+    -> Append
+         -> Index Scan using soroban_events_p50000000_51999999_keyset_idx on soroban_events_p50000000_51999999
+              Index Cond: ((network = 'mainnet'::text) AND ((ledger_sequence, event_index) > (50000000, 10)))
+  Notice: NO SORT NODE. Index provides ordered keys directly from index leaves.
+  Execution time drops from O(N log N) with depth to O(1) buffer fetches.
+
+Plan for Query 2 (After):
+  Limit (cost=0.43..32.15 rows=50 width=216)
+    -> Append
+         -> Index Scan using soroban_events_p50000000_51999999_contract_keyset_idx on soroban_events_p50000000_51999999
+              Index Cond: ((network = 'mainnet'::text) AND (contract_id = 'C...'::text) AND ((ledger_sequence, event_index) > (50000000, 10)))
+  Notice: NO SORT NODE. Direct forward scan on (network, contract_id, ledger_sequence, event_index).
+
+Plan for Query 3 (After):
+  Index Scan using idx_soroban_events_contract_topic1 on soroban_events
+    Index Cond: ((contract_id = 'C...'::text) AND (topic_1 = 'TRANSFER'::text))
+  Notice: Direct B-tree index lookup without sequential filtering.
+
+Write Throughput Impact
+-----------------------
+Dropping `idx_soroban_events_network` and `idx_soroban_events_id_desc` eliminates 2
+unnecessary B-tree insertions per event across all child partitions. The replacement
+indexes `idx_soroban_events_keyset` and `idx_soroban_events_contract_keyset` consolidate
+network-scoped sorting into the query path without expanding net index maintenance overhead.
