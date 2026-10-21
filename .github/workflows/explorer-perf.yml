@@ -13,6 +13,10 @@ on:
       api_key:
         description: 'Explorer API key'
         required: false
+      record_baseline:
+        description: 'Record current run as new committed baseline (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   perf-test:
@@ -37,36 +41,83 @@ jobs:
         env:
           API_URL: ${{ github.event.inputs.api_url || 'https://api.testnet.trident.dev' }}
           API_KEY: ${{ secrets.EXPLORER_API_KEY }}
+          RECORD_BASELINE: ${{ github.event.inputs.record_baseline || 'false' }}
         run: |
+          RECORD_FLAG=""
+          if [ "$RECORD_BASELINE" = "true" ]; then
+            RECORD_FLAG="--record-baseline"
+          fi
           npm run perf-test -- \
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
-            --contract-id "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            --contract-id "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4" \
+            --baseline-file "./PERFORMANCE_BASELINE.json" \
+            --regression-threshold 10 \
+            $RECORD_FLAG
 
       - name: Report results
         if: always()
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            const workflow = context.workflow;
             const status = '${{ job.status }}';
-            const message = `**Explorer Performance Budget** (${status.toUpperCase()})
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const summary = `### Explorer Performance Budget (${status.toUpperCase()})\n\n` +
+              `- **Run**: [View Action Run](${runUrl})\n` +
+              `- **Event**: \`${context.eventName}\`\n` +
+              `- **Baseline**: \`explorer/PERFORMANCE_BASELINE.json\`\n` +
+              `- **Budget reference**: \`explorer/PERFORMANCE_BUDGET.md\`\n`;
             
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            
-            Check PERFORMANCE_BUDGET.md for targets.`;
-            
-            console.log(message);
+            await core.summary.addRaw(summary).write();
+            console.log(summary);
 
       - name: Notify on failure
         if: failure()
         uses: actions/github-script@v7
         with:
           script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '⚠️ Performance budget check failed. See workflow run for details.'
-            });
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const message = `⚠️ **Explorer Performance Budget check failed.**\n\n` +
+              `Workflow run: ${runUrl}\n` +
+              `Triggered by: \`${context.eventName}\`\n\n` +
+              `One or more latency targets exceeded the budget or regressed >10% against \`explorer/PERFORMANCE_BASELINE.json\`.\n` +
+              `Please see the run logs and consult \`explorer/PERFORMANCE_BUDGET.md\` for remediation steps.`;
+
+            if (context.issue && context.issue.number) {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: message
+              });
+            } else {
+              // On schedule or workflow_dispatch, notify via Step Summary and search/create issue
+              console.log('No pull request / issue context; logging failure notification to summary and issues.');
+              try {
+                const issues = await github.rest.issues.listForRepo({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  labels: ['performance', 'explorer']
+                });
+                const existing = issues.data.find(i => i.title.includes('Explorer Performance Budget check failed'));
+                if (existing) {
+                  await github.rest.issues.createComment({
+                    issue_number: existing.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    body: message
+                  });
+                } else {
+                  await github.rest.issues.create({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    title: '⚠️ Explorer Performance Budget check failed',
+                    body: message,
+                    labels: ['performance', 'explorer']
+                  });
+                }
+              } catch (e) {
+                console.warn('Could not post issue comment/creation:', e.message);
+              }
+            }

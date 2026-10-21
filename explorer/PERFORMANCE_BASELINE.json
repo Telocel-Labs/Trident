@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "recordedAt": "2026-10-21T11:00:00.000Z",
+  "dataset": "testnet (10,000+ events per contract)",
+  "metrics": {
+    "home:API latency": 120.5,
+    "contract:API latency": 240.2,
+    "event-detail:API latency": 85.0,
+    "contract:API latency (p95)": 410.8
+  }
+}
