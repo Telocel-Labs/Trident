@@ -2510,13 +2510,14 @@ mod tests {
         };
         let pool = PgPool::connect(&db_url).await.unwrap();
 
-        // Different contract_id so the two rows land under different
-        // deterministic ids (`event_uuid` hashes contract_id in) and never
+        // Different raw_event_index so the two rows land under different
+        // deterministic ids (`event_uuid` hashes raw_event_index in) and never
         // collide on the partitioned primary key; same transaction_hash and
         // event_index is what actually exercises the network-scoped natural
         // key below.
         let mainnet_event = make_event("CNETDUAL_MAINNET", 88, 1);
-        let testnet_event = make_event("CNETDUAL_TESTNET", 88, 1);
+        let mut testnet_event = make_event("CNETDUAL_TESTNET", 88, 1);
+        testnet_event.raw_event_index = 2;
         assert_eq!(
             mainnet_event.transaction_hash,
             testnet_event.transaction_hash

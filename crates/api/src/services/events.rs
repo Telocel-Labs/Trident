@@ -370,12 +370,23 @@ async fn run_stream_consumer(
                         let event = Event {
                             id: entry_event_id(&entry),
                             contract_id: entry_field(&entry, redis_stream_fields::CONTRACT_ID),
-                            ledger_sequence: entry_field(&entry, redis_stream_fields::LEDGER_SEQUENCE)
+                            ledger_sequence: entry_field(
+                                &entry,
+                                redis_stream_fields::LEDGER_SEQUENCE,
+                            )
+                            .parse()
+                            .unwrap_or(0),
+                            ledger_timestamp: entry_field(
+                                &entry,
+                                redis_stream_fields::LEDGER_TIMESTAMP,
+                            ),
+                            transaction_hash: entry_field(
+                                &entry,
+                                redis_stream_fields::TRANSACTION_HASH,
+                            ),
+                            event_index: entry_field(&entry, redis_stream_fields::EVENT_INDEX)
                                 .parse()
                                 .unwrap_or(0),
-                            ledger_timestamp: entry_field(&entry, redis_stream_fields::LEDGER_TIMESTAMP),
-                            transaction_hash: entry_field(&entry, redis_stream_fields::TRANSACTION_HASH),
-                            event_index: entry_field(&entry, redis_stream_fields::EVENT_INDEX).parse().unwrap_or(0),
                             event_type: entry_field(&entry, redis_stream_fields::EVENT_TYPE),
                             topics,
                             data: entry_field(&entry, redis_stream_fields::DATA),

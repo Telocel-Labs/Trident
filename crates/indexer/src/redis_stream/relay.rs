@@ -49,7 +49,12 @@ pub struct OutboxRelay {
 
 impl OutboxRelay {
     pub fn new(db: PgPool, redis: redis::aio::MultiplexedConnection, config: RelayConfig) -> Self {
-        Self { db, redis_url: String::new(), redis: Some(redis), config }
+        Self {
+            db,
+            redis_url: String::new(),
+            redis: Some(redis),
+            config,
+        }
     }
 
     pub fn new_with_config(
@@ -58,10 +63,17 @@ impl OutboxRelay {
         redis: Option<redis::aio::MultiplexedConnection>,
         config: RelayConfig,
     ) -> Self {
-        Self { db, redis_url, redis, config }
+        Self {
+            db,
+            redis_url,
+            redis,
+            config,
+        }
     }
 
-    async fn ensure_redis(&mut self) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
+    async fn ensure_redis(
+        &mut self,
+    ) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
         if self.redis.is_some() {
             return Ok(self.redis.as_mut().unwrap());
         }

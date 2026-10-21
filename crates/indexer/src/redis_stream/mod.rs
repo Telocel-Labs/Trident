@@ -52,10 +52,22 @@ fn stream_fields(
     let mut fields = vec![
         (redis_stream_fields::CONTRACT_ID, event.contract_id.clone()),
         ("network", network.to_string()),
-        (redis_stream_fields::LEDGER_SEQUENCE, event.ledger_sequence.to_string()),
-        (redis_stream_fields::LEDGER_TIMESTAMP, event.ledger_timestamp.clone()),
-        (redis_stream_fields::TRANSACTION_HASH, event.transaction_hash.clone()),
-        (redis_stream_fields::EVENT_INDEX, event.event_index.to_string()),
+        (
+            redis_stream_fields::LEDGER_SEQUENCE,
+            event.ledger_sequence.to_string(),
+        ),
+        (
+            redis_stream_fields::LEDGER_TIMESTAMP,
+            event.ledger_timestamp.clone(),
+        ),
+        (
+            redis_stream_fields::TRANSACTION_HASH,
+            event.transaction_hash.clone(),
+        ),
+        (
+            redis_stream_fields::EVENT_INDEX,
+            event.event_index.to_string(),
+        ),
         (
             redis_stream_fields::EVENT_TYPE,
             format!("{:?}", event.event_type).to_lowercase(),

@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     -- attempted key.
     attempted_key_prefix  TEXT,
     failure_reason        TEXT,
+    auth_source           TEXT,
     ts                    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -281,7 +282,8 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     -- Delivery state machine and retry counter (migration 0013).
     status          TEXT        NOT NULL DEFAULT 'pending'
                                 CHECK (status IN ('pending', 'success', 'failed', 'dead_lettered')),
-    attempts        INTEGER     NOT NULL DEFAULT 1
+    attempts        INTEGER     NOT NULL DEFAULT 1,
+    next_attempt_at TIMESTAMPTZ
 );
 
 -- Defined here rather than beside the other updated_at triggers above: a
@@ -300,6 +302,11 @@ CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_secondary_secret
     WHERE secondary_secret IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_id ON webhook_deliveries (subscription_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_dead_lettered ON webhook_deliveries (subscription_id, delivered_at DESC) WHERE (status = 'dead_lettered');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_idempotency
+    ON webhook_deliveries (subscription_id, event_id, attempt);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending_retry
+    ON webhook_deliveries (next_attempt_at)
+    WHERE status = 'failed' AND next_attempt_at IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- usage_rollup
