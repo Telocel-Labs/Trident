@@ -1275,6 +1275,13 @@ jobs:
       - name: Check base image digests are well-formed
         run: bash scripts/check-image-digests.sh
 
+      # Issue #778: Internal-only Fly services must not declare public ports
+      - name: Check internal Fly services do not expose public ports
+        run: bash scripts/check-internal-ports.sh
+
+      - name: Test check-internal-ports.sh detection logic
+        run: bash scripts/test-check-internal-ports.sh
+
   # ---------------------------------------------------------------------------
   # Schema guard — migration lint + schema.sql drift detection (issue #436,
   # closes #246).

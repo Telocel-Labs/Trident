@@ -1,4 +1,4 @@
-﻿# fly/grpc-api.toml — Trident gRPC API (Rust, trident-api binary)
+# fly/grpc-api.toml — Trident gRPC API (Rust, trident-api binary)
 app = "trident-grpc-api"
 primary_region = "iad"
 
@@ -8,8 +8,7 @@ primary_region = "iad"
 [env]
   LOG_LEVEL = "info"
   # trident-api (Rust) fails collect_required("GRPC_ADDR") at startup and
-  # crash-loops if this is unset (crates/api/src/config.rs). Must match
-  # [[services]] internal_port below.
+  # crash-loops if this is unset (crates/api/src/config.rs).
   GRPC_ADDR = "0.0.0.0:50051"
 
 # Secrets are sourced exclusively from Fly's encrypted secrets store
@@ -18,16 +17,17 @@ primary_region = "iad"
 # REDIS_URL (crates/api/src/main.rs calls .expect("REDIS_URL is required")
 # and panics on startup if unset)
 
-[[services]]
-  protocol = "tcp"
-  internal_port = 50051
-
-  [[services.ports]]
-    port = 50051
-
-  [[services.tcp_checks]]
-    interval = "15s"
-    timeout  = "2s"
+# Internal-only service (issue #778):
+# Reached strictly over Fly's private WireGuard network (6PN) by trident-api
+# via `trident-grpc-api.internal:50051`.
+# No public [[services]] or [[services.ports]] block is defined, preventing
+# public internet exposure of unauthenticated gRPC endpoints.
+[checks]
+  [checks.grpc]
+    type         = "tcp"
+    port         = 50051
+    interval     = "15s"
+    timeout      = "2s"
     grace_period = "10s"
 
 [[vm]]
