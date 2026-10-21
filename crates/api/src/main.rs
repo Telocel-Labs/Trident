@@ -17,12 +17,32 @@ mod services;
 /// Read-heavy service with moderate concurrency, so a moderate pool is correct.
 const DEFAULT_DB_POOL_SIZE: u32 = 10;
 
+pub(crate) fn parse_sampling_ratio(raw: Option<&str>) -> Result<f64, String> {
+    match raw {
+        Some(s) => {
+            let v: f64 = s
+                .parse()
+                .map_err(|e| format!("invalid OTEL_SAMPLING_RATIO '{s}': {e}"))?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "OTEL_SAMPLING_RATIO must be between 0.0 and 1.0, got {v}"
+                ));
+            }
+            Ok(v)
+        }
+        None => Ok(0.1),
+    }
+}
+
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
-    let sampling_ratio = std::env::var("OTEL_SAMPLING_RATIO")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.1);
+    let sampling_ratio = match parse_sampling_ratio(std::env::var("OTEL_SAMPLING_RATIO").ok().as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            std::process::exit(1);
+        }
+    };
 
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
@@ -131,4 +151,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opentelemetry::global::shutdown_tracer_provider();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sampling_ratio_validation() {
+        assert_eq!(parse_sampling_ratio(None).unwrap(), 0.1);
+        assert_eq!(parse_sampling_ratio(Some("0.0")).unwrap(), 0.0);
+        assert_eq!(parse_sampling_ratio(Some("0.5")).unwrap(), 0.5);
+        assert_eq!(parse_sampling_ratio(Some("1.0")).unwrap(), 1.0);
+
+        assert!(parse_sampling_ratio(Some("-0.1")).is_err());
+        assert!(parse_sampling_ratio(Some("1.1")).is_err());
+        assert!(parse_sampling_ratio(Some("not-a-number")).is_err());
+    }
 }
