@@ -1322,6 +1322,13 @@ jobs:
           DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_schema_check
         run: bash scripts/check-schema-drift.sh
 
+      # Issue #688: verify check-schema-drift.sh actually detects discrepancies
+      # when schema.sql and the migration chain deliberately disagree.
+      - name: Verify schema drift detection catches discrepancies
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_schema_check
+        run: bash scripts/test-check-schema-drift.sh
+
       # Applies the full forward chain, then every .down.sql in reverse order,
       # against the same scratch database (issue #602). Proves each rollback
       # file is valid SQL that actually runs against a schema carrying every

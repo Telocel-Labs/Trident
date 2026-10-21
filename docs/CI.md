@@ -253,6 +253,14 @@ production apply the migration chain — but `make migrate` falls back to it whe
 `sqlx-cli` is absent, so a developer bootstrapping from it was getting a
 materially different database from production.
 
+### `scripts/test-check-schema-drift.sh`
+
+Verifies that `check-schema-drift.sh` actually catches structural drift when
+`schema.sql` and the migration chain disagree (issue #688), by deliberately
+introducing missing columns, extra columns, unapplied migrations, and extra
+indexes, asserting that the checker exits with code 1 and surfaces the exact
+discrepancies.
+
 ## SDK versioning and publishing
 
 ### Versions are tied to the spec
