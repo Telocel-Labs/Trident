@@ -168,13 +168,11 @@ impl Parser {
 /// unique within a transaction — [`assign_unique_event_indexes`] resolves any
 /// remaining ties before insert.
 pub(crate) fn raw_event_index(raw: &RawEvent) -> u32 {
-    raw.operation_index
-        .or_else(|| {
-            raw.id
-                .split('-')
-                .next_back()
-                .and_then(|s| s.parse::<u32>().ok())
-        })
+    raw.id
+        .split('-')
+        .next_back()
+        .and_then(|s| s.parse::<u32>().ok())
+        .or(raw.operation_index)
         .unwrap_or(0)
 }
 
@@ -270,19 +268,19 @@ mod tests {
     }
 
     #[test]
-    fn event_index_prefers_operation_index_over_the_legacy_id_suffix() {
+    fn event_index_prefers_id_suffix_over_operation_index() {
         let mut raw = raw_event_fixture();
         raw.id = "0000000000000000007-0000000009".to_string();
-        raw.operation_index = Some(3);
-        assert_eq!(raw_event_index(&raw), 3);
+        raw.operation_index = Some(0); // operationIndex is always 0 for single-op Soroban transactions
+        assert_eq!(raw_event_index(&raw), 9);
     }
 
     #[test]
-    fn event_index_falls_back_to_the_id_suffix_on_older_servers() {
+    fn event_index_falls_back_to_operation_index_when_id_suffix_unparseable() {
         let mut raw = raw_event_fixture();
-        raw.id = "0000000000000000007-0000000009".to_string();
-        raw.operation_index = None;
-        assert_eq!(raw_event_index(&raw), 9);
+        raw.id = "no_hyphens".to_string();
+        raw.operation_index = Some(3);
+        assert_eq!(raw_event_index(&raw), 3);
     }
 
     fn xdr_b64(val: &ScVal) -> String {

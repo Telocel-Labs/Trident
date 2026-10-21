@@ -1,4 +1,4 @@
--- Migration 0034: webhook_deliveries idempotency key + persisted retry state
+-- Migration 0039: webhook_deliveries idempotency key + persisted retry state
 -- (issues #649, #651)
 --
 -- #649: delivery and its database record are two independent steps with no

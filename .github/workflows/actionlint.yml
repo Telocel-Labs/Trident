@@ -1,0 +1,28 @@
+name: Actionlint
+
+# Lint GitHub Action workflows with actionlint (issue #708).
+# Runs in its own standalone workflow so syntax or schema errors in ci.yml
+# still produce a visible failed check rather than silently preventing
+# all CI jobs from running.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+concurrency:
+  group: actionlint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Run actionlint
+        uses: reviewdog/action-actionlint@db582178857c72655ae56107b83146600e62ae74 # v1.65.0
+        with:
+          actionlint_flags: -color

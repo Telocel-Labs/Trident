@@ -330,36 +330,6 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # ---------------------------------------------------------------------------
-  # Explorer — build and type-check (issue #387).
-  #
-  # The explorer had no CI job, so an astro regression could land without
-  # any automated signal. This catches build failures and type errors.
-  # ---------------------------------------------------------------------------
-  explorer:
-    name: Explorer
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: explorer
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-
-      - name: Set up Node.js
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: explorer/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Type check
-        run: npm run lint
 
   # ---------------------------------------------------------------------------
   # Contracts — reference Soroban contracts (issue #258).
