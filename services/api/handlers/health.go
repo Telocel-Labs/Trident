@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/Depo-dev/trident/services/api/gen"
 )
@@ -47,6 +49,11 @@ type RedisPinger interface {
 // EventsLister is the subset of gen.EventsClient used by the health check.
 type EventsLister interface {
 	ListEvents(ctx context.Context, in *gen.ListEventsRequest, opts ...grpc.CallOption) (*gen.ListEventsResponse, error)
+}
+
+// GRPCHealthChecker is the standard gRPC health check interface (issue #678).
+type GRPCHealthChecker interface {
+	Check(ctx context.Context, in *grpc_health_v1.HealthCheckRequest, opts ...grpc.CallOption) (*grpc_health_v1.HealthCheckResponse, error)
 }
 
 // LivenessResponse is the JSON body for GET /v1/health.
@@ -90,7 +97,7 @@ type ReadyResponse struct {
 // instead of continuing to receive traffic it can't serve. The indexer_lag
 // field is populated from system_state when Postgres is healthy and the
 // chain tip is available in the cache; null otherwise.
-func Ready(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.HandlerFunc {
+func Ready(db DBPool, redisClient RedisPinger, grpcClient any) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		parentCtx := r.Context()
 
@@ -190,10 +197,23 @@ func checkRedis(ctx context.Context, redisClient RedisPinger) error {
 	return redisClient.Ping(ctx).Err()
 }
 
-func checkGRPC(ctx context.Context, client EventsLister) error {
+func checkGRPC(ctx context.Context, client any) error {
 	if client == nil {
 		return errNoGRPCClient
 	}
-	_, err := client.ListEvents(ctx, &gen.ListEventsRequest{Limit: 0})
-	return err
+	if hc, ok := client.(GRPCHealthChecker); ok {
+		resp, err := hc.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
+		if err != nil {
+			return err
+		}
+		if resp.GetStatus() != grpc_health_v1.HealthCheckResponse_SERVING {
+			return fmt.Errorf("grpc health status: %v", resp.GetStatus())
+		}
+		return nil
+	}
+	if el, ok := client.(EventsLister); ok {
+		_, err := el.ListEvents(ctx, &gen.ListEventsRequest{Limit: 0})
+		return err
+	}
+	return errors.New("unsupported grpc client type")
 }

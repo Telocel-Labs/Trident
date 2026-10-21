@@ -169,14 +169,14 @@ grpcApi:
     # client throttles itself instead of growing an unbounded server-side queue.
     STREAM_CHANNEL_BUFFER: "128"
   livenessProbe:
-    tcpSocket:
+    grpc:
       port: 5000
     initialDelaySeconds: 10
     periodSeconds: 10
     failureThreshold: 3
     timeoutSeconds: 2
   readinessProbe:
-    tcpSocket:
+    grpc:
       port: 5000
     initialDelaySeconds: 5
     periodSeconds: 5
