@@ -4,7 +4,7 @@ This runbook details the backup automation, point-in-time recovery (PITR) config
 
 ## 1. Automated Scheduled Backups & Retention Policy
 
-- **Tooling**: Automated via `scripts/db-backup.sh`, running via a cron/Kubernetes CronJob.
+- **Tooling**: Automated via `scripts/backup.sh`, running via a cron/Kubernetes CronJob.
 - **Schedule**: Full pg_dump logical backups taken daily at 02:00 UTC; continuous WAL archiving enabled for PITR.
 - **Retention**: 
   - Daily backups: Retained for 30 days in immutable object storage (AWS S3 / GCS bucket configured with Object Lock).

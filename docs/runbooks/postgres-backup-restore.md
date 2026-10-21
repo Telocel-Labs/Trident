@@ -103,20 +103,20 @@ and cross-check against `trident_indexer_ledger_lag` (see
 converge toward zero rather than staying pinned at a large value, which
 would indicate the restored cursor is stale or wrong.
 
-## 5. What's not yet automated
+## 5. Automation, Scheduling, and Alerting (issue #794)
 
-- **Scheduling**: `scripts/backup.sh` is not wired to a cron/CronJob/timer
-  yet. Row 2 of `docs/LAUNCH_CHECKLIST.md` requires a restore to have been
-  *performed* end-to-end (done, see §2) before launch; recurring
-  scheduling is a separate follow-up.
-- **Off-host retention**: backups are currently local-disk only via
-  `BACKUP_DIR`. Shipping them to remote/object storage is not implemented
-  here — a host-level disaster (not just a bad migration or accidental
-  `DELETE`) would take the backups with it.
-- **Backup-failure alerting**: nothing pages on a backup job failing yet.
-  Wiring the scheduler's own failure signal into an alert (matching the
-  pattern in `monitoring/alerts.yml`) is a follow-up once scheduling
-  itself exists.
+- **Scheduling via Helm CronJob**: Trident ships with a scheduled Kubernetes
+  CronJob template (`helm/trident/templates/backup-cronjob.yaml`) configured
+  under `backup:` in `values.yaml` (default schedule `0 2 * * *`).
+- **Off-host replication & Encryption**: `scripts/backup.sh` supports AES-256
+  encryption via `BACKUP_ENCRYPTION_KEY` and remote replication through
+  `OFFSITE_COPY_CMD` (e.g. `aws s3 cp` or `gcloud storage cp`).
+- **Retention**: Local retention policy is automatically enforced via
+  `BACKUP_RETENTION_DAYS` (default 30 days).
+- **Backup-failure alerting**: `scripts/backup.sh` writes the Prometheus metric
+  `trident_database_backup_last_success_timestamp_seconds` (pointing to
+  `$PROMETHEUS_METRICS_DIR/backup.prom`), satisfying the
+  `TridentDatabaseBackupFailed` alert rule in `monitoring/alerts.yml`.
 
 ## 6. Periodic Rehearsal
 

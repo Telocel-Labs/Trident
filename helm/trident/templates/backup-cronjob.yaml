@@ -1,0 +1,91 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "trident.fullname" . }}-backup
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit | default 3 }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit | default 3 }}
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "trident.selectorLabels" (dict "root" . "component" "backup") | nindent 12 }}
+        spec:
+          {{- include "trident.imagePullSecrets" . | nindent 10 }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- include "trident.podSecurityContext" (dict "uid" (.Values.backup.securityContextUid | default 1001)) | nindent 12 }}
+          containers:
+            - name: backup
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag | default "16-alpine" }}"
+              imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+              securityContext:
+                {{- include "trident.containerSecurityContext" . | nindent 16 }}
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.global.existingSecret }}
+                      key: DATABASE_URL
+                - name: BACKUP_RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | default 30 | quote }}
+                {{- if .Values.backup.encryptionKeySecretKey }}
+                - name: BACKUP_ENCRYPTION_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.global.existingSecret }}
+                      key: {{ .Values.backup.encryptionKeySecretKey }}
+                {{- end }}
+                {{- range $k, $v := .Values.backup.env }}
+                - name: {{ $k }}
+                  value: {{ $v | quote }}
+                {{- end }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  TIMESTAMP=$(date -u +"%Y%m%d_%H%M%SZ")
+                  BACKUP_FILE="/backups/trident_backup_${TIMESTAMP}.dump"
+                  echo "Starting pg_dump to ${BACKUP_FILE}..."
+                  pg_dump --format=custom --compress=6 --no-owner --no-privileges --dbname="${DATABASE_URL}" --file="${BACKUP_FILE}"
+                  sha256sum "${BACKUP_FILE}" > "${BACKUP_FILE}.sha256"
+                  echo "Backup created successfully: ${BACKUP_FILE}"
+                  if [ -n "${BACKUP_ENCRYPTION_KEY:-}" ]; then
+                    echo "Encrypting backup..."
+                    openssl enc -aes-256-cbc -salt -pbkdf2 -in "${BACKUP_FILE}" -out "${BACKUP_FILE}.enc" -pass env:BACKUP_ENCRYPTION_KEY
+                    rm -f "${BACKUP_FILE}"
+                    sha256sum "${BACKUP_FILE}.enc" > "${BACKUP_FILE}.enc.sha256"
+                  fi
+                  if [ -n "${OFFSITE_COPY_CMD:-}" ]; then
+                    echo "Executing offsite copy..."
+                    eval "${OFFSITE_COPY_CMD}"
+                  fi
+                  echo "Enforcing retention..."
+                  find /backups -type f -mtime +{{ .Values.backup.retentionDays | default 30 }} -delete || true
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+          volumes:
+            - name: backups
+              {{- if .Values.backup.persistence.enabled }}
+              persistentVolumeClaim:
+                claimName: {{ .Values.backup.persistence.existingClaim | default (printf "%s-backup" (include "trident.fullname" .)) }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+            - name: tmp
+              emptyDir: {}
+{{- end }}

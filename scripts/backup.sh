@@ -73,6 +73,15 @@ pg_dump \
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
+# Optional encryption (issue #794)
+if [[ -n "${BACKUP_ENCRYPTION_KEY:-}" ]]; then
+  echo "[+] Encrypting backup with AES-256 (PBKDF2)..."
+  ENC_PATH="${BACKUP_PATH}.enc"
+  openssl enc -aes-256-cbc -salt -pbkdf2 -in "$BACKUP_PATH" -out "$ENC_PATH" -pass env:BACKUP_ENCRYPTION_KEY
+  rm -f "$BACKUP_PATH"
+  BACKUP_PATH="$ENC_PATH"
+fi
+
 # Generate SHA-256 Checksum
 echo "[+] Computing SHA-256 checksum..."
 sha256sum "$BACKUP_PATH" > "${BACKUP_PATH}.sha256"
@@ -81,5 +90,18 @@ SIZE=$(du -h "$BACKUP_PATH" | cut -f1)
 echo "[+] Backup successfully completed in ${DURATION}s (${SIZE})."
 echo "[+] Artifact: ${BACKUP_PATH}"
 echo "[+] Checksum: $(cat "${BACKUP_PATH}.sha256")"
+
+# Optional off-site upload / replication (issue #794)
+if [[ -n "${OFFSITE_COPY_CMD:-}" ]]; then
+  echo "[+] Running off-site copy command: ${OFFSITE_COPY_CMD}..."
+  eval "$OFFSITE_COPY_CMD"
+fi
+
+# Retention policy: prune backups older than BACKUP_RETENTION_DAYS (default 30)
+RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
+if [[ "$RETENTION_DAYS" -gt 0 ]]; then
+  echo "[+] Enforcing retention: cleaning up backups older than ${RETENTION_DAYS} days in ${OUTPUT_DIR}..."
+  find "$OUTPUT_DIR" -type f \( -name "trident_db_backup_*.dump*" -o -name "trident_db_backup_*.dump.enc*" \) -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+fi
 
 write_metric "success"
