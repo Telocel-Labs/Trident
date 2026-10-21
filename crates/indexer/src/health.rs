@@ -66,7 +66,10 @@ async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: Strin
         .unwrap_or("/");
 
     let (code, phrase, content_type, body): (u16, &str, &str, String) = match path {
-        "/healthz" => (200, "OK", "text/plain", "ok\n".into()),
+        "/healthz" => {
+            let (code, phrase, body) = healthz().await;
+            (code, phrase, "text/plain", body)
+        }
         "/readyz" => {
             let (code, phrase, body) = readyz(&db, &redis_url).await;
             (code, phrase, "text/plain", body)
@@ -90,6 +93,41 @@ async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: Strin
         body.len()
     );
     let _ = write_half.write_all(response.as_bytes()).await;
+}
+
+pub(crate) async fn healthz() -> (u16, &'static str, String) {
+    // Check heartbeat freshness (issue #763). If the poll loop has wedged or
+    // stalled beyond the threshold, fail liveness so Kubernetes restarts the pod.
+    let stale_threshold_secs = std::env::var("HEALTH_HEARTBEAT_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    healthz_check(now, stale_threshold_secs, crate::metrics::last_heartbeat_timestamp())
+}
+
+pub(crate) fn healthz_check(
+    now_secs: u64,
+    stale_threshold_secs: u64,
+    last_heartbeat: Option<u64>,
+) -> (u16, &'static str, String) {
+    if let Some(last) = last_heartbeat {
+        let elapsed = now_secs.saturating_sub(last);
+        if elapsed > stale_threshold_secs {
+            return (
+                503,
+                "Service Unavailable",
+                format!("stale heartbeat: last recorded at {last}, elapsed {elapsed}s > {stale_threshold_secs}s\n"),
+            );
+        }
+    }
+
+    (200, "OK", "ok\n".into())
 }
 
 async fn readyz(db: &PgPool, redis_url: &str) -> (u16, &'static str, String) {
@@ -276,5 +314,33 @@ mod tests {
 
         // Never commit: this DELETE must not outlive the test.
         tx.rollback().await.unwrap();
+    }
+
+    #[test]
+    fn healthz_check_passes_when_fresh() {
+        let now = 1_000_100;
+        let last = Some(1_000_000);
+        let (code, phrase, body) = healthz_check(now, 120, last);
+        assert_eq!(code, 200);
+        assert_eq!(phrase, "OK");
+        assert_eq!(body, "ok\n");
+    }
+
+    #[test]
+    fn healthz_check_passes_when_no_heartbeat_yet() {
+        let (code, phrase, body) = healthz_check(1_000_100, 120, None);
+        assert_eq!(code, 200);
+        assert_eq!(phrase, "OK");
+        assert_eq!(body, "ok\n");
+    }
+
+    #[test]
+    fn healthz_check_fails_503_when_heartbeat_is_stale() {
+        let now = 1_000_200;
+        let last = Some(1_000_000);
+        let (code, phrase, body) = healthz_check(now, 120, last);
+        assert_eq!(code, 503);
+        assert_eq!(phrase, "Service Unavailable");
+        assert!(body.contains("stale heartbeat"));
     }
 }

@@ -425,11 +425,24 @@ pub fn set_effective_poll_interval(ms: u64) {
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(ms as f64);
 }
 
+static LAST_HEARTBEAT_UNIX_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Stamp the heartbeat to the current Unix time. Called at the end of every
 /// poll cycle (success or failure) so a dead-man's switch alert can detect a
 /// stalled-but-not-crashed indexer (#218).
 pub fn set_heartbeat_timestamp(secs: f64) {
+    LAST_HEARTBEAT_UNIX_SECS.store(secs as u64, std::sync::atomic::Ordering::Relaxed);
     gauge!(HEARTBEAT_TIMESTAMP).set(secs);
+}
+
+/// Retrieve the last recorded heartbeat timestamp in whole Unix seconds (issue #763).
+pub fn last_heartbeat_timestamp() -> Option<u64> {
+    let ts = LAST_HEARTBEAT_UNIX_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if ts == 0 {
+        None
+    } else {
+        Some(ts)
+    }
 }
 
 /// Stamp the heartbeat to now. Convenience wrapper over

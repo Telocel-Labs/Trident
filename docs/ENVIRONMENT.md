@@ -64,8 +64,9 @@ description is accurate. Keep this file honest by hand.
 | `RPC_STARTUP_CHECK_ENABLED` | Optional | `true` | Verify RPC connectivity before the poll loop starts; disabling it means an unreachable endpoint only surfaces once polling begins (issue #687). |
 | `TRACKED_SAC_ASSETS` | Optional | none | Assets to derive SAC contract ids for and track. |
 | `REDIS_STREAM_MAXLEN` | Optional | `10000` | Max events kept in the Redis stream before trimming. |
-| `METRICS_PORT` | Optional | `9090` | Prometheus `/metrics` port; also doubles as the indexer's liveness/readiness signal. |
-| `HEALTH_PORT` | Optional | `8080` | Port serving `/healthz` and `/readyz`. |
+| `METRICS_PORT` | Optional | `9090` | Prometheus `/metrics` port. |
+| `HEALTH_PORT` | Optional | `8080` | Port serving `/healthz` and `/readyz` for Kubernetes probes (issue #763). |
+| `HEALTH_HEARTBEAT_STALE_SECS` | Optional | `120` | Max elapsed seconds since last poll loop heartbeat before `/healthz` fails liveness (issue #763). |
 | `RUST_LOG` | Optional | `info` | Log verbosity (`error`\|`warn`\|`info`\|`debug`\|`trace`). |
 | `DB_STATEMENT_TIMEOUT_MS` | Optional | `30000` | Postgres per-statement timeout bound. |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | Optional | `10000` | Postgres `idle_in_transaction_session_timeout` bound. |
