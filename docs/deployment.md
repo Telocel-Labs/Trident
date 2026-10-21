@@ -56,7 +56,10 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `MAX_BATCH_BODY_BYTES` | Maximum request body size specifically for `POST /v1/events/batch`, in bytes (default: `2097152`, 2 MiB) |
 | `PER_IP_RATE_LIMIT_RPS` | Per-IP sliding-window request limit, applied before auth on public paths (default: `20`) |
 | `PER_IP_RATE_LIMIT_WINDOW_MS` | Window for the per-IP limit above, in milliseconds (default: `1000`) |
-| `TRUSTED_PROXY_ENABLED` | Set `true` **only** when the API is known to sit entirely behind the provided nginx config (or an equivalent proxy) that is the sole path reachable by clients — resolves the per-IP rate limiter's client IP from the last hop of `X-Forwarded-For` instead of the raw TCP peer address. Leaving this unset/`false` is always safe; enabling it when untrusted clients can reach the API directly lets them spoof their rate-limit bucket via a forged header. See `services/api/middleware/abuse.go` (`trustedClientIP`) and `docs/threat-model.md`. |
+| `TRUSTED_PROXY_ENABLED` | Set `true` when the API sits behind the provided nginx config, a cloud load balancer, or Fly.io edge proxy — resolves the per-IP rate limiter's client IP from proxy headers instead of the raw TCP peer address. Pair with `TRUSTED_PROXIES` (CIDR list) or `TRUSTED_PROXY_PLATFORM=fly` so intermediate proxy hops are skipped and spoofed client headers cannot alter the rate-limit bucket (issue #779). Leaving this unset/`false` is always safe when directly reachable. See `services/api/middleware/abuse.go` (`trustedClientIP`) and `docs/threat-model.md`. |
+| `TRUSTED_PROXIES` | Comma-separated list of trusted proxy CIDRs (e.g. `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/8`) or `private`. `X-Forwarded-For` is traversed right-to-left skipping trusted hops to find the true client IP. |
+| `TRUSTED_PROXY_PLATFORM` | Deployment platform identifier (e.g. `fly`). On Fly.io, `Fly-Client-IP` is preferred. |
+| `TRUSTED_PROXY_HEADER` | Explicitly override the proxy header used to resolve client IP (e.g. `Fly-Client-IP` or `X-Forwarded-For`). |
 | `MAX_IN_FLIGHT_REQUESTS` | Global concurrency cap — requests beyond this many in-flight get `503` to shed load (default: `500`) |
 
 #### Testnet vs. mainnet configuration

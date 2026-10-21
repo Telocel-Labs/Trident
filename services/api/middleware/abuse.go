@@ -46,45 +46,193 @@ type PerIPRateLimitConfig struct {
 	// RPS and Window define the sliding-window limit applied per client IP.
 	RPS    int
 	Window time.Duration
-	// TrustProxyHeaders, when true, resolves the client IP from the last hop
-	// of X-Forwarded-For instead of r.RemoteAddr. See the trust-assumption
-	// comment on trustedClientIP below before enabling this in an
-	// environment where untrusted clients can reach the API directly.
+	// TrustProxyHeaders, when true, resolves the client IP from proxy headers
+	// instead of r.RemoteAddr. See the trust-assumption comment on trustedClientIP
+	// below before enabling this in an environment where untrusted clients can
+	// reach the API directly.
 	TrustProxyHeaders bool
+	// TrustedProxies is an optional list of trusted proxy CIDRs (issue #779).
+	// When walking X-Forwarded-For right-to-left, hops falling inside these
+	// networks are skipped as intermediate proxies until the first untrusted (client) IP is reached.
+	// Furthermore, if r.RemoteAddr does not match one of these CIDRs, incoming
+	// proxy headers are ignored to prevent spoofing by direct callers.
+	TrustedProxies []*net.IPNet
+	// Platform specifies deployment platform (e.g. "fly").
+	// When "fly", Fly-Client-IP header is preferred.
+	Platform string
+	// TrustedHeader optionally overrides the proxy header to read (defaults to "X-Forwarded-For",
+	// or "Fly-Client-IP" on Fly).
+	TrustedHeader string
 	// SliderFn overrides the Redis sliding window. Set in tests. Defaults to
 	// the same redisSlider helper TieredRateLimit uses.
 	SliderFn func(ctx context.Context, key string, limit, windowMs int64) (allowed bool, count int64, err error)
 }
 
-// trustedClientIP resolves the client IP to rate-limit on.
-//
-// Trust assumption (issue #318): this deployment's nginx edge
-// (docker/nginx/nginx.conf) sets `X-Forwarded-For $proxy_add_x_forwarded_for`,
-// which *appends* to any client-supplied XFF rather than replacing it — so
-// the header can contain a chain of hops, and only the LAST entry (the one
-// nginx itself appended, i.e. the true immediately-upstream peer) is
-// trustworthy; every earlier entry is attacker-controlled and must be
-// ignored for rate-limiting purposes. This function only reads XFF at all
-// when cfg.TrustProxyHeaders is true (wired from TRUSTED_PROXY_ENABLED),
-// which must only be set when the API is known to sit behind exactly that
-// nginx config (or an equivalent proxy) and is not directly reachable by
-// untrusted clients. When false (the default), r.RemoteAddr — which the Go
-// runtime itself sets from the TCP peer and cannot be spoofed by a header —
-// is used instead, which is safe in any deployment but attributes all
-// traffic arriving through a proxy to the proxy's own IP.
-func trustedClientIP(r *http.Request, trustProxyHeaders bool) string {
-	if trustProxyHeaders {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			parts := strings.Split(xff, ",")
-			last := strings.TrimSpace(parts[len(parts)-1])
-			if last != "" {
-				return last
+var privateCIDRBlocks = []string{
+	"127.0.0.0/8",    // IPv4 Loopback
+	"10.0.0.0/8",     // RFC 1918
+	"172.16.0.0/12",  // RFC 1918
+	"192.168.0.0/16", // RFC 1918
+	"169.254.0.0/16", // IPv4 Link-local
+	"::1/128",        // IPv6 Loopback
+	"fc00::/7",       // RFC 4193 Unique Local Address
+	"fe80::/10",      // IPv6 Link-local
+}
+
+// ParseTrustedProxies parses a comma-separated list of CIDR strings or individual IPs
+// into a slice of *net.IPNet. It supports the keyword "private" which expands
+// to RFC 1918 and RFC 4193 private ranges plus loopback and link-local.
+func ParseTrustedProxies(spec string) ([]*net.IPNet, error) {
+	if strings.TrimSpace(spec) == "" {
+		return nil, nil
+	}
+	var networks []*net.IPNet
+	entries := strings.Split(spec, ",")
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		if strings.EqualFold(entry, "private") {
+			for _, cidr := range privateCIDRBlocks {
+				_, netBlock, err := net.ParseCIDR(cidr)
+				if err == nil {
+					networks = append(networks, netBlock)
+				}
+			}
+			continue
+		}
+		if !strings.Contains(entry, "/") {
+			ip := net.ParseIP(entry)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid IP or CIDR in trusted proxies: %q", entry)
+			}
+			if ip.To4() != nil {
+				entry += "/32"
+			} else {
+				entry += "/128"
 			}
 		}
+		_, netBlock, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR in trusted proxies %q: %w", entry, err)
+		}
+		networks = append(networks, netBlock)
 	}
+	return networks, nil
+}
+
+func isIPInCIDRs(ip net.IP, cidrs []*net.IPNet) bool {
+	if ip == nil {
+		return false
+	}
+	for _, cidr := range cidrs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// trustedClientIP resolves the client IP to rate-limit on (issues #318, #779).
+//
+// Trust assumption:
+// In direct/unproxied setups, r.RemoteAddr is used so client headers cannot spoof buckets.
+// When behind proxies (Helm with cloud LB + Nginx, Fly.io, etc.), r.RemoteAddr points to
+// the immediate proxy node (e.g. nginx pod or Fly proxy), collapsing all clients into
+// a single bucket unless proxy headers are inspected.
+//
+// When cfg.TrustProxyHeaders is enabled:
+//  1. If cfg.TrustedProxies is non-empty, r.RemoteAddr must match a trusted proxy CIDR;
+//     if it does not (e.g. an attacker connecting directly bypassing proxies), headers
+//     are untrusted and r.RemoteAddr is returned.
+//  2. On Fly.io (Platform=="fly" or TrustedHeader=="Fly-Client-IP"), Fly-Client-IP is
+//     consulted first as Fly's edge securely guarantees this header.
+//  3. When walking X-Forwarded-For, entries are inspected right-to-left. Any hops matching
+//     cfg.TrustedProxies are skipped as intermediate proxy hops (e.g. cloud load balancer,
+//     ingress controller, nginx edge) until the first non-trusted IP is reached, which represents
+//     the true client IP. Any earlier spoofed hops injected by the client are ignored.
+func trustedClientIP(r *http.Request, cfg PerIPRateLimitConfig) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	host = strings.TrimSpace(host)
+
+	if !cfg.TrustProxyHeaders {
+		return host
+	}
+
+	remoteIP := net.ParseIP(host)
+	if len(cfg.TrustedProxies) > 0 {
+		if remoteIP == nil || !isIPInCIDRs(remoteIP, cfg.TrustedProxies) {
+			return host
+		}
+	}
+
+	isFly := strings.EqualFold(cfg.Platform, "fly") || strings.EqualFold(cfg.Platform, "fly.io")
+	headerName := cfg.TrustedHeader
+	if headerName == "" && isFly {
+		headerName = "Fly-Client-IP"
+	}
+
+	if strings.EqualFold(headerName, "Fly-Client-IP") || isFly {
+		if flyIP := strings.TrimSpace(r.Header.Get("Fly-Client-IP")); flyIP != "" {
+			if h, _, err := net.SplitHostPort(flyIP); err == nil {
+				flyIP = h
+			}
+			if parsed := net.ParseIP(flyIP); parsed != nil {
+				return parsed.String()
+			}
+		}
+		if strings.EqualFold(headerName, "Fly-Client-IP") && !isFly {
+			return host
+		}
+	}
+
+	if headerName == "" || strings.EqualFold(headerName, "X-Forwarded-For") {
+		headerName = "X-Forwarded-For"
+	}
+
+	rawHeader := r.Header.Get(headerName)
+	if rawHeader == "" {
+		return host
+	}
+
+	parts := strings.Split(rawHeader, ",")
+	if len(cfg.TrustedProxies) == 0 {
+		last := strings.TrimSpace(parts[len(parts)-1])
+		if last != "" {
+			if h, _, err := net.SplitHostPort(last); err == nil {
+				return h
+			}
+			return last
+		}
+		return host
+	}
+
+	var leftmostValid string
+	for i := len(parts) - 1; i >= 0; i-- {
+		hop := strings.TrimSpace(parts[i])
+		if hop == "" {
+			continue
+		}
+		hopHost := hop
+		if h, _, err := net.SplitHostPort(hop); err == nil {
+			hopHost = h
+		}
+		parsed := net.ParseIP(hopHost)
+		if parsed == nil {
+			continue
+		}
+		leftmostValid = parsed.String()
+		if !isIPInCIDRs(parsed, cfg.TrustedProxies) {
+			return parsed.String()
+		}
+	}
+
+	if leftmostValid != "" {
+		return leftmostValid
 	}
 	return host
 }
@@ -143,7 +291,7 @@ func PerIPRateLimit(cfg PerIPRateLimitConfig) func(http.Handler) http.Handler {
 				return
 			}
 
-			ip := trustedClientIP(r, cfg.TrustProxyHeaders)
+			ip := trustedClientIP(r, cfg)
 			redisKey := fmt.Sprintf("ratelimit:ip:%s", ip)
 			windowMs := int64(window / time.Millisecond)
 
@@ -178,18 +326,43 @@ func PerIPRateLimit(cfg PerIPRateLimitConfig) func(http.Handler) http.Handler {
 //
 //   - PER_IP_RATE_LIMIT_RPS (default 20)
 //   - PER_IP_RATE_LIMIT_WINDOW_MS (default 1000)
-//   - TRUSTED_PROXY_ENABLED ("true" to trust X-Forwarded-For's last hop —
-//     see the trust-assumption comment on trustedClientIP)
+//   - TRUSTED_PROXY_ENABLED ("true" to trust proxy headers)
+//   - TRUSTED_PROXY_PLATFORM ("fly" to trust Fly-Client-IP)
+//   - TRUSTED_PROXY_HEADER (override header, e.g. "Fly-Client-IP")
+//   - TRUSTED_PROXIES / TRUSTED_PROXY_CIDRS (comma-separated CIDRs/IPs, or "private")
 func NewPerIPRateLimitFromEnv(redisClient *redis.Client) func(http.Handler) http.Handler {
 	rps := envInt("PER_IP_RATE_LIMIT_RPS", 20)
 	windowMs := envInt("PER_IP_RATE_LIMIT_WINDOW_MS", 1000)
-	trustProxy := os.Getenv("TRUSTED_PROXY_ENABLED") == "true"
+	platform := strings.ToLower(strings.TrimSpace(os.Getenv("TRUSTED_PROXY_PLATFORM")))
+	headerOverride := strings.TrimSpace(os.Getenv("TRUSTED_PROXY_HEADER"))
+
+	trustedProxyStr := os.Getenv("TRUSTED_PROXY_ENABLED")
+	trustProxy := trustedProxyStr == "true" || trustedProxyStr == "1"
+	if platform != "" && trustedProxyStr == "" {
+		trustProxy = true
+	}
+
+	proxiesSpec := os.Getenv("TRUSTED_PROXIES")
+	if proxiesSpec == "" {
+		proxiesSpec = os.Getenv("TRUSTED_PROXY_CIDRS")
+	}
+	if proxiesSpec != "" && trustedProxyStr == "" {
+		trustProxy = true
+	}
+
+	trustedCIDRs, err := ParseTrustedProxies(proxiesSpec)
+	if err != nil {
+		slog.Warn("failed to parse TRUSTED_PROXIES; proxy headers will not filter by CIDR", "err", err, "spec", proxiesSpec)
+	}
 
 	return PerIPRateLimit(PerIPRateLimitConfig{
 		Redis:             redisClient,
 		RPS:               rps,
 		Window:            time.Duration(windowMs) * time.Millisecond,
 		TrustProxyHeaders: trustProxy,
+		TrustedProxies:    trustedCIDRs,
+		Platform:          platform,
+		TrustedHeader:     headerOverride,
 	})
 }
 
