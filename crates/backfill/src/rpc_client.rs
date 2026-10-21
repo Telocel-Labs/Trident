@@ -26,6 +26,8 @@ struct JsonRpcError {
 struct GetEventsParams {
     #[serde(rename = "startLedger", skip_serializing_if = "Option::is_none")]
     start_ledger: Option<u64>,
+    #[serde(rename = "endLedger", skip_serializing_if = "Option::is_none")]
+    end_ledger: Option<u64>,
     filters: Vec<serde_json::Value>,
     pagination: Pagination,
 }
@@ -104,10 +106,12 @@ impl RpcClient {
     pub async fn get_events(
         &self,
         start_ledger: Option<u64>,
+        end_ledger: Option<u64>,
         cursor: Option<String>,
     ) -> Result<crate::parser::EventsPage, TridentError> {
         let params = GetEventsParams {
             start_ledger,
+            end_ledger,
             filters: vec![],
             pagination: Pagination { limit: 200, cursor },
         };
@@ -148,5 +152,39 @@ impl RpcClient {
             events: result.events,
             latest_ledger: result.latest_ledger,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_events_params_includes_end_ledger() {
+        let params = GetEventsParams {
+            start_ledger: Some(100),
+            end_ledger: Some(200),
+            filters: vec![],
+            pagination: Pagination {
+                limit: 200,
+                cursor: None,
+            },
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains(r#""startLedger":100"#));
+        assert!(json.contains(r#""endLedger":200"#));
+
+        let params_no_end = GetEventsParams {
+            start_ledger: Some(100),
+            end_ledger: None,
+            filters: vec![],
+            pagination: Pagination {
+                limit: 200,
+                cursor: None,
+            },
+        };
+        let json_no_end = serde_json::to_string(&params_no_end).unwrap();
+        assert!(json_no_end.contains(r#""startLedger":100"#));
+        assert!(!json_no_end.contains("endLedger"));
     }
 }

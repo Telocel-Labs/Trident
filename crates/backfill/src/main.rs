@@ -79,15 +79,22 @@ async fn backfill_range(
     let mut seq = from_ledger;
     let mut consecutive_rpc_failures: u32 = 0;
     while seq <= to_ledger {
-        match rpc.get_events(Some(seq), page_cursor.clone()).await {
+        match rpc.get_events(Some(seq), Some(to_ledger), page_cursor.clone()).await {
             Ok(page) => {
                 consecutive_rpc_failures = 0;
                 if page.events.is_empty() {
                     break;
                 }
+                let mut reached_bound = false;
                 for raw in &page.events {
                     match parser.parse_event(raw) {
                         Ok(Some(ev)) => {
+                            // Client-side bound enforcement (issue #772): never process
+                            // or insert events past to_ledger even if the RPC ignores endLedger.
+                            if ev.ledger_sequence > to_ledger {
+                                reached_bound = true;
+                                break;
+                            }
                             if let Some(c) = contract {
                                 if ev.contract_id != c {
                                     continue;
@@ -100,11 +107,20 @@ async fn backfill_range(
                                 }
                             } else {
                                 match db::insert_event(db, &ev, network).await {
-                                    Ok(_) => {
+                                    Ok(db::InsertOutcome::Inserted) => {
                                         events_indexed.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    Err(_) => {
+                                    Ok(db::InsertOutcome::Duplicate) => {
                                         duplicates_skipped.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            ledger = ev.ledger_sequence,
+                                            tx = %ev.transaction_hash,
+                                            "Database insertion failed during backfill"
+                                        );
+                                        return Err(e);
                                     }
                                 }
                             }
@@ -114,9 +130,18 @@ async fn backfill_range(
                     }
                 }
 
+                if reached_bound {
+                    break;
+                }
+
                 // advance to last event ledger
                 if let Some(last) = page.events.last() {
                     if let Ok(last_seq) = last.ledger.parse::<u64>() {
+                        if last_seq >= to_ledger {
+                            let advanced = to_ledger.saturating_sub(seq) + 1;
+                            on_progress(advanced);
+                            break;
+                        }
                         let advanced = last_seq.saturating_sub(seq) + 1;
                         seq = last_seq + 1;
                         on_progress(advanced);
@@ -310,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some((s, e)) = rx.lock().await.recv().await {
                 tracing::info!(start = s, end = e, "Worker got range");
                 let pb = pb.clone();
-                let _ = backfill_range(
+                backfill_range(
                     &db,
                     &rpc,
                     &parser,
@@ -325,16 +350,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None, // unbounded retries: matches the pre-#216 CLI behaviour
                     move |advanced| pb.inc(advanced),
                 )
-                .await;
+                .await?;
             }
+            Ok::<(), trident_common::TridentError>(())
         });
 
         handles.push(handle);
     }
 
     let start_time = Instant::now();
+    let mut worker_errors: Vec<String> = Vec::new();
     for h in handles {
-        let _ = h.await;
+        match h.await {
+            Ok(Err(e)) => worker_errors.push(e.to_string()),
+            Err(join_err) => worker_errors.push(join_err.to_string()),
+            Ok(Ok(())) => {}
+        }
+    }
+
+    if !worker_errors.is_empty() {
+        return Err(format!(
+            "Backfill failed with {} worker error(s): {:?}",
+            worker_errors.len(),
+            worker_errors
+        )
+        .into());
     }
 
     pb.finish_and_clear();
@@ -353,4 +393,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_test_event(ledger: u64, tx_hash: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "contract",
+            "ledger": ledger.to_string(),
+            "ledgerClosedAt": "2026-01-01T00:00:00Z",
+            "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "id": format!("{:010}-0000000001", ledger),
+            "txHash": tx_hash,
+            "topic": [],
+            "value": ""
+        })
+    }
+
+    #[tokio::test]
+    async fn backfill_range_stops_at_to_ledger_without_processing_past_bound() {
+        let server = MockServer::start().await;
+
+        let events = vec![
+            make_test_event(50, "hash1"),
+            make_test_event(100, "hash2"),
+            make_test_event(150, "hash3"), // Should be ignored because to_ledger = 100
+        ];
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": 200
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+
+        let rpc = rpc_client::RpcClient::new(server.uri()).unwrap();
+        let parser = parser::Parser::new(false);
+        let events_indexed = AtomicU64::new(0);
+        let duplicates_skipped = AtomicU64::new(0);
+
+        let db = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+
+        let res = backfill_range(
+            &db,
+            &rpc,
+            &parser,
+            None,
+            true, // dry_run = true
+            0,
+            "testnet",
+            50,
+            100, // to_ledger
+            &events_indexed,
+            &duplicates_skipped,
+            Some(1),
+            |_| {},
+        )
+        .await;
+
+        assert!(res.is_ok(), "backfill_range should succeed");
+        assert_eq!(
+            events_indexed.load(Ordering::Relaxed),
+            2,
+            "Only ledgers 50 and 100 should be indexed; ledger 150 must be skipped"
+        );
+        assert_eq!(duplicates_skipped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn backfill_range_fails_on_db_error_and_does_not_count_as_duplicate() {
+        let server = MockServer::start().await;
+
+        let events = vec![make_test_event(50, "hash1")];
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": 200
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+
+        let rpc = rpc_client::RpcClient::new(server.uri()).unwrap();
+        let parser = parser::Parser::new(false);
+        let events_indexed = AtomicU64::new(0);
+        let duplicates_skipped = AtomicU64::new(0);
+
+        let db = sqlx::postgres::PgPoolOptions::new().acquire_timeout(std::time::Duration::from_millis(200)).connect_lazy("postgres://127.0.0.1:1/dummy").unwrap();
+
+        let res = backfill_range(
+            &db,
+            &rpc,
+            &parser,
+            None,
+            false, // dry_run = false to trigger DB insert attempt
+            0,
+            "testnet",
+            50,
+            100,
+            &events_indexed,
+            &duplicates_skipped,
+            Some(1),
+            |_| {},
+        )
+        .await;
+
+        assert!(res.is_err(), "backfill_range must fail when DB insert fails");
+        assert_eq!(
+            duplicates_skipped.load(Ordering::Relaxed),
+            0,
+            "DB failures must not be counted as duplicates_skipped"
+        );
+    }
 }
