@@ -14,6 +14,7 @@ pub mod trident {
 mod config;
 mod services;
 
+/// Default pool size if GRPC_API_DB_POOL_SIZE is unset.
 /// Read-heavy service with moderate concurrency, so a moderate pool is correct.
 const DEFAULT_DB_POOL_SIZE: u32 = 10;
 
@@ -74,15 +75,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_DB_POOL_SIZE);
 
+    let stmt_timeout = cfg.statement_timeout_ms;
+    let idle_timeout = cfg.idle_in_transaction_timeout_ms;
+
     // statement_cache_capacity(0) disables named prepared statements so the pool
     // is safe behind PgBouncer in transaction mode. See docs/deployment.md (#87).
+    // Set statement_timeout and idle_in_transaction_session_timeout on every
+    // new connection so a runaway query or leaked transaction cannot hold
+    // connections indefinitely (#249, #789).
     let connect_options =
         PgConnectOptions::from_str(&cfg.database_url)?.statement_cache_capacity(0);
     let db_pool = PgPoolOptions::new()
         .max_connections(pool_size)
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                sqlx::query(&format!("SET statement_timeout = '{stmt_timeout}ms'"))
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query(&format!(
+                    "SET idle_in_transaction_session_timeout = '{idle_timeout}ms'"
+                ))
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
         .connect_with(connect_options)
         .await?;
-    tracing::info!(pool_size, "Database connected via pool");
+    tracing::info!(
+        pool_size,
+        statement_timeout_ms = stmt_timeout,
+        idle_in_transaction_timeout_ms = idle_timeout,
+        "Database connected via pool with timeout defaults"
+    );
 
     let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL is required");
     let redis_manager = redis::Client::open(redis_url)?

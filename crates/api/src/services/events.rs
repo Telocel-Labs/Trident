@@ -151,8 +151,17 @@ fn row_to_event(row: EventRow) -> Event {
     }
 }
 
-fn db_err(e: sqlx::Error) -> Status {
+pub(crate) fn db_err(e: sqlx::Error) -> Status {
     tracing::error!(error = %e, "database error");
+    if let sqlx::Error::Database(ref dbe) = e {
+        // Postgres SQLSTATE 57014: query_canceled (raised when statement_timeout fires)
+        if dbe.code().as_deref() == Some("57014") {
+            return Status::deadline_exceeded("query deadline exceeded");
+        }
+    }
+    if matches!(e, sqlx::Error::PoolTimedOut) {
+        return Status::deadline_exceeded("database pool acquisition timed out");
+    }
     Status::unavailable("database temporarily unavailable")
 }
 
@@ -1238,5 +1247,116 @@ mod tests {
         assert!(network_matches("mainnet", Some("mainnet")));
         assert!(!network_matches("testnet", Some("mainnet")));
         assert!(!network_matches("", Some("mainnet")));
+    }
+
+    #[derive(Debug)]
+    struct MockPgQueryCanceled;
+
+    impl std::fmt::Display for MockPgQueryCanceled {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "canceling statement due to statement timeout")
+        }
+    }
+
+    impl std::error::Error for MockPgQueryCanceled {}
+
+    impl sqlx::error::DatabaseError for MockPgQueryCanceled {
+        fn message(&self) -> &str {
+            "canceling statement due to statement timeout"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed("57014"))
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    #[test]
+    fn db_err_maps_statement_timeout_to_deadline_exceeded() {
+        let err = sqlx::Error::Database(Box::new(MockPgQueryCanceled));
+        let status = db_err(err);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(status.message(), "query deadline exceeded");
+    }
+
+    #[test]
+    fn db_err_maps_pool_timeout_to_deadline_exceeded() {
+        let status = db_err(sqlx::Error::PoolTimedOut);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(status.message(), "database pool acquisition timed out");
+    }
+
+    #[test]
+    fn db_err_maps_generic_error_to_unavailable() {
+        let status = db_err(sqlx::Error::RowNotFound);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "database temporarily unavailable");
+    }
+
+    #[tokio::test]
+    async fn slow_query_list_events_hits_statement_timeout() {
+        let (db_url, redis_url) = require_services!();
+
+        // Connect with statement_timeout set to 200ms
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '200ms'")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&db_url)
+            .await
+            .unwrap();
+
+        let redis = redis::Client::open(redis_url)
+            .unwrap()
+            .get_connection_manager()
+            .await
+            .unwrap();
+        let svc = EventsServiceImpl::new(pool, redis);
+
+        // Hold an ACCESS EXCLUSIVE lock on soroban_events from another connection
+        // so that list_events SELECT blocks and hits statement_timeout
+        let locker = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let mut lock_tx = locker.begin().await.unwrap();
+        sqlx::query("LOCK TABLE soroban_events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        let req = Request::new(ListEventsRequest {
+            contract_id: "CTEST".to_string(),
+            topic_0: String::new(),
+            topic_1: String::new(),
+            ledger_from: 0,
+            ledger_to: 0,
+            cursor: String::new(),
+            limit: 10,
+            network: "testnet".to_string(),
+        });
+
+        let err = svc.list_events(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+
+        let _ = lock_tx.rollback().await;
     }
 }
