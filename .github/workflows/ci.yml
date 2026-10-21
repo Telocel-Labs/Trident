@@ -1261,6 +1261,9 @@ jobs:
       - name: Check every env var the code reads is documented
         run: bash scripts/check-env-reference.sh
 
+      - name: Verify OTLP TLS and sampling ratio configuration (#762)
+        run: bash scripts/test-check-otlp-config.sh
+
       # Catches two migrations sharing a version prefix before it reaches a
       # real database. The rust-integration job applies migrations with a
       # `for f in *.sql` psql loop rather than the sqlx migrator, so it cannot

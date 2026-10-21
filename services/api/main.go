@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -87,23 +88,100 @@ func redactConnErr(err error) string {
 	return connErrRegexp.ReplaceAllString(err.Error(), "${1}://[redacted]@")
 }
 
-func initTracer(ctx context.Context) func() {
+type tracerConfig struct {
+	endpoint      string
+	insecure      bool
+	headers       map[string]string
+	samplingRatio float64
+}
+
+func parseTracerConfig() (*tracerConfig, error) {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
-		return func() {}
+		return nil, nil
 	}
 
 	samplingRatio := 0.1
 	if r := os.Getenv("OTEL_SAMPLING_RATIO"); r != "" {
-		if f, err := strconv.ParseFloat(r, 64); err == nil {
-			samplingRatio = f
+		f, err := strconv.ParseFloat(r, 64)
+		if err != nil || f < 0.0 || f > 1.0 {
+			return nil, fmt.Errorf("OTEL_SAMPLING_RATIO must be between 0.0 and 1.0 (got %q)", r)
 		}
+		samplingRatio = f
 	}
 
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	// Issue #762: Strip URI scheme if provided, e.g. https://tempo:443 -> tempo:443
+	trimmedEndpoint := endpoint
+	isExplicitHTTP := false
+	if strings.HasPrefix(strings.ToLower(endpoint), "http://") {
+		trimmedEndpoint = endpoint[len("http://"):]
+		isExplicitHTTP = true
+	} else if strings.HasPrefix(strings.ToLower(endpoint), "https://") {
+		trimmedEndpoint = endpoint[len("https://"):]
+	}
+
+	// Default to TLS; allow insecure only with an explicit OTEL_EXPORTER_OTLP_INSECURE=true
+	// (or explicit http:// scheme when not overridden)
+	insecureEnv := os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")
+	insecure := false
+	if strings.EqualFold(insecureEnv, "true") || (insecureEnv == "" && isExplicitHTTP) {
+		insecure = true
+	}
+
+	// Support headers for collector auth (OTEL_EXPORTER_OTLP_HEADERS)
+	headers := parseOTelHeaders(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"))
+
+	return &tracerConfig{
+		endpoint:      trimmedEndpoint,
+		insecure:      insecure,
+		headers:       headers,
+		samplingRatio: samplingRatio,
+	}, nil
+}
+
+func parseOTelHeaders(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	headers := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) == 2 {
+			k := strings.TrimSpace(parts[0])
+			v := strings.TrimSpace(parts[1])
+			if k != "" {
+				headers[k] = v
+			}
+		}
+	}
+	return headers
+}
+
+func initTracer(ctx context.Context) func() {
+	cfg, err := parseTracerConfig()
+	if err != nil {
+		slog.Error("failed to parse OTel tracer configuration", "err", err)
+		os.Exit(1)
+	}
+	if cfg == nil {
+		return func() {}
+	}
+
+	opts := []otlptracegrpc.Option{
+		otlptracegrpc.WithEndpoint(cfg.endpoint),
+	}
+	if cfg.insecure {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+	if len(cfg.headers) > 0 {
+		opts = append(opts, otlptracegrpc.WithHeaders(cfg.headers))
+	}
+
+	exporter, err := otlptracegrpc.New(ctx, opts...)
 	if err != nil {
 		slog.Warn("failed to create OTLP trace exporter", "err", err)
 		return func() {}
@@ -125,7 +203,7 @@ func initTracer(ctx context.Context) func() {
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(newAlwaysKeepExporter(exporter)),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(newAlwaysRecordSampler(samplingRatio)),
+		sdktrace.WithSampler(newAlwaysRecordSampler(cfg.samplingRatio)),
 	)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})

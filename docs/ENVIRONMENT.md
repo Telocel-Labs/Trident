@@ -35,7 +35,9 @@ description is accurate. Keep this file honest by hand.
 | `TESTNET_LEDGER_SPAN` | Optional (test-only) | `400` | Testnet correctness suite | Ledger span to verify. Public testnet retains only a rolling window (~120k ledgers), so a very large span fails as out-of-range. |
 | `REQUIRE_TESTNET_CORRECTNESS` | Optional (test-only) | unset | Testnet correctness suite | When set, a missing `TESTNET_RPC_URL` is a hard test failure instead of a silent skip, so the scheduled job cannot report green without testing. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Optional | empty (tracing disabled) | indexer, grpc-api, go-api | OTLP gRPC endpoint for distributed tracing (issue #81). |
-| `OTEL_SAMPLING_RATIO` | Optional | `0.1` | indexer, grpc-api, go-api | Fraction of traces sampled. |
+| `OTEL_SAMPLING_RATIO` | Optional | `0.1` | indexer, grpc-api, go-api | Fraction of traces sampled (validated in [0.0, 1.0], issue #762). |
+| `OTEL_EXPORTER_OTLP_INSECURE` | Optional | `false` | go-api | When true, connects to OTLP collector without TLS (issue #762). Default is false (TLS required). |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Optional | empty | go-api | Comma-separated list of key=value headers for collector authentication (issue #762). |
 | `TOKIO_CONSOLE_ENABLED` | Optional | `false` | indexer | Enables `tokio-console` diagnostics (only takes effect when built with the `tokio-console` cargo feature). |
 
 ## Indexer (`crates/indexer`)

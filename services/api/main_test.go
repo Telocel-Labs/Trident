@@ -118,3 +118,93 @@ func TestEnvIntBounded_DefaultsWhenUnset(t *testing.T) {
 		t.Errorf("want default %d, got %d", defaultStatementTimeoutMS, got)
 	}
 }
+
+func TestParseTracerConfig_DefaultsToTLS(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "tempo.example.com:4317")
+	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "")
+	t.Setenv("OTEL_SAMPLING_RATIO", "")
+
+	cfg, err := parseTracerConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if cfg.endpoint != "tempo.example.com:4317" {
+		t.Errorf("endpoint: want tempo.example.com:4317, got %q", cfg.endpoint)
+	}
+	if cfg.insecure {
+		t.Errorf("insecure: want false (TLS by default), got true")
+	}
+	if cfg.samplingRatio != 0.1 {
+		t.Errorf("samplingRatio: want default 0.1, got %v", cfg.samplingRatio)
+	}
+}
+
+func TestParseTracerConfig_HTTPSchemeAndInsecure(t *testing.T) {
+	// https scheme strips prefix and remains TLS
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://tempo.example.com:443")
+	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "")
+	cfg, err := parseTracerConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.endpoint != "tempo.example.com:443" {
+		t.Errorf("endpoint: want tempo.example.com:443, got %q", cfg.endpoint)
+	}
+	if cfg.insecure {
+		t.Errorf("insecure: want false for https endpoint, got true")
+	}
+
+	// Explicit insecure flag enables insecure
+	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "true")
+	cfg, err = parseTracerConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.insecure {
+		t.Errorf("insecure: want true when OTEL_EXPORTER_OTLP_INSECURE=true, got false")
+	}
+}
+
+func TestParseTracerConfig_Headers(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer token123, x-custom = val ")
+
+	cfg, err := parseTracerConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.headers["authorization"] != "Bearer token123" {
+		t.Errorf("authorization header: want 'Bearer token123', got %q", cfg.headers["authorization"])
+	}
+	if cfg.headers["x-custom"] != "val" {
+		t.Errorf("x-custom header: want 'val', got %q", cfg.headers["x-custom"])
+	}
+}
+
+func TestParseTracerConfig_SamplingRatioValidation(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+
+	validCases := []string{"0", "0.0", "0.5", "1", "1.0"}
+	for _, val := range validCases {
+		t.Setenv("OTEL_SAMPLING_RATIO", val)
+		cfg, err := parseTracerConfig()
+		if err != nil {
+			t.Errorf("sampling ratio %q should be valid, got err: %v", val, err)
+		}
+		if cfg == nil {
+			t.Errorf("expected non-nil config for %q", val)
+		}
+	}
+
+	invalidCases := []string{"-0.1", "-1.0", "1.0001", "2.0", "not-a-number"}
+	for _, val := range invalidCases {
+		t.Setenv("OTEL_SAMPLING_RATIO", val)
+		_, err := parseTracerConfig()
+		if err == nil {
+			t.Errorf("sampling ratio %q should be rejected, got nil error", val)
+		}
+	}
+}
