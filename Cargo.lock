@@ -4022,6 +4022,8 @@ dependencies = [
  "chrono",
  "clap",
  "indicatif",
+ "metrics",
+ "metrics-exporter-prometheus",
  "reqwest",
  "serde",
  "serde_json",

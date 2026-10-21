@@ -29,6 +29,16 @@ grpcApi:
       cpu: "500m"
       memory: "256Mi"
 
+backfill:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
 goApi:
   replicaCount: 1
   hpa:

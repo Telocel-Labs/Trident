@@ -1,0 +1,50 @@
+# fly/backfill.toml — Trident backfill queue worker (Rust)
+app = "trident-backfill"
+primary_region = "iad"
+
+[build]
+  dockerfile = "crates/backfill/Dockerfile"
+
+[env]
+  METRICS_PORT               = "9092"
+  HEALTH_PORT                = "8082"
+  STALE_RUNNING_TIMEOUT_SECS = "900"
+  LOG_LEVEL                  = "info"
+
+# Secrets are sourced from Fly secrets store:
+# Required: DATABASE_URL, STELLAR_RPC_URL
+
+[[services]]
+  protocol      = "tcp"
+  internal_port = 9092
+
+  [[services.ports]]
+    port = 9092
+
+  [[services.tcp_checks]]
+    interval     = "15s"
+    timeout      = "2s"
+    grace_period = "30s"
+
+[checks]
+  [checks.readiness]
+    type         = "http"
+    port         = 8082
+    method       = "get"
+    path         = "/readyz"
+    interval     = "15s"
+    timeout      = "5s"
+    grace_period = "30s"
+
+  [checks.liveness]
+    type         = "http"
+    port         = 8082
+    method       = "get"
+    path         = "/healthz"
+    interval     = "15s"
+    timeout      = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "512mb"
