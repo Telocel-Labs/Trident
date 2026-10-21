@@ -6,6 +6,9 @@
 //! relevant points in `poll_once`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static LAST_HEARTBEAT_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -430,6 +433,23 @@ pub fn set_effective_poll_interval(ms: u64) {
 /// stalled-but-not-crashed indexer (#218).
 pub fn set_heartbeat_timestamp(secs: f64) {
     gauge!(HEARTBEAT_TIMESTAMP).set(secs);
+    LAST_HEARTBEAT_TIMESTAMP.store(secs as u64, Ordering::Relaxed);
+}
+
+pub fn last_heartbeat_timestamp() -> u64 {
+    LAST_HEARTBEAT_TIMESTAMP.load(Ordering::Relaxed)
+}
+
+pub fn last_heartbeat_age_secs() -> Option<u64> {
+    let last = last_heartbeat_timestamp();
+    if last == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(now.saturating_sub(last))
 }
 
 /// Stamp the heartbeat to now. Convenience wrapper over

@@ -66,6 +66,7 @@ description is accurate. Keep this file honest by hand.
 | `REDIS_STREAM_MAXLEN` | Optional | `10000` | Max events kept in the Redis stream before trimming. |
 | `METRICS_PORT` | Optional | `9090` | Prometheus `/metrics` port; also doubles as the indexer's liveness/readiness signal. |
 | `HEALTH_PORT` | Optional | `8080` | Port serving `/healthz` and `/readyz`. |
+| `HEALTH_HEARTBEAT_TIMEOUT_SECS` | Optional | `120` | Max seconds since last poll loop heartbeat before `/healthz` reports stalled (issue #764). Range: `[5, 86400]`. |
 | `RUST_LOG` | Optional | `info` | Log verbosity (`error`\|`warn`\|`info`\|`debug`\|`trace`). |
 | `DB_STATEMENT_TIMEOUT_MS` | Optional | `30000` | Postgres per-statement timeout bound. |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | Optional | `10000` | Postgres `idle_in_transaction_session_timeout` bound. |

@@ -298,7 +298,7 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 /// Guarded by advisory lock to run on one replica (issue #731).
 async fn maintain_partitions(pool: PgPool) {
     let mut interval = time::interval(Duration::from_secs(86400)); // Once per day
-    // Delay first run to avoid re-running on every restart/crash-loop
+                                                                   // Delay first run to avoid re-running on every restart/crash-loop
     tokio::time::sleep(Duration::from_secs(60)).await;
     loop {
         // Try to acquire advisory lock
@@ -442,8 +442,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let health_addr: SocketAddr = ([0, 0, 0, 0], cfg.health_port).into();
     let health_db = db_pool.clone();
     let health_redis_url = cfg.redis_url.clone();
+    let health_cfg = health::HealthConfig {
+        heartbeat_timeout_secs: cfg.health_heartbeat_timeout_secs,
+        admin_api_key: cfg.admin_api_key.clone(),
+        max_concurrent_conns: 64,
+        header_timeout: std::time::Duration::from_secs(5),
+    };
+    let health_redis_conn = redis_conn.clone();
     tokio::spawn(async move {
-        health::serve(health_addr, health_db, health_redis_url).await;
+        health::serve_with_config(
+            health_addr,
+            health_db,
+            health_redis_url,
+            health_redis_conn,
+            health_cfg,
+        )
+        .await;
     });
 
     let shutdown = CancellationToken::new();

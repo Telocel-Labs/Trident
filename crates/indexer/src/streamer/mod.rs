@@ -2145,6 +2145,8 @@ mod tests {
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
             health_port: 0,
+            health_heartbeat_timeout_secs: 120,
+            admin_api_key: None,
             statement_timeout_ms: 30_000,
             idle_in_transaction_timeout_ms: 60_000,
             token_metadata_refresh_interval: Duration::from_secs(86_400),
@@ -2859,6 +2861,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
