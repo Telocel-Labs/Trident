@@ -766,4 +766,35 @@ groups:
         annotations:
           summary: "Database backup has not succeeded in over 26 hours"
           description: "Automated PostgreSQL backup job has failed or failed to run, risking data loss."
+          runbook_url: "docs/runbooks/alerts.md#tridentdatabasebackupfailed"
 
+  # ---------------------------------------------------------------------------
+  # API Audit Log Failures (issue #800)
+  # ---------------------------------------------------------------------------
+  - name: trident.api.audit
+    rules:
+      - alert: TridentAPIAuditLogDroppedHigh
+        expr: rate(trident_api_audit_log_dropped_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "Trident API audit log entries are being dropped"
+          description: >
+            trident_api_audit_log_dropped_total has been increasing for 5 minutes.
+            Audit entries are being dropped due to channel capacity or database insert failures.
+          runbook_url: "docs/runbooks/alerts.md#tridentapiauditlogdroppedhigh"
+
+      - alert: TridentAPIAuditLogFlushFailuresHigh
+        expr: rate(trident_api_audit_log_flush_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "Trident API audit log batch flushes are failing"
+          description: >
+            trident_api_audit_log_flush_failures_total has been increasing for 5 minutes.
+            Batched inserts into audit_log are failing against PostgreSQL.
+          runbook_url: "docs/runbooks/alerts.md#tridentapiauditlogflushfailureshigh"

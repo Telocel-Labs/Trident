@@ -112,6 +112,20 @@ var (
 		Help: "Total failed batched API-key usage flushes (counts are retained and retried).",
 	})
 
+	// AuditLogDroppedTotal counts audit entries dropped because the channel
+	// was full or retry buffer capacity was exceeded (issue #800).
+	AuditLogDroppedTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "trident_api_audit_log_dropped_total",
+		Help: "Total audit log entries dropped due to full channel or exhausted retries.",
+	})
+
+	// AuditLogFlushFailuresTotal counts failed batched audit log inserts
+	// (issue #800).
+	AuditLogFlushFailuresTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "trident_api_audit_log_flush_failures_total",
+		Help: "Total failed batched audit log database inserts.",
+	})
+
 	// AuthKeyLookupFailuresTotal counts API-key lookups that did not
 	// authenticate, by outcome (issue #751): not_found is a bad credential
 	// (401), unavailable is an infrastructure failure (503), expired is a

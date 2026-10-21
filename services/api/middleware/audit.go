@@ -3,6 +3,8 @@ package middleware
 import (
 	"context"
 	"log/slog"
+
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"net"
 	"net/http"
 	"strings"
@@ -45,12 +47,13 @@ type AuditEntry struct {
 
 // AuditWriter asynchronously writes audit log entries to PostgreSQL.
 type AuditWriter struct {
-	ch      chan AuditEntry
-	pool    *pgxpool.Pool
-	logger  *slog.Logger
-	wg      sync.WaitGroup
-	closed  bool
-	closeMu sync.Mutex
+	ch            chan AuditEntry
+	pool          *pgxpool.Pool
+	logger        *slog.Logger
+	wg            sync.WaitGroup
+	closed        bool
+	closeMu       sync.Mutex
+	batchInserter func(context.Context, []AuditEntry) error
 }
 
 // NewAuditWriter creates a new AuditWriter with a buffered channel.
@@ -92,6 +95,7 @@ func (aw *AuditWriter) Write(entry AuditEntry) {
 	select {
 	case aw.ch <- entry:
 	default:
+		metrics.AuditLogDroppedTotal.Inc()
 		aw.logger.Warn("audit log channel full, dropping entry", "endpoint", entry.Endpoint)
 	}
 }
@@ -110,35 +114,69 @@ func (aw *AuditWriter) Close() {
 	aw.wg.Wait()
 }
 
+const maxPendingAuditEntries = 10000
+
 func (aw *AuditWriter) run(flushInterval time.Duration, batchSize int) {
 	defer aw.wg.Done()
 
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
-	batch := make([]AuditEntry, 0, batchSize)
+	pending := make([]AuditEntry, 0, batchSize)
+	consecutiveFailures := 0
 
 	flush := func() {
-		if len(batch) == 0 {
+		if len(pending) == 0 {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := aw.insertBatch(ctx, batch); err != nil {
-			aw.logger.Error("audit log batch insert failed", "err", err, "count", len(batch))
+
+		var err error
+		if aw.batchInserter != nil {
+			err = aw.batchInserter(ctx, pending)
+		} else {
+			err = aw.insertBatch(ctx, pending)
 		}
-		batch = batch[:0]
+
+		if err != nil {
+			metrics.AuditLogFlushFailuresTotal.Inc()
+			consecutiveFailures++
+			aw.logger.Error("audit log batch insert failed; will retry", "err", err, "count", len(pending), "consecutive_failures", consecutiveFailures)
+			return
+		}
+
+		consecutiveFailures = 0
+		pending = pending[:0]
 	}
 
 	for {
 		select {
 		case entry, ok := <-aw.ch:
 			if !ok {
-				flush()
+				// Flush pending entries with retries on shutdown
+				for attempts := 0; attempts < 3 && len(pending) > 0; attempts++ {
+					flush()
+					if len(pending) > 0 {
+						time.Sleep(50 * time.Millisecond)
+					}
+				}
+				if len(pending) > 0 {
+					dropped := len(pending)
+					metrics.AuditLogDroppedTotal.Add(float64(dropped))
+					aw.logger.Error("audit log entries dropped on shutdown after exhausting retries", "count", dropped)
+				}
 				return
 			}
-			batch = append(batch, entry)
-			if len(batch) >= batchSize {
+
+			if len(pending) >= maxPendingAuditEntries {
+				metrics.AuditLogDroppedTotal.Inc()
+				aw.logger.Warn("audit log retry buffer full, dropping entry", "endpoint", entry.Endpoint)
+			} else {
+				pending = append(pending, entry)
+			}
+
+			if len(pending) >= batchSize {
 				flush()
 			}
 		case <-ticker.C:

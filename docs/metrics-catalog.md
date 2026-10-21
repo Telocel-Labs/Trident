@@ -69,6 +69,8 @@ and
 | `trident_api_db_pool_max_connections` | gauge | — | connections | Configured pool ceiling (`GO_API_DB_POOL_SIZE`, default 5). |
 | `trident_api_redis_stream_length` | gauge | — | messages | `XLEN` of the `trident:events` Redis Stream — the indexer→API consumer backlog (#201). Omitted from the scrape if Redis is unreachable at scrape time. |
 | `trident_retention_rows_deleted_total` | counter | `table` | rows | Rows deleted by the periodic retention job (`startRetentionJob`, `services/api/main.go`) per table (issue #604). Makes a disk-growth alert's remediation observable: a flat counter alongside a still-firing disk alert means the job is running but not keeping up, not that it silently stopped. **Note:** unlike the rest of this table, this metric is on the separate `internal/metrics` registry (`METRICS_PORT`, default `9091`), not the public `/metrics` endpoint above — that registry has no catalog section of its own yet. |
+| `trident_api_audit_log_dropped_total` | counter | — | entries | Total audit log entries dropped due to full channel or exhausted retries (issue #800). |
+| `trident_api_audit_log_flush_failures_total` | counter | — | flushes | Total failed batched audit log database inserts (issue #800). |
 
 ## Internal gRPC events backend (`crates/api`)
 
