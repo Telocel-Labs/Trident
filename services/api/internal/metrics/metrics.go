@@ -130,6 +130,18 @@ var (
 		Help: "Total handler-chain panics caught by the recovery middleware.",
 	})
 
+	// WebhookConsumerLag tracks consumer lag for webhook event processing (issue #804).
+	WebhookConsumerLag = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_webhook_consumer_lag",
+		Help: "Current estimated consumer lag for webhook event processing.",
+	})
+
+	// WebhookStreamTrimRiskTotal counts alerts when webhook consumer lag approaches the stream trim threshold.
+	WebhookStreamTrimRiskTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "trident_webhook_stream_trim_risk_total",
+		Help: "Total times webhook consumer lag approached the Redis stream trim threshold.",
+	})
+
 	// DB pool saturation metrics (issue #238), sourced from pgxpool.Pool.Stat()
 	// by PollDBPool. All exposed as Gauges — Stat() itself only returns
 	// point-in-time cumulative totals (not deltas), which Set() reflects

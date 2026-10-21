@@ -238,6 +238,221 @@ func newDB() (*sql.DB, error) {
 	return db, nil
 }
 
+
+type webhookWorkerCheckpoint struct {
+	CreatedAt time.Time `json:"created_at"`
+	ID        string    `json:"id"`
+}
+
+const webhookCheckpointKey = "webhook_worker_checkpoint"
+const defaultRedisStreamMaxLen = 50000
+
+func getRedisStreamMaxLen() int64 {
+	if raw := os.Getenv("REDIS_STREAM_MAXLEN"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultRedisStreamMaxLen
+}
+
+func getWebhookWorkerCheckpoint(ctx context.Context, db *sql.DB) (*webhookWorkerCheckpoint, error) {
+	if db == nil {
+		return nil, nil
+	}
+	var val string
+	err := db.QueryRowContext(ctx, "SELECT value FROM system_state WHERE key = $1", webhookCheckpointKey).Scan(&val)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cp webhookWorkerCheckpoint
+	if err := json.Unmarshal([]byte(val), &cp); err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
+func saveWebhookWorkerCheckpoint(ctx context.Context, db *sql.DB, cp webhookWorkerCheckpoint) error {
+	if db == nil {
+		return nil
+	}
+	data, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO system_state (key, value, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+	`, webhookCheckpointKey, string(data))
+	return err
+}
+
+// catchupWebhookEventsFromPostgres queries soroban_events for all events since
+// the last recorded checkpoint, ensuring durable delivery even when the worker
+// was down or Redis stream trimmed the entries (issue #804).
+func catchupWebhookEventsFromPostgres(ctx context.Context, db *sql.DB, redisClient *redis.Client) (int, error) {
+	if db == nil {
+		return 0, nil
+	}
+	cp, err := getWebhookWorkerCheckpoint(ctx, db)
+	if err != nil {
+		slog.Warn("failed to load webhook worker checkpoint", "err", err)
+	}
+
+	if cp == nil {
+		var latestID string
+		var latestCreatedAt time.Time
+		err := db.QueryRowContext(ctx, "SELECT id, created_at FROM soroban_events ORDER BY created_at DESC, id DESC LIMIT 1").Scan(&latestID, &latestCreatedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		if !strings.EqualFold(os.Getenv("WEBHOOK_CATCHUP_FROM_START"), "true") {
+			_ = saveWebhookWorkerCheckpoint(ctx, db, webhookWorkerCheckpoint{
+				CreatedAt: latestCreatedAt,
+				ID:        latestID,
+			})
+			return 0, nil
+		}
+		cp = &webhookWorkerCheckpoint{
+			CreatedAt: time.Unix(0, 0),
+			ID:        "",
+		}
+	}
+
+	totalDelivered := 0
+	currentCursor := *cp
+
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+
+		rows, err := db.QueryContext(ctx, `
+			SELECT id, contract_id, ledger_sequence, topic_0, data, transaction_hash, network, created_at
+			FROM soroban_events
+			WHERE (created_at > $1 OR (created_at = $1 AND id::text > $2))
+			ORDER BY created_at ASC, id ASC
+			LIMIT 100
+		`, currentCursor.CreatedAt, currentCursor.ID)
+		if err != nil {
+			return totalDelivered, fmt.Errorf("catchup query failed: %w", err)
+		}
+
+		batchCount := 0
+		var lastBatchEventID string
+		var lastBatchCreatedAt time.Time
+
+		for rows.Next() {
+			batchCount++
+			var (
+				idStr          string
+				contractID     string
+				ledgerSequence int64
+				topic0         sql.NullString
+				dataBytes      []byte
+				txHash         string
+				network        string
+				createdAt      time.Time
+			)
+
+			if err := rows.Scan(&idStr, &contractID, &ledgerSequence, &topic0, &dataBytes, &txHash, &network, &createdAt); err != nil {
+				_ = rows.Close()
+				return totalDelivered, fmt.Errorf("catchup scan error: %w", err)
+			}
+
+			var dataMap map[string]any
+			if len(dataBytes) > 0 {
+				_ = json.Unmarshal(dataBytes, &dataMap)
+			}
+			if dataMap == nil {
+				dataMap = make(map[string]any)
+			}
+
+			event := webhookEvent{
+				ID:              idStr,
+				ContractID:      contractID,
+				LedgerSequence:  ledgerSequence,
+				Data:            dataMap,
+				TransactionHash: txHash,
+				Network:         network,
+			}
+			if topic0.Valid {
+				event.Topic0 = topic0.String
+			}
+
+			if err := processWebhookEvent(ctx, db, redisClient, event); err != nil {
+				slog.Error("catchup webhook delivery failed", "event_id", idStr, "err", err)
+			}
+
+			lastBatchEventID = idStr
+			lastBatchCreatedAt = createdAt
+			totalDelivered++
+		}
+		_ = rows.Close()
+
+		if batchCount == 0 {
+			break
+		}
+
+		currentCursor = webhookWorkerCheckpoint{
+			CreatedAt: lastBatchCreatedAt,
+			ID:        lastBatchEventID,
+		}
+		_ = saveWebhookWorkerCheckpoint(ctx, db, currentCursor)
+
+		if batchCount < 100 {
+			break
+		}
+	}
+
+	return totalDelivered, nil
+}
+
+// monitorWebhookConsumerLag inspects Redis stream consumer group pending backlog and warns if approaching trim limit.
+func monitorWebhookConsumerLag(ctx context.Context, redisClient *redis.Client, streamKey, groupName string) {
+	if redisClient == nil {
+		return
+	}
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	maxLen := getRedisStreamMaxLen()
+	threshold := float64(maxLen) * 0.8
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			groups, err := redisClient.XInfoGroups(ctx, streamKey).Result()
+			if err != nil {
+				continue
+			}
+			for _, g := range groups {
+				if g.Name == groupName {
+					lag := g.Lag
+					if lag < 0 {
+						lag = g.Pending
+					}
+					metrics.WebhookConsumerLag.Set(float64(lag))
+					if float64(lag) >= threshold {
+						metrics.WebhookStreamTrimRiskTotal.Inc()
+						slog.Warn("webhook consumer lag approaching Redis stream trim point",
+							"lag", lag, "stream", streamKey, "group", groupName, "stream_maxlen", maxLen)
+					}
+					break
+				}
+			}
+		}
+	}
+}
 func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Client) {
 	if db == nil || redisClient == nil {
 		return
@@ -259,6 +474,32 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 	// (issue #651) — resume anything left mid-backoff before picking up new
 	// stream entries.
 	resumePendingWebhookRetries(ctx, db)
+
+	// Catch up on any events committed to Postgres while worker was down or
+	// trimmed from Redis stream (issue #804).
+	if delivered, err := catchupWebhookEventsFromPostgres(ctx, db, redisClient); err != nil {
+		slog.Warn("webhook catchup from postgres returned error", "err", err)
+	} else if delivered > 0 {
+		slog.Info("webhook catchup from postgres delivered missed events", "count", delivered)
+	}
+
+	// Periodically reconcile against Postgres to guarantee no event is ever lost
+	// even if Redis stream trims older entries under high load (issue #804).
+	go func() {
+		reconcileTicker := time.NewTicker(30 * time.Second)
+		defer reconcileTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reconcileTicker.C:
+				_, _ = catchupWebhookEventsFromPostgres(ctx, db, redisClient)
+			}
+		}
+	}()
+
+	// Monitor consumer lag against Redis stream trim threshold and alert (issue #804).
+	go monitorWebhookConsumerLag(ctx, redisClient, streamKey, groupName)
 
 	go func() {
 		for {
@@ -311,6 +552,10 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 					if err := processWebhookEvent(ctx, db, redisClient, event); err != nil {
 						slog.Error("webhook delivery failed", "err", err)
 					}
+					_ = saveWebhookWorkerCheckpoint(ctx, db, webhookWorkerCheckpoint{
+						CreatedAt: time.Now(),
+						ID:        event.ID,
+					})
 					if _, err := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); err != nil {
 						slog.Warn("failed to ack message", "err", err)
 					}
