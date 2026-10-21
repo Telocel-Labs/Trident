@@ -24,6 +24,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # cosign keyless signing and actions/attest-build-provenance both need
+      # an OIDC token to mint a Sigstore/SLSA identity for this workflow run
+      # (issue #780) — no signing key is stored anywhere in the repo or in
+      # secrets.
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -60,12 +66,43 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.7.0
+
+      - name: Sign image (keyless, GitHub OIDC)
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${ORG}/trident-indexer@${{ steps.push.outputs.digest }}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.17.2
+        with:
+          image: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer@${{ steps.push.outputs.digest }}"
+          format: spdx-json
+          output-file: indexer-sbom.spdx.json
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate indexer-sbom.spdx.json \
+            "${REGISTRY}/${ORG}/trident-indexer@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v1.4.4
+        with:
+          subject-name: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer"
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
   build-grpc-api:
     name: Build gRPC API image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -98,12 +135,43 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.7.0
+
+      - name: Sign image (keyless, GitHub OIDC)
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${ORG}/trident-grpc-api@${{ steps.push.outputs.digest }}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.17.2
+        with:
+          image: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api@${{ steps.push.outputs.digest }}"
+          format: spdx-json
+          output-file: grpc-api-sbom.spdx.json
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate grpc-api-sbom.spdx.json \
+            "${REGISTRY}/${ORG}/trident-grpc-api@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v1.4.4
+        with:
+          subject-name: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api"
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
   build-go-api:
     name: Build Go API image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -144,12 +212,43 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.7.0
+
+      - name: Sign image (keyless, GitHub OIDC)
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${ORG}/trident-go-api@${{ steps.push.outputs.digest }}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.17.2
+        with:
+          image: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api@${{ steps.push.outputs.digest }}"
+          format: spdx-json
+          output-file: go-api-sbom.spdx.json
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate go-api-sbom.spdx.json \
+            "${REGISTRY}/${ORG}/trident-go-api@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v1.4.4
+        with:
+          subject-name: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api"
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
   build-migrate:
     name: Build database migration image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -181,6 +280,35 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.7.0
+
+      - name: Sign image (keyless, GitHub OIDC)
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${ORG}/trident-migrate@${{ steps.push.outputs.digest }}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.17.2
+        with:
+          image: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate@${{ steps.push.outputs.digest }}"
+          format: spdx-json
+          output-file: migrate-sbom.spdx.json
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate migrate-sbom.spdx.json \
+            "${REGISTRY}/${ORG}/trident-migrate@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v1.4.4
+        with:
+          subject-name: "${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate"
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
   # ---------------------------------------------------------------------------
   # Publish TypeScript SDK to npm
