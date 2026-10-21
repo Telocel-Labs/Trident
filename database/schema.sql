@@ -69,9 +69,11 @@ CREATE TABLE IF NOT EXISTS system_state (
     events_indexed_total  BIGINT      NOT NULL DEFAULT 0,
     events_in_last_poll   INT         NOT NULL DEFAULT 0,
     poll_duration_ms      INT         NOT NULL DEFAULT 0,
-    -- alerting state columns (migration 0003)
-    last_alert_at         TIMESTAMPTZ,
-    alert_fired           BOOLEAN     NOT NULL DEFAULT FALSE
+    -- alerting state columns (migration 0003, 0038)
+    last_alert_at               TIMESTAMPTZ,
+    alert_fired                 BOOLEAN     NOT NULL DEFAULT FALSE,
+    rpc_degraded_last_alert_at  TIMESTAMPTZ,
+    rpc_degraded_fired          BOOLEAN     NOT NULL DEFAULT FALSE
 );
 
 -- Seed a cursor row per supported network (migration 0031's vocabulary) so

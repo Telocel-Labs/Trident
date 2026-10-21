@@ -1304,6 +1304,176 @@ mod tests {
         );
         assert!(state.default_partition_last_alert_at.is_none());
     }
+
+    // ── RPC-degraded alert & recovery (issue #632) ─────────────────────────
+
+    #[tokio::test]
+    async fn rpc_degraded_alert_fires_when_rpc_all_degraded() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let mut ctx = make_ctx(999_990, 1_000_000, 200);
+        ctx.rpc_all_degraded = true;
+        let mut state = AlertState::default();
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(
+            state.rpc_degraded_fired,
+            "rpc_degraded_fired must be set after alert fires"
+        );
+        assert!(state.rpc_degraded_last_alert_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn rpc_degraded_alert_cooldown_suppresses_second_fire() {
+        let server = wiremock::MockServer::start().await;
+
+        // Expect 0 calls: should be suppressed by cooldown.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let mut ctx = make_ctx(999_990, 1_000_000, 200);
+        ctx.rpc_all_degraded = true;
+
+        // Already fired 5 minutes ago — within 30-minute cooldown window.
+        let mut state = AlertState {
+            rpc_degraded_fired: true,
+            rpc_degraded_last_alert_at: Some(Utc::now() - CDuration::minutes(5)),
+            ..Default::default()
+        };
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(state.rpc_degraded_fired);
+        assert!(state.rpc_degraded_last_alert_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn rpc_degraded_recovery_webhook_fires_when_recovered() {
+        let server = wiremock::MockServer::start().await;
+
+        // Exactly 1 recovery call expected
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let mut ctx = make_ctx(999_990, 1_000_000, 200);
+        ctx.rpc_all_degraded = false; // Recovered!
+
+        let mut state = AlertState {
+            rpc_degraded_fired: true,
+            rpc_degraded_last_alert_at: Some(Utc::now() - CDuration::minutes(10)),
+            ..Default::default()
+        };
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(
+            !state.rpc_degraded_fired,
+            "rpc_degraded_fired must be cleared after recovery"
+        );
+        assert!(
+            state.rpc_degraded_last_alert_at.is_none(),
+            "rpc_degraded_last_alert_at must be reset after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_degraded_no_resolve_sent_if_alert_was_never_fired() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let mut ctx = make_ctx(999_990, 1_000_000, 200);
+        ctx.rpc_all_degraded = false;
+
+        let mut state = AlertState::default();
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(!state.rpc_degraded_fired);
+        assert!(state.rpc_degraded_last_alert_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn rpc_degraded_simulated_restart_lifecycle() {
+        let server = wiremock::MockServer::start().await;
+
+        // Expect 2 calls: 1 initial alert on degraded, 1 recovery after fix.
+        // During cooldown across simulated restarts, 0 extra calls.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+
+        // Step 1: Initial degradation causes alert
+        let mut degraded_ctx = make_ctx(999_990, 1_000_000, 200);
+        degraded_ctx.rpc_all_degraded = true;
+        let mut state = AlertState::default();
+
+        alerter.evaluate(&degraded_ctx, &mut state).await;
+        assert!(state.rpc_degraded_fired);
+        let alert_time = state.rpc_degraded_last_alert_at.expect("must be set");
+
+        // Step 2: Simulate restart by restoring state from persisted values
+        // (Before issue #632, restart would reset rpc_degraded_fired to false and timestamp to None)
+        let mut restarted_state = AlertState {
+            rpc_degraded_fired: state.rpc_degraded_fired,
+            rpc_degraded_last_alert_at: state.rpc_degraded_last_alert_at,
+            ..Default::default()
+        };
+
+        // Still degraded, but within 30m cooldown: MUST NOT fire again
+        alerter.evaluate(&degraded_ctx, &mut restarted_state).await;
+        assert_eq!(restarted_state.rpc_degraded_last_alert_at, Some(alert_time));
+        assert!(restarted_state.rpc_degraded_fired);
+
+        // Step 3: RPC recovers -> recovery webhook must fire!
+        let mut recovered_ctx = make_ctx(999_990, 1_000_000, 200);
+        recovered_ctx.rpc_all_degraded = false;
+        alerter.evaluate(&recovered_ctx, &mut restarted_state).await;
+
+        assert!(!restarted_state.rpc_degraded_fired);
+        assert!(restarted_state.rpc_degraded_last_alert_at.is_none());
+
+        server.verify().await;
+    }
 }
 
 /// Checks if the newest events partition is within `days_threshold` of its end bound.
@@ -1312,7 +1482,7 @@ pub async fn check_partition_bounds(
     pool: &sqlx::PgPool,
     days_threshold: i32,
 ) -> Result<bool, sqlx::Error> {
-    let row: (bool,) = sqlx::query_as(
+    let _row: (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
             SELECT 1
