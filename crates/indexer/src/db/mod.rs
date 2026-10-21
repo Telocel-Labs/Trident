@@ -1379,6 +1379,44 @@ pub async fn detect_ledger_gaps(
 ///
 /// Uses a single `UPDATE` on the known cursor row so there is never a
 /// duplicate-key issue and the write is O(1) regardless of table size.
+/// Persist indexer operating mode to `system_state` (issue #802).
+pub async fn set_indexer_mode(
+    pool: &PgPool,
+    network: &str,
+    mode: &str,
+) -> Result<(), TridentError> {
+    let key = format!("indexer_mode:{network}");
+    sqlx::query(
+        r#"
+        INSERT INTO system_state (key, value, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (key) DO UPDATE
+        SET value = $2, updated_at = NOW()
+        "#,
+    )
+    .bind(&key)
+    .bind(mode)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("set_indexer_mode")))?;
+
+    // Also update common key 'indexer_mode' for network-agnostic queries
+    sqlx::query(
+        r#"
+        INSERT INTO system_state (key, value, updated_at)
+        VALUES ('indexer_mode', $1, NOW())
+        ON CONFLICT (key) DO UPDATE
+        SET value = $1, updated_at = NOW()
+        "#,
+    )
+    .bind(mode)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("set_indexer_mode common")))?;
+
+    Ok(())
+}
+
 pub async fn update_health_stats(
     pool: &PgPool,
     network: &str,

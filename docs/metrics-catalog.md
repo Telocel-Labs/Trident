@@ -32,6 +32,7 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_reorgs_total` | counter | — | reorgs | Ledger reorganisations detected and repaired: affected `soroban_events`/`ledger_metadata`/projection rows deleted, cursor rewound (issue #196). |
 | `trident_indexer_ledger_gaps_detected_total` | counter | — | gaps | Gaps found in the processed ledger range by the periodic `ledger_metadata` scan (issue #216). Increments on every scan that still finds an unrepaired gap, not just the first time. |
 | `trident_indexer_ledger_gaps_closed_total` | counter | — | gaps | Previously-enqueued `backfill_jobs` rows confirmed filled by a later scan (issue #216). |
+| `trident_indexer_mode` | gauge | — | enum (0=filtered, 1=index_all, 2=idle_no_contracts) | Indexer operating mode determined by allowlist state and `INDEX_ALL` setting (issue #802). |
 | `trident_indexer_last_poll_timestamp_seconds` | gauge | — | unix seconds | Set once per poll-loop iteration regardless of outcome — the dead-man's-switch (#218). Stale means the loop is hung, not just slow. |
 | `trident_indexer_db_pool_size` | gauge | — | connections | Current size of the indexer's own Postgres pool. |
 | `trident_indexer_db_pool_idle_connections` | gauge | — | connections | Idle connections in the indexer's own Postgres pool. |

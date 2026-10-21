@@ -170,6 +170,30 @@ pub const LEDGER_GAPS_CLOSED_TOTAL: &str = "trident_indexer_ledger_gaps_closed_t
 pub const RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL: &str =
     "trident_indexer_retained_floor_ledgers_skipped_total";
 
+pub const INDEXER_MODE: &str = "trident_indexer_mode";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexerMode {
+    Filtered = 0,
+    IndexAll = 1,
+    IdleNoContracts = 2,
+}
+
+impl IndexerMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IndexerMode::Filtered => "filtered",
+            IndexerMode::IndexAll => "index_all",
+            IndexerMode::IdleNoContracts => "idle_no_contracts",
+        }
+    }
+}
+
+pub fn set_indexer_mode(mode: IndexerMode) {
+    gauge!(INDEXER_MODE).set(mode as i64 as f64);
+    gauge!(INDEXER_MODE, "mode" => mode.as_str()).set(1.0);
+}
+
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
 pub fn install(port: u16) -> Result<(), TridentError> {
@@ -182,6 +206,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
             TridentError::config(anyhow::Error::new(e).context("failed to start metrics exporter"))
         })?;
 
+    describe_gauge!(
+        INDEXER_MODE,
+        "Indexer operation mode: 0 = filtered, 1 = index_all, 2 = idle_no_contracts"
+    );
     describe_gauge!(
         LEDGER_LAG,
         "Difference between chain tip and indexer cursor (ledgers)"
@@ -385,6 +413,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
+    gauge!(INDEXER_MODE).set(0.0);
     // Seed at 0 so the gauge is present from the first scrape and fails safe.
     // Seeding at i64::MAX would report infinite headroom, so an indexer that
     // crash-loops before its first successful poll would leave both partition
