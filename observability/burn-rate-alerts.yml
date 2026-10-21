@@ -109,20 +109,141 @@ groups:
           runbook_url: "docs/runbooks/alerts.md#tridentingestlagsustainedhigh"
 
   # ---------------------------------------------------------------------------
-  # Stubbed — do not enable until issue #295 (RED metrics for services/api)
-  # ships the full set of labels needed for SLO 2/3. The metrics exist today
-  # as trident_api_http_requests_total and
-  # trident_api_http_request_duration_seconds (services/api/middleware/metrics.go),
-  # but are still being validated against production traffic patterns before
-  # burn-rate thresholds can be confidently set. See docs/slo.md SLO 2 / SLO 3.
+  # SLO 3 — API availability (success ratio: target 99.5%, error budget 0.5% = 0.005)
+  # Issue #770, docs/slo.md SLO 3
   # ---------------------------------------------------------------------------
-  # - name: trident-slo-api-latency-availability
-  #   rules:
-  #     - record: trident:api_availability_error_ratio5m
-  #       expr: |
-  #         1 - (
-  #           sum(rate(trident_api_http_requests_total{status!~"5.."}[5m]))
-  #           /
-  #           sum(rate(trident_api_http_requests_total[5m]))
-  #         )
-  #     # ... mirror the fast/slow burn pattern above once the metric exists.
+  - name: trident-slo-api-availability
+    rules:
+      - record: trident:api_availability_error_ratio5m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[5m]))
+            /
+            sum(rate(trident_api_http_requests_total[5m]))
+          )
+      - record: trident:api_availability_error_ratio1h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[1h]))
+            /
+            sum(rate(trident_api_http_requests_total[1h]))
+          )
+      - record: trident:api_availability_error_ratio30m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[30m]))
+            /
+            sum(rate(trident_api_http_requests_total[30m]))
+          )
+      - record: trident:api_availability_error_ratio6h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[6h]))
+            /
+            sum(rate(trident_api_http_requests_total[6h]))
+          )
+
+      # Fast burn: consuming the monthly 0.5% budget at 14.4x (~2 days to exhaustion)
+      - alert: APIAvailabilityFastBurn
+        expr: |
+          trident:api_availability_error_ratio5m > (14.4 * 0.005)
+          and
+          trident:api_availability_error_ratio1h > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: page
+          slo: api-availability
+        annotations:
+          summary: "API availability SLO fast-burn — high 5xx error rate"
+          description: >-
+            Over 7.2% of API requests have returned 5xx errors across both
+            the last 5m and 1h windows. At this rate the monthly availability
+            error budget will be exhausted in under 2 days.
+          runbook_url: "docs/runbooks/alerts.md#apiavailabilityfastburn"
+
+      # Slow burn: consuming the monthly 0.5% budget at 6x (~5 days to exhaustion)
+      - alert: APIAvailabilitySlowBurn
+        expr: |
+          trident:api_availability_error_ratio30m > (6 * 0.005)
+          and
+          trident:api_availability_error_ratio6h > (6 * 0.005)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: api-availability
+        annotations:
+          summary: "API availability SLO slow-burn — sustained elevated 5xx rate"
+          description: >-
+            Elevated 5xx error rate has consumed a meaningful share of the
+            availability error budget over the last 30m and 6h windows.
+          runbook_url: "docs/runbooks/alerts.md#apiavailabilityslowburn"
+
+  # ---------------------------------------------------------------------------
+  # SLO 2 — API request latency (target: 95% under 1s, budget 5% = 0.05)
+  # Issue #770, docs/slo.md SLO 2
+  # ---------------------------------------------------------------------------
+  - name: trident-slo-api-latency
+    rules:
+      - record: trident:api_latency_error_ratio5m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{le="1"}[5m]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count[5m]))
+          )
+      - record: trident:api_latency_error_ratio1h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{le="1"}[1h]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count[1h]))
+          )
+      - record: trident:api_latency_error_ratio30m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{le="1"}[30m]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count[30m]))
+          )
+      - record: trident:api_latency_error_ratio6h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{le="1"}[6h]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count[6h]))
+          )
+
+      # Fast burn: 14.4x burn rate (exhausts monthly latency budget in ~2 days)
+      - alert: APILatencyFastBurn
+        expr: |
+          trident:api_latency_error_ratio5m > (14.4 * 0.05)
+          and
+          trident:api_latency_error_ratio1h > (14.4 * 0.05)
+        for: 2m
+        labels:
+          severity: page
+          slo: api-latency
+        annotations:
+          summary: "API latency SLO fast-burn — high request latency"
+          description: >-
+            Over 72% of API requests exceeded 1s duration across both the
+            last 5m and 1h windows. At this rate the monthly latency error
+            budget will be exhausted in under 2 days.
+          runbook_url: "docs/runbooks/alerts.md#apilatencyfastburn"
+
+      # Slow burn: 6x burn rate (exhausts monthly latency budget in ~5 days)
+      - alert: APILatencySlowBurn
+        expr: |
+          trident:api_latency_error_ratio30m > (6 * 0.05)
+          and
+          trident:api_latency_error_ratio6h > (6 * 0.05)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: api-latency
+        annotations:
+          summary: "API latency SLO slow-burn — sustained elevated request latency"
+          description: >-
+            Elevated request latency has consumed a meaningful share of the
+            latency error budget over the last 30m and 6h windows.
+          runbook_url: "docs/runbooks/alerts.md#apilatencyslowburn"

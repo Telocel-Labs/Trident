@@ -780,6 +780,90 @@ bottleneck, indexer restart during high activity).
 **Escalation:** page on-call — this crosses the "API consumers are reading
 meaningfully stale data" threshold.
 
+## APIAvailabilityFastBurn
+
+**Means:** API HTTP 5xx error ratio has exceeded the 99.5% availability budget consumption rate (14.4x burn rate) across both the 5m and 1h windows (docs/slo.md SLO 3). The 28-day error budget will be exhausted in under 2 days if sustained.
+
+**Why this threshold:** 14.4x burn rate on a 99.5% SLO corresponds to an error rate of 7.2% (14.4 * 0.005). Sustained across both windows, this indicates an active outage or critical dependency failure.
+
+**First steps:**
+1. Check `trident_api_http_requests_total{status=~"5.."}` grouped by route and status to identify which endpoint is failing.
+2. Check Postgres and Redis connectivity and error rates.
+3. Check Go API logs for panic stack traces or database connection pool exhaustion.
+
+**Known causes:**
+- Database pool exhaustion or lock contention.
+- Redis unreachable during stream writes.
+- Upstream network partition between API replicas and storage.
+
+**Mitigation:**
+- Roll back recent deploy if error rate began with a release.
+- Scale API replicas or increase DB pool size.
+- Isolate degraded dependent services.
+
+**Escalation:** page on-call immediately — API availability SLO budget is burning rapidly.
+
+## APIAvailabilitySlowBurn
+
+**Means:** API HTTP 5xx error ratio has exceeded the 6x burn rate across both the 30m and 6h windows (docs/slo.md SLO 3).
+
+**Why this threshold:** 6x burn rate on a 99.5% SLO corresponds to a 3% error rate. Sustained across multiple hours, it consumes the monthly budget in ~5 days without necessarily triggering high-threshold fast-burn pages.
+
+**First steps:**
+1. Inspect endpoint error distribution in Grafana API dashboard.
+2. Check for intermittent client payload errors or periodic batch job failures.
+3. Review slow database queries causing intermittent timeouts.
+
+**Known causes:**
+- Intermittent background sync failures.
+- Flapping dependency connections.
+
+**Mitigation:**
+- Investigate and optimize failing query paths or adjust timeouts.
+
+**Escalation:** file on-call ticket for daytime investigation.
+
+## APILatencyFastBurn
+
+**Means:** Over 72% of API requests have exceeded the 1-second latency objective across both the 5m and 1h windows, burning the 95% latency budget at 14.4x (docs/slo.md SLO 2).
+
+**Why this threshold:** A 14.4x burn rate on a 95% objective burns the monthly latency budget in under 2 days. Requiring both 5m and 1h windows ensures transient cold-start spikes do not page.
+
+**First steps:**
+1. Check `trident_api_http_request_duration_seconds` by route to isolate slow endpoints.
+2. Check database CPU, memory, and active query execution times.
+3. Check gRPC backend response times and downstream RPC latency.
+
+**Known causes:**
+- Unindexed database queries under heavy table scan load.
+- Resource saturation on API pods or database nodes.
+- High network latency or lock contention.
+
+**Mitigation:**
+- Check for runaway queries and kill locks if necessary.
+- Scale out API replicas to distribute load.
+
+**Escalation:** page on-call immediately — API latency SLO budget is burning rapidly.
+
+## APILatencySlowBurn
+
+**Means:** Over 30% of API requests have exceeded the 1-second latency objective across both the 30m and 6h windows, burning the 95% latency budget at 6x (docs/slo.md SLO 2).
+
+**Why this threshold:** Sustained elevated latency over 30m/6h burns the monthly budget in ~5 days.
+
+**First steps:**
+1. Review 24-hour latency trends in Grafana.
+2. Inspect cache hit rates and database query plan regressions.
+
+**Known causes:**
+- Slow table bloat or missing indexes on growing event tables.
+- Moderate resource pressure.
+
+**Mitigation:**
+- Optimize database queries or add caching.
+
+**Escalation:** file on-call ticket for daytime investigation.
+
 ## TridentDiskFillingWithin14Days
 
 **Means:** extrapolating the last 6 hours of growth, the Postgres data volume
@@ -1193,3 +1277,15 @@ considers this endpoint close to unusable, not merely degraded.
 
 **Escalation:** `severity: page` — this endpoint is near-unusable by the
 scorer's own floor.
+
+
+## TridentDatabaseBackupFailed
+
+**Means:** `trident_database_backup_last_success_timestamp_seconds` has not advanced in over 26 hours — the daily automated database backup has failed or stalled.
+
+**Why this threshold:** Daily backups run every 24 hours. A 26-hour threshold allows for minor scheduling delays before paging on-call.
+
+**First steps:**
+1. Check the backup job logs (`scripts/backup.sh` or Kubernetes CronJob logs).
+2. Verify Postgres connectivity and available disk space in the backup destination.
+3. Manually trigger a backup to ensure recovery point objective (RPO) is maintained.
