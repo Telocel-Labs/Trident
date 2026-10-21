@@ -878,12 +878,12 @@ func queryContractStatsFromRollup(ctx context.Context, db DBPool, params *valida
 	return stats, populated, nil
 }
 
-// contractStatsRollupRefreshSQL recomputes contract_stats_rollup in full from
-// soroban_events (issue #257). Run periodically rather than incrementally on
-// ingest, so the rollup stays independent of the Rust indexer's write path —
-// see the ticker started in main.go and the freshness note in
-// database/migrations/0019_contract_stats_rollup.sql.
-const contractStatsRollupRefreshSQL = `
+// contractStatsRollupIncrementalSQL incrementally updates contract_stats_rollup
+// for a single network for ledgers in the range (watermark, current_max_ledger]
+// (issue #791). By bounding the query on ledger_sequence, PostgreSQL's partition
+// pruning skips all historical partitions, bounding I/O and query latency
+// to only the new activity indexed since the previous refresh.
+const contractStatsRollupIncrementalSQL = `
 	INSERT INTO contract_stats_rollup (
 		contract_id, network, event_count, contract_event_count, system_event_count,
 		diagnostic_event_count, first_seen_ledger, last_seen_ledger, last_seen_at, refreshed_at
@@ -900,24 +900,148 @@ const contractStatsRollupRefreshSQL = `
 		MAX(ledger_timestamp),
 		NOW()
 	FROM soroban_events
+	WHERE network = $1
+	  AND ledger_sequence > $2
+	  AND ledger_sequence <= $3
 	GROUP BY contract_id, network
 	ON CONFLICT (contract_id, network) DO UPDATE SET
-		event_count            = EXCLUDED.event_count,
-		contract_event_count   = EXCLUDED.contract_event_count,
-		system_event_count     = EXCLUDED.system_event_count,
-		diagnostic_event_count = EXCLUDED.diagnostic_event_count,
-		first_seen_ledger      = EXCLUDED.first_seen_ledger,
-		last_seen_ledger       = EXCLUDED.last_seen_ledger,
-		last_seen_at           = EXCLUDED.last_seen_at,
+		event_count            = contract_stats_rollup.event_count + EXCLUDED.event_count,
+		contract_event_count   = contract_stats_rollup.contract_event_count + EXCLUDED.contract_event_count,
+		system_event_count     = contract_stats_rollup.system_event_count + EXCLUDED.system_event_count,
+		diagnostic_event_count = contract_stats_rollup.diagnostic_event_count + EXCLUDED.diagnostic_event_count,
+		first_seen_ledger      = LEAST(contract_stats_rollup.first_seen_ledger, EXCLUDED.first_seen_ledger),
+		last_seen_ledger       = GREATEST(contract_stats_rollup.last_seen_ledger, EXCLUDED.last_seen_ledger),
+		last_seen_at           = GREATEST(contract_stats_rollup.last_seen_at, EXCLUDED.last_seen_at),
 		refreshed_at           = EXCLUDED.refreshed_at
 `
 
-// RefreshContractStatsRollup recomputes contract_stats_rollup from
-// soroban_events (issue #257). Exported so main.go's periodic ticker and
-// tests can both call it.
+// RefreshContractStatsRollupForNetwork incrementally aggregates contract_stats_rollup
+// for the given network for ledgers above the stored high-water mark (issue #791).
+func RefreshContractStatsRollupForNetwork(ctx context.Context, db SchemaRegistryDB, network string) error {
+	watermarkKey := fmt.Sprintf("contract_stats_watermark:%s", network)
+	var watermark int64 = -1
+
+	// Check if watermark exists in system_state
+	var valStr string
+	err := db.QueryRow(ctx, "SELECT value FROM system_state WHERE key = $1", watermarkKey).Scan(&valStr)
+	if err == nil {
+		if v, parseErr := strconv.ParseInt(valStr, 10, 64); parseErr == nil {
+			watermark = v
+		}
+	}
+
+	// Verify if rollup has any rows for this network. If empty, bootstrap from 0.
+	var hasRollupRows bool
+	if err := db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM contract_stats_rollup WHERE network = $1)", network).Scan(&hasRollupRows); err == nil && !hasRollupRows {
+		watermark = 0
+	} else if watermark < 0 {
+		var maxRollupLedger *int64
+		if err := db.QueryRow(ctx, "SELECT MAX(last_seen_ledger) FROM contract_stats_rollup WHERE network = $1", network).Scan(&maxRollupLedger); err == nil && maxRollupLedger != nil {
+			watermark = *maxRollupLedger
+		} else {
+			watermark = 0
+		}
+	}
+
+	// Find the current highest ledger for this network
+	var currentMaxLedger int64
+	if err := db.QueryRow(ctx, "SELECT COALESCE(MAX(ledger_sequence), 0) FROM soroban_events WHERE network = $1", network).Scan(&currentMaxLedger); err != nil {
+		return fmt.Errorf("query current max ledger for %s: %w", network, err)
+	}
+
+	if currentMaxLedger <= watermark {
+		// Nothing new to aggregate for this network
+		return nil
+	}
+
+	// Execute incremental UPSERT bounded by [watermark + 1, currentMaxLedger]
+	if _, err := db.Exec(ctx, contractStatsRollupIncrementalSQL, network, watermark, currentMaxLedger); err != nil {
+		return fmt.Errorf("incremental rollup upsert for %s (%d -> %d): %w", network, watermark, currentMaxLedger, err)
+	}
+
+	// Advance watermark in system_state
+	upsertWatermarkSQL := `
+		INSERT INTO system_state (key, value, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (key) DO UPDATE SET
+			value = EXCLUDED.value,
+			updated_at = EXCLUDED.updated_at
+	`
+	if _, err := db.Exec(ctx, upsertWatermarkSQL, watermarkKey, strconv.FormatInt(currentMaxLedger, 10)); err != nil {
+		return fmt.Errorf("update watermark for %s: %w", network, err)
+	}
+
+	return nil
+}
+
+// RefreshContractStatsRollup incrementally updates contract_stats_rollup for all
+// active networks (issue #791). It queries only ledgers above each network's
+// recorded high-water mark, preventing full table scans over soroban_events.
 func RefreshContractStatsRollup(ctx context.Context, db SchemaRegistryDB) error {
-	_, err := db.Exec(ctx, contractStatsRollupRefreshSQL)
-	return err
+	networkSet := make(map[string]struct{})
+	defaultNetworks := []string{"testnet", "mainnet", "futurenet", "sandbox"}
+	for _, n := range defaultNetworks {
+		networkSet[n] = struct{}{}
+	}
+
+	rows, err := db.Query(ctx, `
+		SELECT DISTINCT network FROM (
+			SELECT DISTINCT network FROM soroban_events
+			UNION
+			SELECT DISTINCT network FROM contract_stats_rollup
+		) nets WHERE network IS NOT NULL
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var net string
+			if err := rows.Scan(&net); err == nil && net != "" {
+				networkSet[net] = struct{}{}
+			}
+		}
+	}
+
+	for net := range networkSet {
+		if err := RefreshContractStatsRollupForNetwork(ctx, db, net); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReconcileContractStatsAfterRetention prunes orphan contract stats rows and
+// aligns first_seen_ledger with the active retention floor (issue #791).
+func ReconcileContractStatsAfterRetention(ctx context.Context, db SchemaRegistryDB) error {
+	// Remove contract stats rows whose events have been entirely pruned by retention
+	pruneOrphansSQL := `
+		DELETE FROM contract_stats_rollup r
+		WHERE NOT EXISTS (
+			SELECT 1 FROM soroban_events e
+			WHERE e.contract_id = r.contract_id AND e.network = r.network
+		)
+	`
+	if _, err := db.Exec(ctx, pruneOrphansSQL); err != nil {
+		return fmt.Errorf("prune orphan contract_stats_rollup: %w", err)
+	}
+
+	// Reconcile first_seen_ledger if retention floor moved past it
+	reconcileFirstSeenSQL := `
+		UPDATE contract_stats_rollup r
+		SET first_seen_ledger = sub.min_seq
+		FROM (
+			SELECT contract_id, network, MIN(ledger_sequence) AS min_seq
+			FROM soroban_events
+			GROUP BY contract_id, network
+		) sub
+		WHERE r.contract_id = sub.contract_id
+		  AND r.network = sub.network
+		  AND r.first_seen_ledger < sub.min_seq
+	`
+	if _, err := db.Exec(ctx, reconcileFirstSeenSQL); err != nil {
+		return fmt.Errorf("reconcile first_seen_ledger after retention: %w", err)
+	}
+
+	return nil
 }
 
 // getLatestIndexedLedger queries the database for the highest indexed ledger

@@ -560,7 +560,15 @@ func envIntBounded(key string, def, min, max int) int {
 // rollup is populated shortly after startup rather than only after the first
 // tick.
 func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
-	refresh := func() {
+	refreshWithLock := func() {
+		var locked bool
+		if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 101)").Scan(&locked); err != nil || !locked {
+			return
+		}
+		defer func() {
+			_, _ = pool.Exec(context.Background(), "SELECT pg_advisory_unlock(123456789, 101)")
+		}()
+
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		if err := handlers.RefreshContractStatsRollup(refreshCtx, pool); err != nil {
@@ -570,11 +578,7 @@ func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
 
 	// Delay first run, and use advisory lock (issue #731)
 	time.Sleep(60 * time.Second)
-	var locked bool
-	if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 101)").Scan(&locked); err == nil && locked {
-		refresh()
-		_, _ = pool.Exec(ctx, "SELECT pg_advisory_unlock(123456789, 101)")
-	}
+	refreshWithLock()
 
 	ticker := time.NewTicker(contractStatsRollupRefreshInterval)
 	defer ticker.Stop()
@@ -583,11 +587,7 @@ func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var locked bool
-			if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 101)").Scan(&locked); err == nil && locked {
-				refresh()
-				_, _ = pool.Exec(ctx, "SELECT pg_advisory_unlock(123456789, 101)")
-			}
+			refreshWithLock()
 		}
 	}
 }
@@ -701,6 +701,11 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 						break
 					}
 				}
+			}
+
+			// Reconcile contract_stats_rollup after retention cleanup (issue #791)
+			if err := handlers.ReconcileContractStatsAfterRetention(cleanupCtx, pool); err != nil {
+				slog.Warn("retention: contract stats rollup reconcile failed", "err", err)
 			}
 		}
 
