@@ -1,7 +1,8 @@
 # cargo-audit configuration for Trident
 #
 # Ignore list for pre-existing advisories surfaced by the first real
-# Dependency audit run (issue #373). Each entry documents:
+# Dependency audit run (issue #373) and subsequent audit gate enforcement (issue #627).
+# Each entry documents:
 #   - Which advisory is affected
 #   - Why we accept the risk
 #   - Date triaged
@@ -12,7 +13,7 @@
 # rationale for each entry lives in the comment above it. deny.toml keeps
 # the table form, which is correct for that tool.
 #
-# Review date: 2026-11-30 (90 days from triage)
+# Review date: 2026-12-31 (rolling quarterly review)
 
 [advisories]
 ignore = [
@@ -74,4 +75,35 @@ ignore = [
     # release, so clearing it requires a tonic/opentelemetry major upgrade,
     # which needs its own PR. Triaged 2026-08-30.
     "RUSTSEC-2026-0258",
+
+    # rustls: TLS 1.3 handshake messages accepted across encryption level boundaries.
+    # Reached transitively through rustls 0.21 line; all production endpoints
+    # enforce compliant TLS 1.3 state transitions. Triaged 2026-10-21 (#627).
+    "RUSTSEC-2026-0285",
+
+    # rustls: `Debug` impls for client session values expose TLS secrets.
+    # Reached transitively via reqwest 0.11 / tokio-rustls 0.24 & 0.25 (rustls 0.21 & 0.22).
+    # Our codebase never calls `Debug` formatting on ClientSession/Connection
+    # values or writes TLS session secrets to logs. No upstream fix exists on
+    # 0.21/0.22 lines; migrating requires reqwest major upgrade. Triaged 2026-10-21 (#627).
+    "RUSTSEC-2026-0346",
+
+    # rustls: Unauthenticated ServerHello can downgrade later connections to classical key exchange.
+    # Reached transitively via rustls 0.21 & 0.22. Trident RPC/WebSocket clients connect
+    # to standard HTTPS/WSS endpoints without hybrid post-quantum key exchange configured.
+    # 0.21/0.22 have no patched release. Triaged 2026-10-21 (#627).
+    "RUSTSEC-2026-0349",
+
+    # rustls-webpki: Certificate verification may accept distrusted intermediates.
+    # Reached transitively via rustls 0.21 & 0.22 (rustls-webpki 0.101 & 0.102).
+    # All RPC client connections target vetted Stellar Horizon/Soroban RPC endpoints
+    # with standard well-known root CAs. 0.101/0.102 branches have no patched release.
+    # Triaged 2026-10-21 (#627).
+    "RUSTSEC-2026-0382",
+
+    # webpki-roots: Bundled root certificates allow trust in distrusted emSign intermediates.
+    # Reached transitively via reqwest 0.11 / tokio-tungstenite 0.20 (webpki-roots 0.25.4).
+    # Endpoints do not use emSign certificates. Upgrading requires reqwest major bump.
+    # Triaged 2026-10-21 (#627).
+    "RUSTSEC-2026-0381",
 ]

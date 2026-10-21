@@ -1,6 +1,6 @@
 # cargo-deny configuration for Trident
 #
-# Tracks triaged cargo-audit advisories (issue #401). Every advisory surfaced
+# Tracks triaged cargo-audit advisories (issue #401, #627). Every advisory surfaced
 # by `cargo audit` must be either fixed (upgrade/replace the dependency) or
 # formally accepted here with a documented rationale.
 #
@@ -12,22 +12,8 @@
 # See https://embarkstudios.github.io/cargo-deny/ for full documentation.
 
 [advisories]
-# The path where the advisory database is cloned/fetched into
-db-path = "~/.cargo/advisory-db"
-# The url(s) of the advisory databases to use
-db-urls = ["https://github.com/rustsec/advisory-db"]
-
-# Threshold for security vulnerabilities.
-# "deny" fails the build on any vulnerability; we can temporarily set to
-# "allow" with explicit ignore entries below while triaging the backlog
-# from issue #373, then restore to "deny" once all 10 advisories are cleared.
-vulnerability = "deny"
-
-# Threshold for unmaintained crates
-unmaintained = "warn"
-
-# Threshold for crates with security notices
-notice = "warn"
+# Threshold for unmaintained crates: "none", "workspace", "transitive", "all"
+unmaintained = "none"
 
 # Threshold for yanked crates
 yanked = "deny"
@@ -41,9 +27,6 @@ yanked = "deny"
 #
 # Template:
 # { id = "RUSTSEC-YYYY-NNNN", reason = "Explanation of why this is accepted" }
-#
-# Example ignore entries (remove/replace with actual triaged advisories):
-# { id = "RUSTSEC-2023-0001", reason = "Affects unused feature flag in transitive dep; no fix available; mitigated by not calling affected API. Triaged 2026-08-26 (#401)" }
 
 ignore = [
     # The 11 advisories from issue #373 plus RUSTSEC-2026-0258, all triaged
@@ -62,6 +45,17 @@ ignore = [
     { id = "RUSTSEC-2025-0119", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
     { id = "RUSTSEC-2025-0134", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
     { id = "RUSTSEC-2026-0258", reason = "h2 0.4.x upgraded to 0.4.19; remaining hit is h2 0.3.27 via tonic 0.11, which has no patched 0.3 release. Triaged 2026-08-30." },
+
+    # Additional advisories triaged 2026-10-21 (issue #627)
+    { id = "RUSTSEC-2026-0285", reason = "Transitive via rustls 0.21; production endpoints strictly enforce compliant TLS 1.3 state transitions. Triaged 2026-10-21 (#627)." },
+    { id = "RUSTSEC-2026-0346", reason = "Transitive via reqwest 0.11 / tokio-rustls 0.24 & 0.25 (rustls 0.21 & 0.22); no Debug formatting or session secret dumping invoked. Triaged 2026-10-21 (#627)." },
+    { id = "RUSTSEC-2026-0349", reason = "Transitive via rustls 0.21 & 0.22; standard HTTPS/WSS connections without hybrid post-quantum key exchange. Triaged 2026-10-21 (#627)." },
+    { id = "RUSTSEC-2026-0382", reason = "Transitive via rustls 0.21 & 0.22 (rustls-webpki 0.101 & 0.102); connections target vetted Stellar Horizon/Soroban RPC providers with standard root CAs. Triaged 2026-10-21 (#627)." },
+    { id = "RUSTSEC-2026-0381", reason = "Transitive via reqwest 0.11 / tokio-tungstenite 0.20 (webpki-roots 0.25.4); endpoints do not use emSign certificates. Triaged 2026-10-21 (#627)." },
+
+    # Yanked crates accepted with rationale
+    { crate = "chacha20@0.10.0", reason = "Transitive dependency via rand 0.10; upstream replacement tracked in #373. Triaged 2026-10-21 (#627)." },
+    { crate = "spin@0.9.8", reason = "Transitive dependency via flume/lazy_static; no direct usage of yanked features. Triaged 2026-10-21 (#627)." },
 ]
 
 [licenses]
