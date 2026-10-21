@@ -158,7 +158,14 @@ grpcApi:
     # See migrations.image.tag above for why this defaults to empty rather
     # than "latest" (issue #622).
     tag: ""
-  replicaCount: 1
+  # Multi-replica by default (issue #765): the gRPC API is a long-lived
+  # HTTP/2 connection target for every REST read the Go API serves
+  # (/v1/events, /v1/events/{id}, batch) and for the Go API's own readiness
+  # check, so a single pod made a node drain, OOM kill or rollout take out
+  # every one of those at once. Unlike the indexer (replicaCount: 1 above,
+  # by design — one stateful poll loop), this service is stateless and
+  # horizontally scalable like goApi.
+  replicaCount: 2
   service:
     port: 5000
   env:
@@ -194,6 +201,21 @@ grpcApi:
   affinity: {}
   # Matches the `USER trident` (uid 1001) added to crates/api/Dockerfile.
   securityContextUid: 1001
+  # Keep at least this many gRPC API pods up through a voluntary disruption
+  # (node drain, rollout) — mirrors goApi.podDisruptionBudget below.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # Spread replicas across nodes for the same reason as goApi below.
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+  hpa:
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
 
 # ---------------------------------------------------------------------------
 # Go API — configurable replicas with HPA
