@@ -76,6 +76,14 @@ STELLAR_RPC_URL=https://<your-mainnet-rpc-provider>/<api-key>   # placeholder
 INDEX_DIAGNOSTIC=false
 ```
 
+When deploying on Kubernetes with Helm, pass the dedicated mainnet overlay `helm/trident/values-mainnet.yaml` (issue #676):
+```bash
+helm upgrade --install trident-mainnet helm/trident \
+  -f helm/trident/values.yaml \
+  -f helm/trident/values-mainnet.yaml \
+  --namespace trident-mainnet --create-namespace
+```
+
 The Stellar Development Foundation does not operate a public mainnet Soroban RPC
 for production workloads, so you must source one:
 
