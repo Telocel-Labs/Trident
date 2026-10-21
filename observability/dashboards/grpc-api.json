@@ -1,0 +1,147 @@
+{
+  "title": "Trident gRPC API Health & RED Metrics",
+  "uid": "trident-grpc-api",
+  "description": "RED metrics (Rate, Errors, Duration), active streaming subscribers, and database connection pool saturation for the internal Rust gRPC API service (crates/api, issue #790).",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "utc",
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "tags": ["trident", "grpc", "api", "observability"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus",
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "gRPC Request Rate (by method)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(trident_grpc_api_requests_total[1m])) by (method)",
+          "legendFormat": "{{method}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "gRPC Error Rate (by method & code)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(trident_grpc_api_errors_total[1m])) by (method, code)",
+          "legendFormat": "{{method}} ({{code}})"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "gRPC Call Latency p95 (by method)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(trident_grpc_api_request_duration_seconds_bucket[5m])) by (le, method))",
+          "legendFormat": "p95 {{method}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Active StreamEvents Subscribers",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "yellow", "value": 500 },
+              { "color": "red", "value": 2000 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"] },
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "trident_grpc_api_active_streams",
+          "legendFormat": "Subscribers"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "gRPC API Postgres DB Pool Utilization",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "trident_grpc_api_db_pool_acquired_connections",
+          "legendFormat": "Acquired (In-Use)"
+        },
+        {
+          "refId": "B",
+          "expr": "trident_grpc_api_db_pool_idle_connections",
+          "legendFormat": "Idle"
+        },
+        {
+          "refId": "C",
+          "expr": "trident_grpc_api_db_pool_size",
+          "legendFormat": "Max Capacity"
+        }
+      ]
+    }
+  ]
+}

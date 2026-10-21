@@ -2859,6 +2859,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".into(),
             },
         );
         let published = relay.publish_pending().await.unwrap();

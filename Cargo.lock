@@ -3995,6 +3995,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

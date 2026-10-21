@@ -72,22 +72,25 @@ and
 
 ## Internal gRPC events backend (`crates/api`)
 
-**Known gap:** `crates/api` is a pure `tonic` gRPC server with no HTTP
-listener, so it has no `/metrics` endpoint of its own today. Call latency and
-error rate for this service are covered *indirectly* from the client side —
-`trident_api_grpc_client_requests_total` /
-`trident_api_grpc_client_request_duration_seconds` above measure every call
-the Go API makes to it, which is the path that actually matters for
-user-facing latency/errors.
-Adding a native `/metrics` endpoint to `crates/api` itself (for
-concurrency/queueing metrics only visible server-side) is a reasonable
-follow-up, but needs a new Cargo dependency and a regenerated `Cargo.lock` —
-left out of this change to avoid hand-editing the lockfile.
+Scrapeable at `GET http://<grpc-api-host>:<METRICS_PORT>/metrics` (default
+port `9092`, set via `GRPC_METRICS_PORT` or `METRICS_PORT`). Defined in
+[`crates/api/src/metrics.rs`](../crates/api/src/metrics.rs).
+
+| Name | Type | Labels | Unit | Meaning |
+|---|---|---|---|---|
+| `trident_grpc_api_requests_total` | counter | `method`, `status` | requests | Cumulative gRPC calls served, labelled by method (`list_events`, `get_event`, `stream_events`) and status code (`OK`, `INVALID_ARGUMENT`, etc.). |
+| `trident_grpc_api_errors_total` | counter | `method`, `code` | errors | Cumulative non-OK gRPC responses, labelled by method and status code name. |
+| `trident_grpc_api_request_duration_seconds` | histogram | `method` | seconds | gRPC request processing latency in seconds, per method. |
+| `trident_grpc_api_active_streams` | gauge | — | subscribers | Number of active server-streaming event subscribers (`StreamEvents`). |
+| `trident_grpc_api_db_pool_size` | gauge | — | connections | Total configured connection capacity of the gRPC API's Postgres pool (`GRPC_API_DB_POOL_SIZE`). |
+| `trident_grpc_api_db_pool_idle_connections` | gauge | — | connections | Idle (available) connections in the gRPC API's Postgres pool. |
+| `trident_grpc_api_db_pool_acquired_connections` | gauge | — | connections | Connections currently in active use by the gRPC API. |
 
 ## Verifying `/metrics` is scrapeable
 
 ```bash
 curl -s http://localhost:9090/metrics | head   # indexer (METRICS_PORT)
+curl -s http://localhost:9092/metrics | head   # gRPC API (GRPC_METRICS_PORT / METRICS_PORT)
 curl -s http://localhost:3000/metrics | head   # Go API (PORT)
 ```
 
