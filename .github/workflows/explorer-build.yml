@@ -53,6 +53,15 @@ jobs:
         working-directory: explorer
         run: npm install --legacy-peer-deps
 
+      - name: Verify build fails without TRIDENT_MAINNET_SOROBAN_RPC_URL (issue #785)
+        working-directory: explorer
+        run: |
+          if npm run build; then
+            echo "Expected build to fail without TRIDENT_MAINNET_SOROBAN_RPC_URL, but it succeeded"
+            exit 1
+          fi
+          echo "Build failed as expected when TRIDENT_MAINNET_SOROBAN_RPC_URL is missing"
+
       - name: Type-check
         working-directory: explorer
         # astro check has pre-existing, unrelated failures in
@@ -60,6 +69,8 @@ jobs:
         # separately) — this job checks the build, which is the specific
         # "breaks loudly" signal #520 asks for; a full green astro check
         # across the whole package is a separate concern.
+        env:
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
         run: npm run build
 
       - name: Verify the built server actually starts
@@ -67,6 +78,7 @@ jobs:
         env:
           TRIDENT_TESTNET_API_URL: https://api.testnet.trident.dev
           TRIDENT_MAINNET_API_URL: https://api.mainnet.trident.dev
+          TRIDENT_MAINNET_SOROBAN_RPC_URL: https://soroban-mainnet.stellar.org
           EXPLORER_API_KEY: ci-smoke-test-key
           PORT: 4321
         run: |

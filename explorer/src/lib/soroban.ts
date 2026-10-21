@@ -2,8 +2,12 @@ import type { Network } from './types';
 
 const TESTNET_RPC =
   import.meta.env.TRIDENT_TESTNET_SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org';
-const MAINNET_RPC =
-  import.meta.env.TRIDENT_MAINNET_SOROBAN_RPC_URL ?? 'https://mainnet.sorobanrpc.com';
+const MAINNET_RPC = import.meta.env.TRIDENT_MAINNET_SOROBAN_RPC_URL;
+if (!MAINNET_RPC || !MAINNET_RPC.trim()) {
+  throw new Error(
+    '[explorer] TRIDENT_MAINNET_SOROBAN_RPC_URL is required but not configured (issue #785).'
+  );
+}
 
 const PROBE_TIMEOUT_MS = 2500;
 // How many recent ledgers to scan for on-chain events when deciding whether a
