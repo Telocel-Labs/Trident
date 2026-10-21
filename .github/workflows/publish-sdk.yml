@@ -374,7 +374,8 @@ jobs:
             fi
             sleep 15
           done
-          echo "::warning::proxy did not serve v${{ inputs.version }} within 150s; it usually appears shortly after."
+          echo "::error::proxy did not serve v${{ inputs.version }} within 150s"
+          exit 1
 
       - name: Dry run — skipped tag and publish
         if: ${{ inputs.dry_run }}

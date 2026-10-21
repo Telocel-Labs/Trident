@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Depo-dev/trident/sdk/go/openapi"
+	"github.com/Telocel-Labs/Trident/sdk/go/openapi"
 )
 
 // Client is the Trident Go Client.

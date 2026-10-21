@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Depo-dev/trident/sdk/go/openapi"
+	"github.com/Telocel-Labs/Trident/sdk/go/openapi"
 )
 
 func TestCreateWebhook(t *testing.T) {
