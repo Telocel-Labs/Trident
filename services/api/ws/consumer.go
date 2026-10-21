@@ -18,7 +18,20 @@ import (
 // copy of the literal that could drift from this one.
 const StreamKey = "trident:events"
 
-const groupName = "trident-api"
+// DefaultGroupName is the base consumer group name for Trident API WebSocket readers.
+const DefaultGroupName = "trident-api"
+
+// consumerGroupName resolves the consumer group name to use for this replica.
+// If WS_CONSUMER_GROUP is set, that explicit group is used. Otherwise, in a
+// multi-replica fan-out deployment, each replica requires its own consumer group
+// so all replicas receive every published event rather than Redis load-balancing
+// messages across them (issue #807).
+func consumerGroupName(consumerName string) string {
+	if g := os.Getenv("WS_CONSUMER_GROUP"); g != "" {
+		return g
+	}
+	return DefaultGroupName + "-" + consumerName
+}
 
 // streamKey is a private alias for StreamKey, kept so this file's many
 // internal references don't all need renaming.
@@ -41,6 +54,7 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 	if consumerName == "" {
 		consumerName = uuid.NewString()
 	}
+	groupName := consumerGroupName(consumerName)
 
 	slog.Info("ws: Redis Streams consumer starting (consumer group)", "stream", streamKey, "group", groupName, "consumer", consumerName)
 
@@ -55,8 +69,18 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 		}
 	}
 
+	// Clean up dynamic consumer group on shutdown to avoid Redis stream metadata accumulation.
+	if os.Getenv("WS_CONSUMER_GROUP") == "" {
+		go func() {
+			<-ctx.Done()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = rdb.XGroupDestroy(cleanupCtx, streamKey, groupName).Err()
+		}()
+	}
+
 	// Run PEL recovery (XAUTOCLAIM) once at startup.
-	recoverPending(ctx, rdb, hub, consumerName)
+	recoverPending(ctx, rdb, hub, groupName, consumerName)
 
 	// Periodic PEL recovery every 30 seconds in background.
 	go func() {
@@ -65,7 +89,7 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 		for {
 			select {
 			case <-ticker.C:
-				recoverPending(ctx, rdb, hub, consumerName)
+				recoverPending(ctx, rdb, hub, groupName, consumerName)
 			case <-ctx.Done():
 				slog.Info("ws: PEL recovery goroutine stopping")
 				return
@@ -151,7 +175,7 @@ func StartConsumer(ctx context.Context, rdb *redis.Client, hub *Hub) {
 
 // recoverPending claims pending messages older than 30s using XAUTOCLAIM and
 // reprocesses them locally so no messages stay stuck in the PEL.
-func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, consumerName string) {
+func recoverPending(ctx context.Context, rdb *redis.Client, hub *Hub, groupName, consumerName string) {
 	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
