@@ -1012,3 +1012,85 @@ following require you to provision them once:
    the new tag.
 5. If a smoke test on `dev` fails, treat the branch as un-promotable until
    fixed — do not cut a `main` PR or tag from a red `dev`.
+
+
+---
+
+## Supply Chain Security & Release Verification
+
+Starting with release builds (issue #780), all Trident container images published to `ghcr.io/telocel-labs/*` are cryptographically signed using Sigstore Cosign in keyless mode (via GitHub Actions OIDC identity) and carry SLSA Build Provenance (Level 3) and SPDX Software Bill of Materials (SBOM) attestations.
+
+### Verification Tools
+
+You can verify images manually or using the provided helper script `scripts/verify-release-signatures.sh`.
+
+#### 1. Automated Verification Script
+
+To verify all images for a given release:
+
+```bash
+# Verify all images for tag v0.2.0
+./scripts/verify-release-signatures.sh --tag v0.2.0
+
+# Verify a single specific container image
+./scripts/verify-release-signatures.sh --image ghcr.io/telocel-labs/trident-indexer:v0.2.0
+
+# Dry-run to inspect verification commands without calling network
+./scripts/verify-release-signatures.sh --tag v0.2.0 --dry-run
+```
+
+#### 2. Manual Cosign Verification
+
+To verify Cosign keyless signatures manually:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp "^https://github.com/Telocel-Labs/Trident/\.github/workflows/release\.yml@refs/tags/v.*$" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  ghcr.io/telocel-labs/trident-indexer:v0.2.0
+```
+
+#### 3. Manual Attestation Verification (SLSA & SBOM)
+
+To verify the GitHub build provenance attestation:
+
+```bash
+gh attestation verify oci://ghcr.io/telocel-labs/trident-indexer:v0.2.0 \
+  --owner Telocel-Labs
+```
+
+To extract and inspect the attached SPDX SBOM:
+
+```bash
+cosign download attestation \
+  --predicate-type "https://spdx.dev/Document" \
+  ghcr.io/telocel-labs/trident-indexer:v0.2.0 \
+  | jq -r .payload | base64 -d | jq .predicate
+```
+
+### Kubernetes Admission Control Enforcement
+
+#### Sigstore Policy Controller (`ClusterImagePolicy`)
+
+To enforce in Kubernetes that only cryptographically signed and attested Trident release images can run:
+
+```yaml
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: trident-image-policy
+spec:
+  images:
+    - glob: "ghcr.io/telocel-labs/trident-*"
+  authorities:
+    - keyless:
+        url: https://fulcio.sigstore.dev
+        identities:
+          - issuer: https://token.actions.githubusercontent.com
+            subjectRegExp: "^https://github.com/Telocel-Labs/Trident/\\.github/workflows/release\\.yml@refs/tags/.*$"
+      ctlog:
+        url: https://rekor.sigstore.dev
+      attestations:
+        - name: slsa-provenance
+          predicateType: https://slsa.dev/provenance/v1
+```

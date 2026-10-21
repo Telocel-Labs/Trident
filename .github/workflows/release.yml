@@ -16,7 +16,8 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build and push multi-platform Docker images in parallel
+  # Build and push multi-platform Docker images in parallel with Cosign signing,
+  # SLSA provenance attestation, and SBOM generation (issue #780).
   # ---------------------------------------------------------------------------
   build-indexer:
     name: Build indexer image
@@ -24,6 +25,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -54,11 +56,42 @@ jobs:
           file: crates/indexer/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer:${{ github.ref_name }}
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+
+      - name: Sign indexer image with Cosign
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1b5fb4a48355702dd90730f5b9bf659e # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@fcb4e339f4d720b0051a0212f3060cb5cfb61972 # v0.16.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer@${{ steps.push.outputs.digest }}
+          artifact-name: trident-indexer-sbom.spdx.json
+          output-file: ./trident-indexer-sbom.spdx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@28d9859f5112f458197779f64bf5015b6d19ebf4 # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: ./trident-indexer-sbom.spdx.json
+          push-to-registry: true
 
   build-grpc-api:
     name: Build gRPC API image
@@ -66,6 +99,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -92,11 +126,42 @@ jobs:
           file: crates/api/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api:${{ github.ref_name }}
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+
+      - name: Sign gRPC API image with Cosign
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1b5fb4a48355702dd90730f5b9bf659e # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@fcb4e339f4d720b0051a0212f3060cb5cfb61972 # v0.16.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api@${{ steps.push.outputs.digest }}
+          artifact-name: trident-grpc-api-sbom.spdx.json
+          output-file: ./trident-grpc-api-sbom.spdx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@28d9859f5112f458197779f64bf5015b6d19ebf4 # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: ./trident-grpc-api-sbom.spdx.json
+          push-to-registry: true
 
   build-go-api:
     name: Build Go API image
@@ -104,6 +169,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -134,6 +200,8 @@ jobs:
           file: services/api/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:${{ github.ref_name }}
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:latest
@@ -144,12 +212,42 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+
+      - name: Sign Go API image with Cosign
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1b5fb4a48355702dd90730f5b9bf659e # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@fcb4e339f4d720b0051a0212f3060cb5cfb61972 # v0.16.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api@${{ steps.push.outputs.digest }}
+          artifact-name: trident-go-api-sbom.spdx.json
+          output-file: ./trident-go-api-sbom.spdx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@28d9859f5112f458197779f64bf5015b6d19ebf4 # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: ./trident-go-api-sbom.spdx.json
+          push-to-registry: true
+
   build-migrate:
     name: Build database migration image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -176,11 +274,42 @@ jobs:
           file: database/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate:${{ github.ref_name }}
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+
+      - name: Sign migration image with Cosign
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate@${{ steps.push.outputs.digest }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1b5fb4a48355702dd90730f5b9bf659e # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@fcb4e339f4d720b0051a0212f3060cb5cfb61972 # v0.16.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate@${{ steps.push.outputs.digest }}
+          artifact-name: trident-migrate-sbom.spdx.json
+          output-file: ./trident-migrate-sbom.spdx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@28d9859f5112f458197779f64bf5015b6d19ebf4 # v1.4.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: ./trident-migrate-sbom.spdx.json
+          push-to-registry: true
 
   # ---------------------------------------------------------------------------
   # Publish TypeScript SDK to npm
@@ -263,6 +392,22 @@ jobs:
             docker pull ghcr.io/${{ env.ORG }}/trident-grpc-api:${{ github.ref_name }}
             docker pull ghcr.io/${{ env.ORG }}/trident-go-api:${{ github.ref_name }}
             docker pull ghcr.io/${{ env.ORG }}/trident-migrate:${{ github.ref_name }}
+            ```
+
+            ### Supply Chain Security & Verification
+
+            All images in this release are signed keylessly with Cosign via Sigstore and include cryptographic SLSA build provenance and SBOM attestations:
+
+            ```bash
+            # Verify signature with Cosign
+            cosign verify \
+              --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/tags/${{ github.ref_name }}$" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              ghcr.io/${{ env.ORG }}/trident-indexer:${{ github.ref_name }}
+
+            # Verify SLSA build provenance with GitHub CLI
+            gh attestation verify oci://ghcr.io/${{ env.ORG }}/trident-indexer:${{ github.ref_name }} \
+              --owner ${{ env.ORG }}
             ```
 
             ## TypeScript SDK
