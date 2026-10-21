@@ -766,4 +766,5 @@ groups:
         annotations:
           summary: "Database backup has not succeeded in over 26 hours"
           description: "Automated PostgreSQL backup job has failed or failed to run, risking data loss."
+          runbook_url: "docs/runbooks/alerts.md#tridentdatabasebackupfailed"
 

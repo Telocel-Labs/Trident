@@ -1,0 +1,70 @@
+rule_files:
+  - burn-rate-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Test 1: API latency fast burn alert fires on simulated latency regression
+  - interval: 1m
+    input_series:
+      - series: 'trident_api_http_request_duration_seconds_bucket{le="1",method="GET",route="/v1/events",status="200"}'
+        values: '0+10x20'
+      - series: 'trident_api_http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/v1/events",status="200"}'
+        values: '0+100x20'
+      - series: 'trident_api_http_request_duration_seconds_count{method="GET",route="/v1/events",status="200"}'
+        values: '0+100x20'
+    alert_rule_test:
+      # At 2m, pending but not yet firing (for: 2m)
+      - eval_time: 2m
+        alertname: APILatencyFastBurn
+        exp_alerts: []
+      # At 4m, fired after being active for 2m
+      - eval_time: 4m
+        alertname: APILatencyFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: api-latency
+            exp_annotations:
+              summary: "API latency SLO fast-burn — high request latency"
+              description: "Over 72% of API requests exceeded 1s duration across both the last 5m and 1h windows. At this rate the monthly latency error budget will be exhausted in under 2 days."
+              runbook_url: "docs/runbooks/alerts.md#apilatencyfastburn"
+
+  # Test 2: API availability fast burn alert fires on elevated 5xx error rate
+  - interval: 1m
+    input_series:
+      - series: 'trident_api_http_requests_total{method="GET",route="/v1/events",status="200"}'
+        values: '0+90x20'
+      - series: 'trident_api_http_requests_total{method="GET",route="/v1/events",status="500"}'
+        values: '0+10x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: APIAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: APIAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: api-availability
+            exp_annotations:
+              summary: "API availability SLO fast-burn — high 5xx error rate"
+              description: "Over 7.2% of API requests have returned 5xx errors across both the last 5m and 1h windows. At this rate the monthly availability error budget will be exhausted in under 2 days."
+              runbook_url: "docs/runbooks/alerts.md#apiavailabilityfastburn"
+
+  # Test 3: Normal healthy traffic does not trigger alerts
+  - interval: 1m
+    input_series:
+      - series: 'trident_api_http_request_duration_seconds_bucket{le="1",method="GET",route="/v1/events",status="200"}'
+        values: '0+99x20'
+      - series: 'trident_api_http_request_duration_seconds_count{method="GET",route="/v1/events",status="200"}'
+        values: '0+100x20'
+      - series: 'trident_api_http_requests_total{method="GET",route="/v1/events",status="200"}'
+        values: '0+100x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: APILatencyFastBurn
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: APIAvailabilityFastBurn
+        exp_alerts: []
