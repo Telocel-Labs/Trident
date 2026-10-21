@@ -67,6 +67,8 @@ pub const RPC_CONSECUTIVE_FAILURES: &str = "trident_indexer_rpc_consecutive_fail
 pub const UNEXPECTED_SCVAL_VARIANT_TOTAL: &str =
     trident_common::scval::UNEXPECTED_SCVAL_VARIANT_TOTAL;
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
+/// Failures in the streamer poll cycle labelled by `failure_class` (issue #631).
+pub const POLL_CYCLE_FAILURES_TOTAL: &str = "trident_indexer_poll_cycle_failures_total";
 
 /// Reconciliation loop (issue #511): passes that completed a full compare of
 /// a settled ledger window against the RPC source.
@@ -349,6 +351,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_CIRCUIT_STATE,
         "Per-endpoint RPC circuit breaker state: 0=closed, 1=open, 2=half-open"
     );
+    describe_counter!(
+        POLL_CYCLE_FAILURES_TOTAL,
+        "Failures in the streamer poll cycle labelled by failure_class (issue #631)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -366,6 +372,24 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(LEDGER_GAPS_DETECTED_TOTAL).increment(0);
     counter!(LEDGER_GAPS_CLOSED_TOTAL).increment(0);
     counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
+    for class in &[
+        "contract_filter_refresh",
+        "contract_spec_persist",
+        "contract_spec_fetch",
+        "get_transaction_failed",
+        "get_transaction_not_found",
+        "get_transaction_missing_xdr",
+        "invocation_metrics_decode",
+        "token_metadata_freshness_query",
+        "token_metadata_resolve",
+        "token_metadata_cache_write",
+        "get_ledgers_failed",
+        "storage_snapshot_fetch",
+        "health_stats_write",
+        "alert_state_read_write",
+    ] {
+        counter!(POLL_CYCLE_FAILURES_TOTAL, "failure_class" => *class).increment(0);
+    }
     counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(0);
     gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(0.0);
     counter!(DEAD_LETTERED_TOTAL).increment(0);
@@ -537,6 +561,10 @@ pub fn record_poll_duration(seconds: f64) {
     histogram!(POLL_DURATION_SECONDS).record(seconds);
 }
 
+pub fn record_poll_cycle_failure(failure_class: &'static str) {
+    counter!(POLL_CYCLE_FAILURES_TOTAL, "failure_class" => failure_class).increment(1);
+}
+
 pub fn record_poll_error() {
     counter!(POLL_ERRORS_TOTAL).increment(1);
 }
@@ -695,4 +723,31 @@ pub fn set_rpc_circuit_state(endpoint: &str, state: &str) {
         _ => 0.0,
     };
     gauge!(RPC_CIRCUIT_STATE, "endpoint" => endpoint.to_string()).set(val);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_poll_cycle_failure_increments_counter() {
+        for class in &[
+            "contract_filter_refresh",
+            "contract_spec_persist",
+            "contract_spec_fetch",
+            "get_transaction_failed",
+            "get_transaction_not_found",
+            "get_transaction_missing_xdr",
+            "invocation_metrics_decode",
+            "token_metadata_freshness_query",
+            "token_metadata_resolve",
+            "token_metadata_cache_write",
+            "get_ledgers_failed",
+            "storage_snapshot_fetch",
+            "health_stats_write",
+            "alert_state_read_write",
+        ] {
+            record_poll_cycle_failure(class);
+        }
+    }
 }

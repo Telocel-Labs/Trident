@@ -1193,3 +1193,32 @@ considers this endpoint close to unusable, not merely degraded.
 
 **Escalation:** `severity: page` — this endpoint is near-unusable by the
 scorer's own floor.
+
+## TridentIndexerPollCycleFailuresSustained
+
+**Means:** `trident_indexer_poll_cycle_failures_total` for a specific `failure_class` has been increasing at a non-zero rate for over 10 minutes (issue #631).
+
+**Why this threshold:** Swallowed failures in the poll cycle (e.g. contract filter reload, token metadata refresh, getTransaction metrics decoding, or health stats persistence) keep the indexer running but cause silent degradation. A 10-minute rate check filters out single transient errors while reliably catching sustained failures.
+
+**First steps:**
+1. Check the `failure_class` label on the alert:
+   - `contract_filter_refresh`: Database query or contract allowlist reload failed.
+   - `contract_spec_fetch` / `contract_spec_persist`: Spec synchronization failed to fetch or persist contract specs.
+   - `get_transaction_failed` / `get_transaction_not_found` / `get_transaction_missing_xdr` / `invocation_metrics_decode`: Invocation metrics ingestion failed for events.
+   - `token_metadata_freshness_query` / `token_metadata_resolve` / `token_metadata_cache_write`: Token metadata resolution pipeline degraded.
+   - `get_ledgers_failed`: RPC `getLedgers` returned empty or failed, leading to empty ledger hashes.
+   - `storage_snapshot_fetch`: Storage balance snapshot querying failed.
+   - `health_stats_write` / `alert_state_read_write`: Database state persistence for health or alerting degraded.
+2. Inspect indexer logs filtering for the corresponding failure class warning message.
+3. Verify database connectivity and RPC provider responsiveness.
+
+## TridentDatabaseBackupFailed
+
+**Means:** `time() - trident_database_backup_last_success_timestamp_seconds > 93600`, indicating automated PostgreSQL backup has not succeeded in over 26 hours.
+
+**Why this threshold:** Daily backups run every 24 hours; 26 hours allows a 2-hour window for backup duration and scheduler jitter before firing.
+
+**First steps:**
+1. Check Kubernetes CronJob or backup job logs (`scripts/backup.sh`).
+2. Verify object storage / destination bucket write permissions and disk space.
+3. Trigger a manual backup run if needed to protect against data loss.
