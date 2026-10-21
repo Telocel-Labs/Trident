@@ -261,6 +261,7 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let sampling_ratio = std::env::var("OTEL_SAMPLING_RATIO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&r| (0.0..=1.0).contains(&r))
         .unwrap_or(0.1);
 
     opentelemetry::global::set_text_map_propagator(

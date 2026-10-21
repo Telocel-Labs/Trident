@@ -125,6 +125,7 @@ impl OutboxRelay {
 
         let mut published_seqs: Vec<i64> = Vec::with_capacity(records.len());
         let mut failure: Option<TridentError> = None;
+        let network = self.config.network.clone();
 
         for record in &records {
             let event = match record.event() {
@@ -167,7 +168,7 @@ impl OutboxRelay {
                 &event,
                 stream_maxlen,
                 Some(&record.event_id.to_string()),
-                &self.config.network,
+                &network,
             )
             .await
             {
