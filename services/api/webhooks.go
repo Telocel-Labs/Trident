@@ -280,29 +280,9 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 			}
 			for _, stream := range entries {
 				for _, message := range stream.Messages {
-					var event webhookEvent
-					if raw, ok := message.Values["event"]; ok {
-						if parsed, err := parseWebhookEvent(raw); err == nil {
-							event = parsed
-						} else {
-							slog.Error("failed to parse webhook event", "err", err)
-							if _, ackErr := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); ackErr != nil {
-								slog.Warn("failed to ack message", "err", ackErr)
-							}
-							continue
-						}
-					} else if raw, ok := message.Values["payload"]; ok {
-						if parsed, err := parseWebhookEvent(raw); err == nil {
-							event = parsed
-						} else {
-							slog.Error("failed to parse webhook payload", "err", err)
-							if _, ackErr := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); ackErr != nil {
-								slog.Warn("failed to ack message", "err", ackErr)
-							}
-							continue
-						}
-					} else {
-						slog.Warn("webhook worker received empty payload", "id", message.ID)
+					event, ok := parseStreamToWebhookEvent(message.Values)
+					if !ok {
+						slog.Warn("webhook worker received unparseable payload", "id", message.ID)
 						if _, ackErr := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); ackErr != nil {
 							slog.Warn("failed to ack message", "err", ackErr)
 						}
@@ -376,6 +356,84 @@ func startWebhookCleanupJob(ctx context.Context, db *sql.DB) {
 			}
 		}
 	}()
+}
+
+
+// parseStreamToWebhookEvent parses an incoming Redis Stream message into a webhookEvent (issue #793).
+// Supports both legacy payload shapes and canonical Indexer top-level KV fields.
+func parseStreamToWebhookEvent(values map[string]any) (webhookEvent, bool) {
+	if raw, ok := values["event"]; ok {
+		if parsed, err := parseWebhookEvent(raw); err == nil {
+			return parsed, true
+		}
+	}
+	if raw, ok := values["payload"]; ok {
+		if parsed, err := parseWebhookEvent(raw); err == nil {
+			return parsed, true
+		}
+	}
+
+	// Canonical Indexer stream schema: top-level fields
+	cidRaw, ok := values["contract_id"]
+	if !ok {
+		return webhookEvent{}, false
+	}
+	cid := webhookRedisString(cidRaw)
+	if cid == "" {
+		return webhookEvent{}, false
+	}
+
+	evID := webhookRedisString(values["id"])
+	if evID == "" {
+		evID = webhookRedisString(values["event_id"])
+	}
+
+	var ledgerSeq int64
+	if s := webhookRedisString(values["ledger_sequence"]); s != "" {
+		ledgerSeq, _ = strconv.ParseInt(s, 10, 64)
+	}
+
+	var topic0 string
+	if tStr := webhookRedisString(values["topics"]); tStr != "" {
+		var topics []string
+		if err := json.Unmarshal([]byte(tStr), &topics); err == nil && len(topics) > 0 {
+			topic0 = topics[0]
+		}
+	}
+
+	var dataMap map[string]any
+	if dStr := webhookRedisString(values["data"]); dStr != "" {
+		if err := json.Unmarshal([]byte(dStr), &dataMap); err != nil {
+			var scalar any
+			if sErr := json.Unmarshal([]byte(dStr), &scalar); sErr == nil {
+				dataMap = map[string]any{"value": scalar}
+			} else {
+				dataMap = map[string]any{"raw": dStr}
+			}
+		}
+	}
+
+	ev := webhookEvent{
+		ID:              evID,
+		ContractID:      cid,
+		LedgerSequence:  ledgerSeq,
+		Topic0:          topic0,
+		Data:            dataMap,
+		TransactionHash: webhookRedisString(values["transaction_hash"]),
+		Network:         webhookRedisString(values["network"]),
+	}
+	return ev, true
+}
+
+func webhookRedisString(val any) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 func parseWebhookEvent(raw any) (webhookEvent, error) {

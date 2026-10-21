@@ -232,3 +232,46 @@ func TestSignWebhookPayloadIsStable(t *testing.T) {
 		t.Fatal("signWebhookPayload should return raw hex, not the sha256= prefixed form")
 	}
 }
+
+func TestParseStreamToWebhookEvent(t *testing.T) {
+	t.Run("canonical Indexer schema", func(t *testing.T) {
+		values := map[string]any{
+			"contract_id":      "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ",
+			"id":               "event-uuid-1234",
+			"network":          "local",
+			"topics":           `["mint","GA1","GB2"]`,
+			"data":             `{"amount":4200000}`,
+			"ledger_sequence":  "9999",
+			"transaction_hash": "tx-hash-5555",
+		}
+		ev, ok := parseStreamToWebhookEvent(values)
+		if !ok {
+			t.Fatal("expected ok=true for canonical Indexer stream entry")
+		}
+		if ev.ID != "event-uuid-1234" {
+			t.Errorf("expected ID=event-uuid-1234, got %s", ev.ID)
+		}
+		if ev.ContractID != "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ" {
+			t.Errorf("expected ContractID match, got %s", ev.ContractID)
+		}
+		if ev.Topic0 != "mint" {
+			t.Errorf("expected Topic0=mint, got %s", ev.Topic0)
+		}
+		if ev.Network != "local" {
+			t.Errorf("expected Network=local, got %s", ev.Network)
+		}
+		if ev.LedgerSequence != 9999 {
+			t.Errorf("expected LedgerSequence=9999, got %d", ev.LedgerSequence)
+		}
+	})
+
+	t.Run("legacy wrapper schema", func(t *testing.T) {
+		values := map[string]any{
+			"event": `{"id":"legacy-evt","contractId":"C1","network":"testnet"}`,
+		}
+		ev, ok := parseStreamToWebhookEvent(values)
+		if !ok || ev.ID != "legacy-evt" {
+			t.Fatalf("expected legacy event parsed, got %+v", ev)
+		}
+	})
+}

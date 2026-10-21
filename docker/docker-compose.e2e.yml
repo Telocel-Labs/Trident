@@ -25,3 +25,11 @@ services:
       POLL_INTERVAL_CEILING_MS: "500"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  api:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grpc-api:
+    ports:
+      - "50051:50051"
