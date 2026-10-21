@@ -83,3 +83,15 @@ readOnlyRootFilesystem: true
 capabilities:
   drop: ["ALL"]
 {{- end }}
+
+{{/*
+ServiceAccount name per component (issue #767).
+Usage: {{ include "trident.serviceAccountName" (dict "root" . "component" "indexer") }}
+*/}}
+{{- define "trident.serviceAccountName" -}}
+{{- if .root.Values.serviceAccount.create -}}
+    {{- printf "%s-%s" (include "trident.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+    {{- default "default" .root.Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}

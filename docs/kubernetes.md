@@ -565,6 +565,19 @@ The Go API exposes two endpoints for Kubernetes' liveness and readiness probes, 
 - **Liveness** — `GET /v1/health` (`failureThreshold: 3`): cheap, no dependency calls, just confirms the process is up. Restarts the container after 3 consecutive failures. Never fails because Postgres/Redis/the gRPC backend is down — restarting the pod doesn't fix an external dependency, so liveness must not conflate "the process is stuck" with "a dependency is unreachable."
 - **Readiness** — `GET /v1/ready` (`failureThreshold: 1`): checks Postgres, Redis, and the gRPC backend concurrently (3s timeout per dependency) and returns 503 if any fail. Removes the pod from the Service load balancer on the first failure for faster traffic isolation.
 
+## NetworkPolicy and ServiceAccount security
+
+By default (`networkPolicy.enabled: true`, `serviceAccount.create: true`), the Helm chart applies zero-trust isolation to pods (issue #767):
+
+1. **Default-Deny Ingress**: All ingress to pods carrying `app.kubernetes.io/name: trident` is blocked by default.
+2. **Explicit Component Ingress**:
+   - `nginx`: Accepts HTTP traffic on port 80.
+   - `go-api`: Accepts traffic exclusively from `nginx` on port 8080 and Prometheus on port 9090.
+   - `grpc-api`: Accepts gRPC traffic exclusively from `go-api` on port 5000 and Prometheus on port 9090. Unrelated pods in the namespace cannot reach gRPC API directly.
+   - `indexer`: Accepts Prometheus metrics scraping (port 9090) and health probes (port 8080); refuses all other pods.
+3. **Egress Controls**: Allows DNS egress (UDP/TCP 53), database (Postgres 5432, Redis 6379), and Stellar RPC (80, 443).
+4. **Per-Component ServiceAccounts**: Dedicated ServiceAccounts are created for `nginx`, `go-api`, `grpc-api`, `indexer`, and `migrate` with `automountServiceAccountToken: false` to ensure no Kubernetes API token is mounted into workload containers.
+
 ## Upgrading
 
 ```bash

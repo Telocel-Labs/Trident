@@ -16,6 +16,8 @@ spec:
         {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 8 }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "trident.serviceAccountName" (dict "root" . "component" "grpc-api") }}
+      automountServiceAccountToken: false
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.grpcApi.securityContextUid) | nindent 8 }}
       containers:

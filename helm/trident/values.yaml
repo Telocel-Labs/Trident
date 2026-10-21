@@ -363,3 +363,31 @@ internalMTLS:
   #   INTERNAL_CLIENT_CERT  - Go API client leaf cert
   #   INTERNAL_CLIENT_KEY   - Go API client private key
   mountPath: /etc/trident/mtls
+
+# ---------------------------------------------------------------------------
+# ServiceAccount (issue #767) — dedicated per-component ServiceAccounts with
+# token automount disabled (automountServiceAccountToken: false).
+# ---------------------------------------------------------------------------
+serviceAccount:
+  # Specifies whether dedicated ServiceAccounts should be created for each component
+  create: true
+  # Annotations to add to each ServiceAccount
+  annotations: {}
+  # Name of an existing ServiceAccount to use if create is false
+  name: ""
+
+# ---------------------------------------------------------------------------
+# NetworkPolicy (issue #767) — restrict traffic between pods in the cluster.
+# By default, denies all ingress and allows only necessary internal traffic:
+#   nginx -> go-api
+#   go-api -> grpc-api
+#   Prometheus -> metrics ports (9090)
+#   All -> Postgres/Redis/DNS egress
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Ingress selector for Prometheus scraping pods (metrics ports 9090)
+  prometheus:
+    # Match labels for pods allowed to scrape metrics
+    matchLabels:
+      app.kubernetes.io/name: prometheus

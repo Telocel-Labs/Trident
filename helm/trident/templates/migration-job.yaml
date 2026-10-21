@@ -39,6 +39,8 @@ spec:
         {{- include "trident.selectorLabels" (dict "root" . "component" "migrate") | nindent 8 }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "trident.serviceAccountName" (dict "root" . "component" "migrate") }}
+      automountServiceAccountToken: false
       restartPolicy: Never
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.migrations.securityContextUid) | nindent 8 }}
