@@ -79,6 +79,10 @@ pub struct Config {
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
     pub health_port: u16,
+    /// Maximum age (seconds) since last heartbeat before /healthz reports stalled (issue #764).
+    pub health_heartbeat_timeout_secs: u64,
+    /// Shared secret required to access /admin/dead-letter (issue #764).
+    pub admin_api_key: Option<String>,
     pub alert_webhook_url: Option<String>,
     pub alert_lag_threshold: u64,
     pub alert_cooldown_minutes: u64,
@@ -398,6 +402,8 @@ impl Config {
         let redis_stream_maxlen = parse_bounded_u64("REDIS_STREAM_MAXLEN", 10_000, 1, 100_000_000);
         let metrics_port = parse_bounded_u64("METRICS_PORT", 9090, 1, 65_535);
         let health_port = parse_bounded_u64("HEALTH_PORT", 8080, 1, 65_535);
+        let health_heartbeat_timeout_secs =
+            parse_bounded_u64("HEALTH_HEARTBEAT_TIMEOUT_SECS", 120, 5, 86_400);
 
         // Collect all parse/range errors at once.
         for (key, result) in [
@@ -451,6 +457,10 @@ impl Config {
             ("REDIS_STREAM_MAXLEN", redis_stream_maxlen.as_ref()),
             ("METRICS_PORT", metrics_port.as_ref()),
             ("HEALTH_PORT", health_port.as_ref()),
+            (
+                "HEALTH_HEARTBEAT_TIMEOUT_SECS",
+                health_heartbeat_timeout_secs.as_ref(),
+            ),
             ("MAX_REORG_DEPTH", max_reorg_depth.as_ref()),
         ] {
             if let Err(e) = result {
@@ -515,6 +525,11 @@ impl Config {
 
         let alert_webhook_url = std::env::var("ALERT_WEBHOOK_URL")
             .ok()
+            .filter(|s| !s.is_empty());
+
+        let admin_api_key = std::env::var("ADMIN_API_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
         // ── Bail if any errors were collected ────────────────────────────────
@@ -595,6 +610,8 @@ impl Config {
             redis_stream_maxlen,
             metrics_port,
             health_port,
+            health_heartbeat_timeout_secs: health_heartbeat_timeout_secs.unwrap(),
+            admin_api_key,
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,

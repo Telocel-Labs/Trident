@@ -91,6 +91,9 @@ jobs:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
         run: cargo test --all -- --test-threads=1
 
+      - name: Verify indexer health server (issue #764)
+        run: bash scripts/test-check-indexer-health.sh
+
       # Issue #416: the proptest suite already runs above as part of `cargo
       # test`, but at its in-file case count. This step re-runs only the parser
       # property tests with a much larger budget so CI does a real (if short)
