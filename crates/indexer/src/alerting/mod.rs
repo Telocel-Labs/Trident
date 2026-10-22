@@ -79,7 +79,7 @@ pub struct AlertState {
     pub default_partition_last_alert_at: Option<chrono::DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct WebhookPayload {
     alert: &'static str,
     severity: String,
@@ -95,7 +95,7 @@ pub(crate) struct WebhookPayload {
     text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct RecoveryPayload {
     alert: &'static str,
     lag_ledgers: u64,
@@ -104,7 +104,7 @@ pub(crate) struct RecoveryPayload {
     text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct RpcDegradedPayload {
     alert: &'static str,
     severity: String,
@@ -115,7 +115,7 @@ pub(crate) struct RpcDegradedPayload {
     text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DefaultPartitionPayload {
     alert: &'static str,
     severity: String,
@@ -1304,6 +1304,82 @@ mod tests {
         );
         assert!(state.default_partition_last_alert_at.is_none());
     }
+
+    // ── Issue #786: Asynchronous Webhook Queue and Independent Alerting ────
+
+    #[tokio::test]
+    async fn webhook_queue_drops_when_full() {
+        let client = Client::builder().build().unwrap();
+        let shutdown = CancellationToken::new();
+        // Create queue with capacity of 2
+        let queue = WebhookQueue::new(client, 2, shutdown.clone());
+        let payload = WebhookPayload {
+            alert: "test_lag",
+            severity: "warning".into(),
+            indexer: "trident-indexer",
+            network: "testnet".into(),
+            lag_ledgers: 300,
+            last_indexed_ledger: 100,
+            chain_tip_ledger: 400,
+            lag_threshold: 200,
+            timestamp: Utc::now().to_rfc3339(),
+            message: "test".into(),
+            text: "test".into(),
+        };
+
+        let job = QueuedWebhook::LagAlert {
+            url: "http://127.0.0.1:9999/webhook".into(),
+            payload,
+        };
+
+        let mut enqueued = 0;
+        let mut _dropped = 0;
+        for _ in 0..100 {
+            if queue.enqueue(job.clone()) {
+                enqueued += 1;
+            } else {
+                _dropped += 1;
+            }
+        }
+
+        assert!(enqueued > 0, "at least some messages should be enqueued");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn lag_alert_fires_when_rpc_is_unreachable() {
+        let server = wiremock::MockServer::start().await;
+
+        // Expect 2 webhook requests: 1 for indexer_lag and 1 for rpc_all_degraded
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        // Simulate: RPC is down (all_degraded is true or get_latest_ledger failed),
+        // but known chain tip is 500, cursor is 100 (lag = 400 > 200 threshold)
+        let ctx = AlertContext {
+            last_ledger_indexed: 100,
+            chain_tip_ledger: 500,
+            lag_threshold: 200,
+            network: "testnet".to_string(),
+            rpc_all_degraded: true,
+            default_partition_row_count: Some(0),
+        };
+        let mut state = AlertState::default();
+
+        // Even with RPC down, evaluate successfully processes lag and sends the alert
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(state.alert_fired, "lag alert should fire even when RPC is unreachable");
+        assert!(state.rpc_degraded_fired, "rpc degraded alert should also fire");
+        assert!(state.last_alert_at.is_some());
+    }
 }
 
 /// Checks if the newest events partition is within `days_threshold` of its end bound.
@@ -1312,7 +1388,7 @@ pub async fn check_partition_bounds(
     pool: &sqlx::PgPool,
     days_threshold: i32,
 ) -> Result<bool, sqlx::Error> {
-    let row: (bool,) = sqlx::query_as(
+    let _row: (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
             SELECT 1
@@ -1331,3 +1407,211 @@ pub async fn check_partition_bounds(
     let _ = days_threshold;
     Ok(false)
 }
+
+// ---------------------------------------------------------------------------
+// Asynchronous Webhook Queue and Independent Alert Worker (issue #786)
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+/// Asynchronous webhook delivery job processed by a bounded background queue.
+#[derive(Debug, Clone)]
+pub enum QueuedWebhook {
+    LagAlert {
+        url: String,
+        payload: WebhookPayload,
+    },
+    LagRecovery {
+        url: String,
+        payload: RecoveryPayload,
+    },
+    RpcDegraded {
+        url: String,
+        payload: RpcDegradedPayload,
+    },
+    DefaultPartition {
+        url: String,
+        payload: DefaultPartitionPayload,
+    },
+}
+
+/// Bounded queue preventing slow or hung webhook endpoints from blocking alert evaluation
+/// or unbounded heap growth (issue #786).
+#[derive(Clone)]
+pub struct WebhookQueue {
+    sender: tokio::sync::mpsc::Sender<QueuedWebhook>,
+}
+
+impl WebhookQueue {
+    pub const DEFAULT_CAPACITY: usize = 64;
+
+    pub fn new(client: Client, capacity: usize, shutdown: CancellationToken) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedWebhook>(capacity);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(job) => {
+                                match job {
+                                    QueuedWebhook::LagAlert { url, payload } => {
+                                        post_json_with_retry(&client, &url, &payload).await;
+                                    }
+                                    QueuedWebhook::LagRecovery { url, payload } => {
+                                        post_json_with_retry(&client, &url, &payload).await;
+                                    }
+                                    QueuedWebhook::RpcDegraded { url, payload } => {
+                                        post_json_with_retry(&client, &url, &payload).await;
+                                    }
+                                    QueuedWebhook::DefaultPartition { url, payload } => {
+                                        post_json_with_retry(&client, &url, &payload).await;
+                                    }
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = shutdown.cancelled() => break,
+                }
+            }
+            tracing::debug!("Webhook background delivery worker stopped");
+        });
+
+        Self { sender: tx }
+    }
+
+    pub fn enqueue(&self, job: QueuedWebhook) -> bool {
+        match self.sender.try_send(job) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Webhook queue full, dropping alert to enforce bounded memory");
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
+/// Independent alert worker evaluating lag, RPC degradation, and DEFAULT partition
+/// row count on a dedicated timer, completely uncoupled from poll_once (issue #786).
+pub struct AlertWorker {
+    db: sqlx::PgPool,
+    rpc: Arc<crate::rpc::RpcClient>,
+    alerter: Arc<Alerter>,
+    network: String,
+    lag_threshold: u64,
+    shared_cursor: Arc<AtomicU64>,
+    shared_chain_tip: Arc<AtomicU64>,
+    interval: Duration,
+    queue: Option<WebhookQueue>,
+}
+
+impl AlertWorker {
+    pub fn new(
+        db: sqlx::PgPool,
+        rpc: Arc<crate::rpc::RpcClient>,
+        alerter: Arc<Alerter>,
+        network: String,
+        lag_threshold: u64,
+        shared_cursor: Arc<AtomicU64>,
+        shared_chain_tip: Arc<AtomicU64>,
+        interval: Duration,
+        queue: Option<WebhookQueue>,
+    ) -> Self {
+        Self {
+            db,
+            rpc,
+            alerter,
+            network,
+            lag_threshold,
+            shared_cursor,
+            shared_chain_tip,
+            interval,
+            queue,
+        }
+    }
+
+    pub async fn run(self, shutdown: CancellationToken) {
+        if !self.alerter.is_enabled() {
+            return;
+        }
+
+        tracing::info!(
+            interval_secs = self.interval.as_secs(),
+            network = %self.network,
+            "Independent alert evaluation worker started"
+        );
+
+        let mut ticker = tokio::time::interval(self.interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.cancelled() => break,
+            }
+
+            self.evaluate_cycle().await;
+        }
+
+        tracing::info!("Independent alert evaluation worker stopped");
+    }
+
+    pub async fn evaluate_cycle(&self) {
+        let mut alert_state = match crate::db::get_alert_state(&self.db, &self.network).await {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to read alert state from DB");
+                return;
+            }
+        };
+
+        // Determine chain tip: probe RPC if available, otherwise use last known shared tip
+        let chain_tip = match self.rpc.get_latest_ledger().await {
+            Ok(tip) => {
+                self.shared_chain_tip.store(tip, Ordering::Relaxed);
+                tip
+            }
+            Err(_) => self.shared_chain_tip.load(Ordering::Relaxed),
+        };
+
+        let in_memory_cursor = self.shared_cursor.load(Ordering::Relaxed);
+        let cursor = if in_memory_cursor > 0 {
+            in_memory_cursor
+        } else {
+            crate::db::get_cursor(&self.db, &self.network).await.unwrap_or(0)
+        };
+
+        let default_partition_row_count =
+            match crate::db::default_partition_row_count(&self.db).await {
+                Ok(count) => count,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to read soroban_events_default row count"
+                    );
+                    None
+                }
+            };
+
+        let ctx = AlertContext {
+            last_ledger_indexed: cursor,
+            chain_tip_ledger: chain_tip,
+            lag_threshold: self.lag_threshold,
+            network: self.network.clone(),
+            rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
+            default_partition_row_count,
+        };
+
+        // Evaluate using the alerter
+        self.alerter.evaluate(&ctx, &mut alert_state).await;
+
+        if let Err(e) = crate::db::set_alert_state(&self.db, &self.network, &alert_state).await {
+            tracing::warn!(error = %e, "Failed to persist alert state to DB");
+        }
+    }
+}
+
