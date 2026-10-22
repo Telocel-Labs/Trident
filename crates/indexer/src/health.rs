@@ -110,11 +110,7 @@ async fn readyz(db: &PgPool, redis_url: &str) -> (u16, &'static str, String) {
             (200, "OK", "ready (redis degraded)\n".into())
         }
     } else {
-        (
-            503,
-            "Service Unavailable",
-            "not ready: db\n".into(),
-        )
+        (503, "Service Unavailable", "not ready: db\n".into())
     }
 }
 

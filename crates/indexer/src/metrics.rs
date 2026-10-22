@@ -46,6 +46,9 @@ pub const PERSIST_DEAD_LETTER_BACKLOG: &str = "trident_indexer_persist_dead_lett
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
+/// Times the RPC provider capped getEvents page size below MAX_EVENTS_PER_POLL (issue #674).
+pub const RPC_PAGE_SIZE_CAP_MISMATCH_TOTAL: &str =
+    "trident_indexer_rpc_page_size_cap_mismatch_total";
 pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_interval_ms";
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
@@ -250,6 +253,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Times the indexer failed over to another RPC endpoint (issue #213)"
     );
     describe_counter!(
+        RPC_PAGE_SIZE_CAP_MISMATCH_TOTAL,
+        "Times the RPC provider capped getEvents page size below MAX_EVENTS_PER_POLL (issue #674)"
+    );
+    describe_counter!(
         REORGS_TOTAL,
         "Total number of ledger reorganisations / rollbacks detected and reconciled (issue #196)"
     );
@@ -368,6 +375,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(REORGS_TOTAL).increment(0);
     counter!(RPC_TIMEOUTS_TOTAL).increment(0);
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
+    counter!(RPC_PAGE_SIZE_CAP_MISMATCH_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
     counter!(OUTBOX_UNDECODABLE_TOTAL).increment(0);
@@ -574,6 +582,11 @@ pub fn record_ledger_gaps_closed(count: u64) {
 }
 
 /// Count ledgers permanently skipped by a retained-floor recovery (issue #598).
+/// Increment counter when the RPC provider enforces a page-size cap smaller than MAX_EVENTS_PER_POLL (#674).
+pub fn record_rpc_page_size_cap_mismatch() {
+    counter!(RPC_PAGE_SIZE_CAP_MISMATCH_TOTAL).increment(1);
+}
+
 pub fn record_retained_floor_ledgers_skipped(count: u64) {
     if count > 0 {
         counter!(RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL).increment(count);

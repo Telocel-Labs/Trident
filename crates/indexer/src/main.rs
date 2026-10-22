@@ -326,7 +326,7 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 /// Guarded by advisory lock to run on one replica (issue #731).
 async fn maintain_partitions(pool: PgPool) {
     let mut interval = time::interval(Duration::from_secs(86400)); // Once per day
-    // Delay first run to avoid re-running on every restart/crash-loop
+                                                                   // Delay first run to avoid re-running on every restart/crash-loop
     tokio::time::sleep(Duration::from_secs(60)).await;
     loop {
         // Try to acquire advisory lock
