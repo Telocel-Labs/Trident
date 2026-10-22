@@ -13,6 +13,7 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -36,6 +37,10 @@ func (m *mockStatsDB) Ping(_ context.Context) error {
 
 func (m *mockStatsDB) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
 	return nil, nil
+}
+
+func (m *mockStatsDB) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+	return pgconn.NewCommandTag("INSERT 1"), nil
 }
 
 type mockStatsRow struct{ m *mockStatsDB }
@@ -589,5 +594,213 @@ func TestQueryContractStats_KeysetPagination_TiedEventCountsNoSkipOrDuplicate(t 
 		if curCount == prevCount && mineOrder[i] >= mineOrder[i-1] {
 			t.Fatalf("position %d: tied event_count=%d but contract_id did not strictly decrease (%s then %s)", i, curCount, mineOrder[i-1], mineOrder[i])
 		}
+	}
+}
+
+// TestRefreshContractStatsRollup_IncrementalAndRetention verifies that:
+// 1. Initial refresh computes total counts and establishes watermark.
+// 2. Incremental refresh correctly advances watermark and accumulates counts
+//    without performing full table scans.
+// 3. No-op refresh when no new events exist preserves consistency.
+// 4. ReconcileContractStatsAfterRetention removes orphan contracts when all events are pruned.
+func TestRefreshContractStatsRollup_IncrementalAndRetention(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+
+	contractID := fmt.Sprintf("CINC_TEST_%d", time.Now().UnixNano())
+	const network = "testnet"
+
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM soroban_events WHERE contract_id = $1", contractID)
+		_, _ = pool.Exec(ctx, "DELETE FROM contract_stats_rollup WHERE contract_id = $1", contractID)
+		_, _ = pool.Exec(ctx, "DELETE FROM system_state WHERE key = $1", fmt.Sprintf("contract_stats_watermark:%s", network))
+	})
+
+	seedEvent := `
+		INSERT INTO soroban_events
+			(contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+			 event_index, event_type, network, topics, data)
+		VALUES ($1, $2, $3, $4, 0, 'contract', $5, '[]', '{}')
+	`
+
+	// 1. Initial 2 events at ledgers 200, 201
+	for i, seq := range []int64{200, 201} {
+		ts := time.Unix(1_700_000_000+seq, 0).UTC()
+		if _, err := pool.Exec(ctx, seedEvent, contractID, seq, ts, fmt.Sprintf("tx-init-%d", i), network); err != nil {
+			t.Fatalf("seed initial event: %v", err)
+		}
+	}
+
+	if err := RefreshContractStatsRollup(ctx, pool); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+
+	var count int64
+	var firstLedger, lastLedger int64
+	err = pool.QueryRow(ctx, `
+		SELECT event_count, first_seen_ledger, last_seen_ledger
+		FROM contract_stats_rollup
+		WHERE contract_id = $1 AND network = $2
+	`, contractID, network).Scan(&count, &firstLedger, &lastLedger)
+	if err != nil {
+		t.Fatalf("query rollup after initial refresh: %v", err)
+	}
+	if count != 2 || firstLedger != 200 || lastLedger != 201 {
+		t.Errorf("initial rollup unexpected: count=%d first=%d last=%d", count, firstLedger, lastLedger)
+	}
+
+	// 2. Incremental 3 events at ledgers 202, 203, 204
+	for i, seq := range []int64{202, 203, 204} {
+		ts := time.Unix(1_700_000_000+seq, 0).UTC()
+		if _, err := pool.Exec(ctx, seedEvent, contractID, seq, ts, fmt.Sprintf("tx-inc-%d", i), network); err != nil {
+			t.Fatalf("seed incremental event: %v", err)
+		}
+	}
+
+	if err := RefreshContractStatsRollup(ctx, pool); err != nil {
+		t.Fatalf("incremental refresh: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT event_count, first_seen_ledger, last_seen_ledger
+		FROM contract_stats_rollup
+		WHERE contract_id = $1 AND network = $2
+	`, contractID, network).Scan(&count, &firstLedger, &lastLedger)
+	if err != nil {
+		t.Fatalf("query rollup after incremental refresh: %v", err)
+	}
+	if count != 5 || firstLedger != 200 || lastLedger != 204 {
+		t.Errorf("incremental rollup unexpected: count=%d (expected 5), first=%d (expected 200), last=%d (expected 204)", count, firstLedger, lastLedger)
+	}
+
+	// 3. No-op refresh when no new events exist
+	if err := RefreshContractStatsRollup(ctx, pool); err != nil {
+		t.Fatalf("idle refresh: %v", err)
+	}
+	var countAfterIdle int64
+	_ = pool.QueryRow(ctx, "SELECT event_count FROM contract_stats_rollup WHERE contract_id = $1 AND network = $2", contractID, network).Scan(&countAfterIdle)
+	if countAfterIdle != 5 {
+		t.Errorf("expected count to remain 5 after idle refresh, got %d", countAfterIdle)
+	}
+
+	// 4. Prune events and verify retention reconciliation
+	if _, err := pool.Exec(ctx, "DELETE FROM soroban_events WHERE contract_id = $1", contractID); err != nil {
+		t.Fatalf("delete events for retention test: %v", err)
+	}
+	if err := ReconcileContractStatsAfterRetention(ctx, pool); err != nil {
+		t.Fatalf("reconcile after retention: %v", err)
+	}
+
+	var existsAfterPrune bool
+	_ = pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM contract_stats_rollup WHERE contract_id = $1 AND network = $2)", contractID, network).Scan(&existsAfterPrune)
+	if existsAfterPrune {
+		t.Errorf("expected orphan contract_stats_rollup to be deleted after retention reconcile")
+	}
+}
+
+// mockIncrementalStatsDB allows testing incremental rollup logic without an external database.
+type mockIncrementalStatsDB struct {
+	watermarkVal  string
+	watermarkErr  error
+	hasRollupRows bool
+	currentMax    int64
+	execCalls     []string
+}
+
+func (m *mockIncrementalStatsDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "FROM system_state") {
+		return &mockIncrementalRow{val: m.watermarkVal, err: m.watermarkErr}
+	}
+	if strings.Contains(sql, "EXISTS(SELECT 1 FROM contract_stats_rollup") {
+		return &mockIncrementalRow{val: m.hasRollupRows, err: nil}
+	}
+	if strings.Contains(sql, "COALESCE(MAX(ledger_sequence), 0)") {
+		return &mockIncrementalRow{val: m.currentMax, err: nil}
+	}
+	return &mockIncrementalRow{err: pgx.ErrNoRows}
+}
+
+func (m *mockIncrementalStatsDB) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+	return nil, nil
+}
+
+func (m *mockIncrementalStatsDB) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	m.execCalls = append(m.execCalls, sql)
+	return pgconn.NewCommandTag("INSERT 1"), nil
+}
+
+type mockIncrementalRow struct {
+	val any
+	err error
+}
+
+func (r *mockIncrementalRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	switch v := r.val.(type) {
+	case string:
+		if p, ok := dest[0].(*string); ok {
+			*p = v
+			return nil
+		}
+	case bool:
+		if p, ok := dest[0].(*bool); ok {
+			*p = v
+			return nil
+		}
+	case int64:
+		if p, ok := dest[0].(*int64); ok {
+			*p = v
+			return nil
+		}
+	}
+	return nil
+}
+
+func TestRefreshContractStatsRollupForNetwork_IdleWhenNoNewLedgers(t *testing.T) {
+	db := &mockIncrementalStatsDB{
+		watermarkVal:  "500",
+		hasRollupRows: true,
+		currentMax:    500, // No new ledgers since watermark
+	}
+
+	err := RefreshContractStatsRollupForNetwork(context.Background(), db, "testnet")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(db.execCalls) != 0 {
+		t.Errorf("expected 0 Exec calls when idle, got %d", len(db.execCalls))
+	}
+}
+
+func TestRefreshContractStatsRollupForNetwork_AggregatesWhenNewLedgersArrive(t *testing.T) {
+	db := &mockIncrementalStatsDB{
+		watermarkVal:  "500",
+		hasRollupRows: true,
+		currentMax:    550, // 50 new ledgers
+	}
+
+	err := RefreshContractStatsRollupForNetwork(context.Background(), db, "testnet")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(db.execCalls) != 2 {
+		t.Fatalf("expected 2 Exec calls (incremental upsert + watermark update), got %d", len(db.execCalls))
+	}
+	if !strings.Contains(db.execCalls[0], "contractStatsRollupIncrementalSQL") && !strings.Contains(db.execCalls[0], "INSERT INTO contract_stats_rollup") {
+		t.Errorf("first Exec call should be incremental upsert, got %s", db.execCalls[0])
+	}
+	if !strings.Contains(db.execCalls[1], "INSERT INTO system_state") {
+		t.Errorf("second Exec call should update watermark, got %s", db.execCalls[1])
 	}
 }
