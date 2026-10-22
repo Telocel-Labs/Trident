@@ -1,10 +1,24 @@
 use trident_common::TridentError;
 
+/// Default per-statement timeout (ms) for every database connection.
+pub const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
+/// Default idle-in-transaction session timeout (ms) for every database connection.
+pub const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS: u64 = 10_000;
+
+/// Inclusive lower bound for statement and idle-in-transaction timeouts (ms).
+pub const MIN_TIMEOUT_MS: u64 = 100;
+
+/// Inclusive upper bound for statement and idle-in-transaction timeouts (ms) — 1 hour.
+pub const MAX_TIMEOUT_MS: u64 = 3_600_000;
+
 #[derive(Debug)]
 pub struct Config {
     pub database_url: String,
     pub grpc_addr: String,
     pub mtls: Option<MtlsConfig>,
+    pub statement_timeout_ms: u64,
+    pub idle_in_transaction_timeout_ms: u64,
 }
 
 /// Internal mTLS between the Go API and this gRPC service (issue #320).
@@ -48,6 +62,19 @@ impl Config {
             None
         };
 
+        let statement_timeout_ms = parse_bounded_u64(
+            "DB_STATEMENT_TIMEOUT_MS",
+            DEFAULT_STATEMENT_TIMEOUT_MS,
+            MIN_TIMEOUT_MS,
+            MAX_TIMEOUT_MS,
+        )?;
+        let idle_in_transaction_timeout_ms = parse_bounded_u64(
+            "DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+            DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+            MIN_TIMEOUT_MS,
+            MAX_TIMEOUT_MS,
+        )?;
+
         if !missing.is_empty() {
             return Err(TridentError::config(anyhow::anyhow!(
                 "[trident-api] missing required env vars:\n{}",
@@ -59,6 +86,8 @@ impl Config {
             database_url: database_url.unwrap(),
             grpc_addr: grpc_addr.unwrap(),
             mtls,
+            statement_timeout_ms,
+            idle_in_transaction_timeout_ms,
         })
     }
 }
@@ -69,6 +98,26 @@ fn collect_required<'a>(key: &'a str, missing: &mut Vec<&'a str>) -> Option<Stri
         _ => {
             missing.push(key);
             None
+        }
+    }
+}
+
+fn parse_bounded_u64(key: &str, default: u64, min: u64, max: u64) -> Result<u64, TridentError> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(raw) if raw.trim().is_empty() => Ok(default),
+        Ok(raw) => {
+            let v: u64 = raw.trim().parse().map_err(|_| {
+                TridentError::config(anyhow::anyhow!(
+                    "[trident-api] {key} must be a positive integer, got {raw:?}"
+                ))
+            })?;
+            if v < min || v > max {
+                return Err(TridentError::config(anyhow::anyhow!(
+                    "[trident-api] {key} must be between {min} and {max}, got {v}"
+                )));
+            }
+            Ok(v)
         }
     }
 }
@@ -151,6 +200,79 @@ mod tests {
                 assert_eq!(cfg.database_url, "postgres://localhost/trident");
                 assert_eq!(cfg.grpc_addr, "0.0.0.0:50051");
                 assert!(cfg.mtls.is_none());
+                assert_eq!(cfg.statement_timeout_ms, DEFAULT_STATEMENT_TIMEOUT_MS);
+                assert_eq!(
+                    cfg.idle_in_transaction_timeout_ms,
+                    DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn timeouts_custom_valid_values() {
+        with_env(
+            &[
+                ("DATABASE_URL", "postgres://localhost/trident"),
+                ("GRPC_ADDR", "0.0.0.0:50051"),
+                ("DB_STATEMENT_TIMEOUT_MS", "5000"),
+                ("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "2500"),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.statement_timeout_ms, 5000);
+                assert_eq!(cfg.idle_in_transaction_timeout_ms, 2500);
+            },
+        );
+    }
+
+    #[test]
+    fn timeout_below_min_errors() {
+        with_env(
+            &[
+                ("DATABASE_URL", "postgres://localhost/trident"),
+                ("GRPC_ADDR", "0.0.0.0:50051"),
+                ("DB_STATEMENT_TIMEOUT_MS", "50"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains("DB_STATEMENT_TIMEOUT_MS"));
+                assert!(msg.contains("must be between"));
+            },
+        );
+    }
+
+    #[test]
+    fn timeout_above_max_errors() {
+        with_env(
+            &[
+                ("DATABASE_URL", "postgres://localhost/trident"),
+                ("GRPC_ADDR", "0.0.0.0:50051"),
+                ("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "4000000"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS"));
+                assert!(msg.contains("must be between"));
+            },
+        );
+    }
+
+    #[test]
+    fn timeout_non_numeric_errors() {
+        with_env(
+            &[
+                ("DATABASE_URL", "postgres://localhost/trident"),
+                ("GRPC_ADDR", "0.0.0.0:50051"),
+                ("DB_STATEMENT_TIMEOUT_MS", "invalid"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains("DB_STATEMENT_TIMEOUT_MS"));
+                assert!(msg.contains("must be a positive integer"));
             },
         );
     }
