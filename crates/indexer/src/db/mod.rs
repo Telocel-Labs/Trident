@@ -1565,28 +1565,41 @@ pub async fn default_partition_row_count(pool: &PgPool) -> Result<Option<i64>, T
     }
 }
 
-/// Read alert state (last_alert_at, alert_fired) from system_state for
-/// `network` (issue #75). Shares the per-network cursor row (issue #600) so
+/// Read alert state (last_alert_at, alert_fired, rpc_degraded_*) from system_state for
+/// `network` (issue #75, issue #632). Shares the per-network cursor row (issue #600) so
 /// each network's lag-alert state is independent too.
 pub async fn get_alert_state(
     pool: &PgPool,
     network: &str,
 ) -> Result<crate::alerting::AlertState, TridentError> {
-    let row: (Option<chrono::DateTime<chrono::Utc>>, bool) =
-        sqlx::query_as("SELECT last_alert_at, alert_fired FROM system_state WHERE key = $1")
-            .bind(cursor_key(network))
-            .fetch_one(pool)
-            .await
-            .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_alert_state")))?;
+    let row: (
+        Option<chrono::DateTime<chrono::Utc>>,
+        bool,
+        Option<chrono::DateTime<chrono::Utc>>,
+        bool,
+    ) = sqlx::query_as(
+        r#"
+        SELECT last_alert_at,
+               alert_fired,
+               rpc_degraded_last_alert_at,
+               rpc_degraded_fired
+        FROM system_state
+        WHERE key = $1
+        "#,
+    )
+    .bind(cursor_key(network))
+    .fetch_one(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_alert_state")))?;
 
     Ok(crate::alerting::AlertState {
         last_alert_at: row.0,
         alert_fired: row.1,
-        rpc_degraded_fired: false,
-        rpc_degraded_last_alert_at: None,
-        // Not persisted, same as rpc_degraded_* above (issue #605): re-derived
-        // fresh from soroban_events_default_partition_status every poll cycle
-        // by the caller, via default_partition_row_count, rather than round
+        rpc_degraded_fired: row.3,
+        rpc_degraded_last_alert_at: row.2,
+        // Not persisted (issue #605): re-derived fresh from
+        // soroban_events_default_partition_status every poll cycle by the
+        // caller, via default_partition_row_count, rather than round
         // tripping through system_state.
         default_partition_fired: false,
         default_partition_last_alert_at: None,
@@ -1594,7 +1607,7 @@ pub async fn get_alert_state(
 }
 
 /// Persist alert state back to system_state after an alerting evaluation for
-/// `network` (issue #75, issue #600).
+/// `network` (issue #75, issue #600, issue #632).
 pub async fn set_alert_state(
     pool: &PgPool,
     network: &str,
@@ -1603,14 +1616,18 @@ pub async fn set_alert_state(
     sqlx::query(
         r#"
         UPDATE system_state
-        SET last_alert_at = $1,
-            alert_fired   = $2,
-            updated_at    = NOW()
-        WHERE key = $3
+        SET last_alert_at              = $1,
+            alert_fired                = $2,
+            rpc_degraded_last_alert_at = $3,
+            rpc_degraded_fired         = $4,
+            updated_at                 = NOW()
+        WHERE key = $5
         "#,
     )
     .bind(state.last_alert_at)
     .bind(state.alert_fired)
+    .bind(state.rpc_degraded_last_alert_at)
+    .bind(state.rpc_degraded_fired)
     .bind(cursor_key(network))
     .execute(pool)
     .await
