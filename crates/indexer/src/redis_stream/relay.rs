@@ -117,7 +117,9 @@ impl OutboxRelay {
 
     /// Publish one bounded batch. Returns how many events reached Redis.
     pub async fn publish_pending(&mut self) -> Result<usize, TridentError> {
+        let acquire_start = std::time::Instant::now();
         let records = outbox::fetch_unpublished(&self.db, self.config.batch_size).await?;
+        crate::metrics::record_db_pool_acquire_wait("relay", acquire_start.elapsed().as_secs_f64());
         if records.is_empty() {
             self.report_backlog(0).await;
             return Ok(0);
@@ -154,6 +156,7 @@ impl OutboxRelay {
             };
 
             let stream_maxlen = self.config.stream_maxlen;
+            let network = self.config.network.clone();
             let conn = match self.ensure_redis().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -167,7 +170,7 @@ impl OutboxRelay {
                 &event,
                 stream_maxlen,
                 Some(&record.event_id.to_string()),
-                &self.config.network,
+                &network,
             )
             .await
             {

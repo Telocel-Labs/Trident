@@ -1312,7 +1312,7 @@ pub async fn check_partition_bounds(
     pool: &sqlx::PgPool,
     days_threshold: i32,
 ) -> Result<bool, sqlx::Error> {
-    let row: (bool,) = sqlx::query_as(
+    let _row: (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
             SELECT 1

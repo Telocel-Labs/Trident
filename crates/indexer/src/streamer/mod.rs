@@ -424,6 +424,7 @@ impl Streamer {
             // even when lag itself still looks fine.
             metrics::record_heartbeat();
             metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
+            metrics::set_db_pool_stats_for_pool("ingest", self.db.size(), self.db.num_idle() as u32);
 
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
@@ -2115,6 +2116,9 @@ mod tests {
             stellar_rpc_url: rpc_url.clone(),
             database_url: db_url.to_string(),
             db_pool_size: 3,
+            db_ingest_pool_size: 3,
+            db_relay_pool_size: 2,
+            db_maintenance_pool_size: 2,
             redis_url: redis_url.to_string(),
             network: "testnet".to_string(),
             max_reorg_depth: 128,
@@ -2866,6 +2870,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
@@ -4391,5 +4396,93 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_maintenance_and_retention_does_not_block_ingest() {
+        use metrics_util::debugging::DebuggingRecorder;
+        use metrics_util::MetricKind;
+
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 2)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(100, 0)))
+            .mount(&server)
+            .await;
+
+        // Dedicated pools: ingest pool and maintenance pool
+        let ingest_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .unwrap();
+
+        let maintenance_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .unwrap();
+
+        reset_db(&ingest_pool).await;
+
+        // Simulate intense concurrent maintenance holding all connections on maintenance_pool
+        let mut maintenance_handles = Vec::new();
+        for _ in 0..2 {
+            let mp = maintenance_pool.clone();
+            maintenance_handles.push(tokio::spawn(async move {
+                let mut conn = mp.acquire().await.unwrap();
+                let _: (i64,) = sqlx::query_as("SELECT pg_sleep(0.3)::text, 1::bigint")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        let config = test_config(&db_url, &redis_url, server.uri());
+        let mut s = Streamer::new(config, ingest_pool).await.unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let start = std::time::Instant::now();
+        let mut cursor = 0u64;
+        let total = s.poll_once(&mut cursor).await.unwrap();
+        let duration = start.elapsed();
+        drop(guard);
+
+        assert_eq!(total, 2, "poll_once should succeed without starvation");
+        assert!(
+            duration < Duration::from_millis(250),
+            "Ingest poll-cycle duration ({:?}) must not be raised by concurrent maintenance load",
+            duration
+        );
+
+        for h in maintenance_handles {
+            h.await.unwrap();
+        }
+
+        // Verify acquire-wait metric is recorded
+        let snapshot = snapshotter.snapshot().into_vec();
+        let acquire_histogram_observed = snapshot.iter().any(|(key, _, _, _)| {
+            key.kind() == MetricKind::Histogram && key.key().name() == metrics::DB_POOL_ACQUIRE_WAIT_SECONDS
+        });
+        assert!(acquire_histogram_observed, "DB pool acquire wait metric must be exported");
+    }
+
+    #[test]
+    fn dedicated_pool_sizes_configured_and_defaulted() {
+        assert_eq!(crate::config::DEFAULT_DB_POOL_SIZE, 10);
+        assert_eq!(crate::config::DEFAULT_DB_INGEST_POOL_SIZE, 5);
+        assert_eq!(crate::config::DEFAULT_DB_RELAY_POOL_SIZE, 3);
+        assert_eq!(crate::config::DEFAULT_DB_MAINTENANCE_POOL_SIZE, 4);
     }
 }
