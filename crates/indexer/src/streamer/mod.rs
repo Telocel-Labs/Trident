@@ -330,13 +330,14 @@ impl Streamer {
 
     /// Recover from a `getEvents` rejection reporting that `cursor` predates
     /// the RPC's retained history, by advancing to the oldest ledger the RPC
-    /// still retains (issue #388). Returns the new cursor value.
+    /// still retains plus a window-scaled margin (issues #388, #598, #720).
+    /// Returns the new cursor value.
     ///
-    /// The span strictly between the old `cursor` and the new `floor` is
+    /// The span strictly between the old `cursor` and the new `cursor` is
     /// permanently lost to live polling the moment the cursor jumps — this
     /// records it durably as a `backfill_jobs` row and increments a
     /// dedicated metric before advancing, so the loss is queryable and
-    /// alertable instead of visible only in a log line (issue #598).
+    /// alertable instead of visible only in a log line (issues #598, #720).
     ///
     /// Takes `db`/`network` explicitly (rather than `&self`) so it can be
     /// exercised directly in a test without spinning up a whole `Streamer`.
@@ -345,10 +346,27 @@ impl Streamer {
         network: &str,
         cursor: u64,
         floor: u64,
+        ceiling: u64,
         source_error: &TridentError,
     ) -> u64 {
+        // page_request_params sends `cursor + 1`. Do NOT anchor exactly at
+        // the floor: the floor advances while the loop sleeps between polls,
+        // so an exact anchor is rejected again next cycle and the streamer
+        // chases the retention edge forever without ingesting anything.
+        //
+        // The margin must scale with the window, not be a flat constant. A
+        // public network retains ~120k ledgers, where skipping 60 is nothing;
+        // a fresh CI chain has a few hundred total, where skipping 60
+        // discards most of the history — including, in the E2E suite, the mint
+        // event the test then waits for. 1% of the window bounded to [1, 60]
+        // stays clear of the pruning edge on a live network while giving up
+        // almost nothing on a short chain.
+        let window = ceiling.saturating_sub(floor);
+        let margin = (window / 100).clamp(1, 60);
+        let new_cursor = floor.saturating_sub(1).saturating_add(margin);
+
         let skipped_from = cursor + 1;
-        let skipped_to = floor.saturating_sub(1);
+        let skipped_to = new_cursor;
 
         if skipped_from <= skipped_to {
             let gap = db::LedgerGap {
@@ -366,12 +384,11 @@ impl Streamer {
             metrics::record_retained_floor_ledgers_skipped(skipped_to - skipped_from + 1);
         }
 
-        // page_request_params sends `cursor + 1`, so store floor - 1 to make
-        // the next request anchor exactly at the oldest retained ledger.
-        let new_cursor = floor.saturating_sub(1);
         tracing::warn!(
             error = %source_error,
             retained_floor = floor,
+            retained_ceiling = ceiling,
+            margin,
             cursor = new_cursor,
             skipped_from,
             skipped_to,
@@ -494,36 +511,15 @@ impl Streamer {
                                 // starts inside the retained window.
                                 match parse_retained_floor(&e.to_string()) {
                                     Some((floor, ceiling)) if cursor < floor.saturating_sub(1) => {
-                                        // page_request_params sends `cursor + 1`. Do
-                                        // NOT anchor exactly at the floor: the floor
-                                        // advances while the loop sleeps between
-                                        // polls, so an exact anchor is rejected again
-                                        // next cycle and the streamer chases the
-                                        // retention edge forever without ingesting
-                                        // anything.
-                                        //
-                                        // The margin must scale with the window, not
-                                        // be a flat constant. A public network
-                                        // retains ~120k ledgers, where skipping 60 is
-                                        // nothing; a fresh CI chain has a few hundred
-                                        // total, where skipping 60 discards most of
-                                        // the history — including, in the E2E suite,
-                                        // the mint event the test then waits for.
-                                        // 1% of the window bounded to [1, 60] stays
-                                        // clear of the pruning edge on a live network
-                                        // while giving up almost nothing on a short
-                                        // chain.
-                                        let window = ceiling.saturating_sub(floor);
-                                        let margin = (window / 100).clamp(1, 60);
-                                        cursor = floor.saturating_sub(1).saturating_add(margin);
-                                        tracing::warn!(
-                                            error = %e,
-                                            retained_floor = floor,
-                                            retained_ceiling = ceiling,
-                                            margin,
+                                        cursor = Self::recover_retained_floor(
+                                            &self.db,
+                                            &self.config.network,
                                             cursor,
-                                            "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
-                                        );
+                                            floor,
+                                            ceiling,
+                                            &e,
+                                        )
+                                        .await;
                                     }
                                     _ => {
                                         tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
@@ -1883,9 +1879,9 @@ mod tests {
         assert_eq!(recovery_cursor(floor, ceiling), 7);
     }
 
-    /// #598: a retained-floor recovery must durably record the ledgers it
-    /// skips as a backfill_jobs row, not just a log line, so the range is
-    /// queryable and a backfill can target it afterwards.
+    /// #598, #720: a retained-floor recovery must durably record the ledgers it
+    /// skips (including the window-scaled margin) as a backfill_jobs row, not just
+    /// a log line, so the range is queryable and a backfill can target it afterwards.
     #[tokio::test]
     async fn recover_retained_floor_enqueues_the_skipped_range_as_a_backfill_job() {
         let db_url = match std::env::var("TEST_DATABASE_URL") {
@@ -1903,16 +1899,24 @@ mod tests {
 
         let old_cursor = 100u64;
         let floor = 151u64; // RPC retains from 151 onward.
+        let ceiling = 999u64;
         let source_error = TridentError::rpc(anyhow::anyhow!(
             "getEvents: RPC error -32600: startLedger must be within the ledger range: 151 - 999"
         ));
 
-        let new_cursor =
-            Streamer::recover_retained_floor(&pool, &network, old_cursor, floor, &source_error)
-                .await;
+        // Window = 999 - 151 = 848. Margin = (848 / 100).clamp(1, 60) = 8.
+        // new_cursor = 151 - 1 + 8 = 158.
+        let new_cursor = Streamer::recover_retained_floor(
+            &pool,
+            &network,
+            old_cursor,
+            floor,
+            ceiling,
+            &source_error,
+        )
+        .await;
 
-        // floor - 1, so the next poll's cursor + 1 lands exactly on the floor.
-        assert_eq!(new_cursor, 150);
+        assert_eq!(new_cursor, 158);
 
         let row: (i64, i64, String) = sqlx::query_as(
             "SELECT from_ledger, to_ledger, status FROM backfill_jobs WHERE network = $1",
@@ -1922,11 +1926,9 @@ mod tests {
         .await
         .expect("the skipped range must be queryable as a backfill_jobs row");
 
-        // The skipped span is strictly between the old cursor and the new
-        // floor: [101, 150] — ledger 151 itself was never lost, it's where
-        // the next poll resumes.
+        // The skipped span includes the window-scaled margin: [101, 158].
         assert_eq!(row.0, 101, "from_ledger must be old_cursor + 1");
-        assert_eq!(row.1, 150, "to_ledger must be floor - 1");
+        assert_eq!(row.1, 158, "to_ledger must be new_cursor");
         assert_eq!(row.2, "pending");
 
         sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
@@ -1954,13 +1956,16 @@ mod tests {
         let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
         let network = format!("retainedfloortest-{}", uuid::Uuid::new_v4());
 
-        // cursor = 100, floor = 101: the next poll resumes at exactly 101,
-        // nothing in between was skipped.
+        // cursor = 100, floor = 101, ceiling = 101: window = 0, margin = 1.
+        // new_cursor = 101 - 1 + 1 = 101.
+        // cursor = 100, skipped_from = 101, skipped_to = 101.
+        // If cursor = 100 and new_cursor = 100 (e.g. floor = 100, ceiling = 100 -> new_cursor = 100),
+        // skipped_from = 101, skipped_to = 100 -> nothing skipped.
         let source_error = TridentError::rpc(anyhow::anyhow!(
-            "startLedger must be within the ledger range: 101 - 999"
+            "startLedger must be within the ledger range: 100 - 100"
         ));
         let new_cursor =
-            Streamer::recover_retained_floor(&pool, &network, 100, 101, &source_error).await;
+            Streamer::recover_retained_floor(&pool, &network, 100, 100, 100, &source_error).await;
         assert_eq!(new_cursor, 100);
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backfill_jobs WHERE network = $1")
@@ -1971,6 +1976,96 @@ mod tests {
         assert_eq!(
             count.0, 0,
             "no ledgers were skipped, so no job should be enqueued"
+        );
+    }
+
+    /// #720: driving the run loop into a retained-floor error must execute
+    /// recover_retained_floor, inserting a backfill_jobs row for the skipped
+    /// span (including window-scaled margin) and incrementing the metric counter.
+    #[tokio::test]
+    async fn run_loop_retained_floor_recovery_enqueues_backfill_and_increments_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // Mock RPC returning retained floor error on getEvents: floor 151, ceiling 999.
+        let error_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32600,
+                "message": "startLedger must be within the ledger range: 151 - 999"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(error_body))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+
+        // Cursor starts at 0. Window = 999 - 151 = 848, margin = 8.
+        // new_cursor = 151 - 1 + 8 = 158.
+        // skipped_from = 0 + 1 = 1, skipped_to = 158.
+        // skipped_count = 158.
+        let run_handle = tokio::spawn(async move {
+            s.run(shutdown_clone).await
+        });
+
+        // Poll DB for backfill_jobs row until inserted or timeout.
+        let mut job_found = false;
+        let mut row_data = (0i64, 0i64, String::new());
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(row) = sqlx::query_as::<_, (i64, i64, String)>(
+                "SELECT from_ledger, to_ledger, status FROM backfill_jobs WHERE network = $1",
+            )
+            .bind("testnet")
+            .fetch_one(&sqlx::PgPool::connect(&db_url).await.unwrap())
+            .await
+            {
+                row_data = row;
+                job_found = true;
+                break;
+            }
+        }
+
+        // Cancel the run loop so streamer shuts down cleanly.
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_handle).await;
+
+        assert!(job_found, "expected backfill_jobs row to be inserted by run loop");
+        assert_eq!(row_data.0, 1, "from_ledger should be initial_cursor (0) + 1");
+        assert_eq!(row_data.1, 158, "to_ledger should be floor - 1 + margin");
+        assert_eq!(row_data.2, "pending");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counter_val = snapshot
+            .iter()
+            .find(|(key, _, _, _)| {
+                key.kind() == MetricKind::Counter
+                    && key.key().name() == metrics::RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL
+            })
+            .and_then(|(_, _, _, value)| match value {
+                DebugValue::Counter(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        assert_eq!(
+            counter_val, 158,
+            "metric trident_indexer_retained_floor_ledgers_skipped_total must be incremented by skipped ledgers"
         );
     }
 
