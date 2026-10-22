@@ -32,11 +32,12 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     PRIMARY KEY (ledger_sequence, id)
 ) PARTITION BY RANGE (ledger_sequence);
 
--- Indexes — canonical set produced by migrations 0004 and 0009.
--- network isolation (0004)
-CREATE INDEX IF NOT EXISTS idx_soroban_events_network          ON soroban_events (network);
+-- Indexes — canonical set updated by migration 0038 (issue #795).
+-- Keyset pagination indexes (0038, #795):
+CREATE INDEX IF NOT EXISTS idx_soroban_events_keyset           ON soroban_events (network, ledger_sequence, event_index);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_keyset  ON soroban_events (network, contract_id, ledger_sequence, event_index);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_network_contract ON soroban_events (network, contract_id);
--- high-cardinality query patterns (0009)
+
 -- Natural-key uniqueness (migration 0025). ledger_sequence is included only
 -- because PostgreSQL requires the partition key in every unique constraint on
 -- a partitioned table; the protocol-level key is
@@ -48,7 +49,8 @@ ALTER TABLE soroban_events
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_ledger  ON soroban_events (contract_id, ledger_sequence DESC);
 CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic0  ON soroban_events (contract_id, topic_0)
     WHERE topic_0 IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_soroban_events_id_desc          ON soroban_events (id DESC);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic1  ON soroban_events (contract_id, topic_1)
+    WHERE topic_1 IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp ON soroban_events (ledger_timestamp DESC);
 
 -- ---------------------------------------------------------------------------
