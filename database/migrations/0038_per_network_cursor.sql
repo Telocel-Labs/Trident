@@ -1,4 +1,4 @@
--- Migration 0033: namespace the ledger cursor (and the health/alert-state
+-- Migration 0038: namespace the ledger cursor (and the health/alert-state
 -- columns that share its system_state row) per network (issue #600).
 --
 -- system_state had a single 'latest_ledger_cursor' row with no network

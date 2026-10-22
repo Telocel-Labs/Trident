@@ -62,6 +62,8 @@ ignore = [
     { id = "RUSTSEC-2025-0119", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
     { id = "RUSTSEC-2025-0134", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
     { id = "RUSTSEC-2026-0258", reason = "h2 0.4.x upgraded to 0.4.19; remaining hit is h2 0.3.27 via tonic 0.11, which has no patched 0.3 release. Triaged 2026-08-30." },
+    { id = "RUSTSEC-2026-0381", reason = "Transitive; webpki-roots 0.25.4 has no 0.25 patch. Triaged 2026-10-21." },
+    { id = "RUSTSEC-2026-0382", reason = "Transitive; rustls-webpki 0.102.8 has no 0.102 patch (0.103 bumped to 0.103.16). Triaged 2026-10-21." },
 ]
 
 [licenses]

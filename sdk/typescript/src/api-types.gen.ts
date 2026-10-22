@@ -33,7 +33,7 @@ export interface paths {
         };
         /**
          * Readiness check
-         * @description Verifies Postgres, Redis, and the gRPC backend concurrently, each with a 3-second timeout (issue #243). Returns 503 if any dependency check fails. Intended for Kubernetes' readiness probe / Fly's HTTP service check, so a pod with a broken dependency is pulled out of rotation instead of continuing to receive traffic it can't serve.
+         * @description Verifies Postgres, Redis, and the gRPC backend concurrently, each with a 3-second timeout (issue #243). Returns 503 only when a dependency required to serve core traffic (Postgres or the gRPC backend) is unavailable, so a pod that cannot serve is pulled out of rotation. Redis backs fail-open middlewares only (rate limit, cache, idempotency), so a Redis failure is reported as `degraded` with a 200 and does not remove the pod from rotation (issue #758). The body carries generic statuses only; error details are logged server-side.
          */
         get: operations["getReady"];
         put?: never;
@@ -753,16 +753,25 @@ export interface components {
             status: "ok";
         };
         ReadyChecks: {
-            /** @description "ok" or "error: <message>" */
-            postgres: string;
-            /** @description "ok" or "error: <message>" */
-            redis: string;
-            /** @description "ok" or "error: <message>" */
-            grpc_api: string;
+            /**
+             * @description Required dependency. "unavailable" fails readiness.
+             * @enum {string}
+             */
+            postgres: "ok" | "unavailable";
+            /**
+             * @description Optional dependency (middlewares fail open). "degraded" does not fail readiness.
+             * @enum {string}
+             */
+            redis: "ok" | "degraded";
+            /**
+             * @description Required dependency. "unavailable" fails readiness.
+             * @enum {string}
+             */
+            grpc_api: "ok" | "unavailable";
         };
         ReadyResponse: {
             /**
-             * @description "degraded" when any dependency check in `checks` failed.
+             * @description "degraded" when any dependency check in `checks` failed. The HTTP status is 503 only when a required dependency failed.
              * @enum {string}
              */
             status: "ok" | "degraded";
@@ -1283,9 +1292,21 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description Rate limit exceeded for this API key's tier (error.code RATE_LIMITED). Carries the same X-RateLimit-* headers as a successful response (X-RateLimit-Remaining is 0) plus Retry-After. */
+        /** @description Rate limit exceeded for this API key's tier (error.code RATE_LIMITED). Carries the same X-RateLimit-* headers as a successful response (X-RateLimit-Remaining is 0) plus Retry-After. When a daily or monthly request quota is exhausted the error.code is QUOTA_EXCEEDED instead, with X-Quota-{Daily,Monthly}-{Limit,Remaining,Reset} headers (Reset is a Unix timestamp) and Retry-After set to the reset. Concurrent WebSocket/GraphQL/SSE stream caps per key also return 429 RATE_LIMITED. */
         RateLimitExceeded: {
             headers: {
+                /** @description Daily request quota for this key's tier (absent when unlimited). */
+                "X-Quota-Daily-Limit"?: number;
+                /** @description Requests left in the current UTC day. */
+                "X-Quota-Daily-Remaining"?: number;
+                /** @description Unix time the daily quota resets (next UTC midnight). */
+                "X-Quota-Daily-Reset"?: number;
+                /** @description Monthly request quota for this key's tier (absent when unlimited). */
+                "X-Quota-Monthly-Limit"?: number;
+                /** @description Requests left in the current UTC month. */
+                "X-Quota-Monthly-Remaining"?: number;
+                /** @description Unix time the monthly quota resets (first of next UTC month). */
+                "X-Quota-Monthly-Reset"?: number;
                 "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
                 "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
                 "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
@@ -1401,7 +1422,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description All dependencies reachable */
+            /** @description Pod can serve core traffic. `status` is "degraded" and `checks.redis` is "degraded" when only Redis is unreachable. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1411,7 +1432,7 @@ export interface operations {
                 };
             };
             429: components["responses"]["TooManyRequestsIPOnly"];
-            /** @description Either one or more dependencies is unreachable (ReadyResponse body, status "degraded", the failing entry in checks set to "error: ..."), or the server is shedding load under the global concurrency cap (ErrorResponse body, Retry-After header set) — the same outermost load-shedding behavior every endpoint shares. */
+            /** @description Postgres or the gRPC backend is unavailable (ReadyResponse body, status "degraded", the failing entry in checks set to "unavailable"), or the server is shedding load under the global concurrency cap (ErrorResponse body, Retry-After header set) — the same outermost load-shedding behavior every endpoint shares. */
             503: {
                 headers: {
                     "Retry-After": components["headers"]["Retry-After"];

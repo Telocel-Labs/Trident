@@ -167,6 +167,7 @@ pub const LEDGER_GAPS_CLOSED_TOTAL: &str = "trident_indexer_ledger_gaps_closed_t
 /// the moment of loss, in the live poll path, rather than during the
 /// periodic `ledger_metadata` scan, so an operator can alert on it directly
 /// instead of relying on the gap scan to notice later.
+#[allow(dead_code)]
 pub const RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL: &str =
     "trident_indexer_retained_floor_ledgers_skipped_total";
 
@@ -565,6 +566,7 @@ pub fn record_ledger_gaps_closed(count: u64) {
 }
 
 /// Count ledgers permanently skipped by a retained-floor recovery (issue #598).
+#[allow(dead_code)]
 pub fn record_retained_floor_ledgers_skipped(count: u64) {
     if count > 0 {
         counter!(RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL).increment(count);

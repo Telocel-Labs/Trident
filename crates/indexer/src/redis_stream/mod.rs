@@ -1,7 +1,7 @@
 pub mod relay;
 
 use redis::{streams::StreamMaxlen, AsyncCommands};
-use trident_common::{SorobanEvent, TridentError};
+use trident_common::{redis_stream_fields, SorobanEvent, TridentError};
 
 const STREAM_KEY: &str = "trident:events";
 
@@ -50,21 +50,33 @@ fn stream_fields(
     let topics = serde_json::to_string(&event.topics)
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("topics serialise")))?;
     let mut fields = vec![
-        ("contract_id", event.contract_id.clone()),
+        (redis_stream_fields::CONTRACT_ID, event.contract_id.clone()),
         ("network", network.to_string()),
-        ("ledger_sequence", event.ledger_sequence.to_string()),
-        ("ledger_timestamp", event.ledger_timestamp.clone()),
-        ("transaction_hash", event.transaction_hash.clone()),
-        ("event_index", event.event_index.to_string()),
         (
-            "event_type",
+            redis_stream_fields::LEDGER_SEQUENCE,
+            event.ledger_sequence.to_string(),
+        ),
+        (
+            redis_stream_fields::LEDGER_TIMESTAMP,
+            event.ledger_timestamp.clone(),
+        ),
+        (
+            redis_stream_fields::TRANSACTION_HASH,
+            event.transaction_hash.clone(),
+        ),
+        (
+            redis_stream_fields::EVENT_INDEX,
+            event.event_index.to_string(),
+        ),
+        (
+            redis_stream_fields::EVENT_TYPE,
             format!("{:?}", event.event_type).to_lowercase(),
         ),
-        ("topics", topics),
-        ("data", event.data.to_string()),
+        (redis_stream_fields::TOPICS, topics),
+        (redis_stream_fields::DATA, event.data.to_string()),
     ];
     if let Some(id) = event_id {
-        fields.push(("event_id", id.to_string()));
+        fields.push((redis_stream_fields::EVENT_ID, id.to_string()));
         fields.push(("id", id.to_string()));
     }
     Ok(fields)

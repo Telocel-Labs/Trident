@@ -48,8 +48,14 @@ pub struct OutboxRelay {
 }
 
 impl OutboxRelay {
+    #[allow(dead_code)]
     pub fn new(db: PgPool, redis: redis::aio::MultiplexedConnection, config: RelayConfig) -> Self {
-        Self { db, redis_url: String::new(), redis: Some(redis), config }
+        Self {
+            db,
+            redis_url: String::new(),
+            redis: Some(redis),
+            config,
+        }
     }
 
     pub fn new_with_config(
@@ -58,12 +64,19 @@ impl OutboxRelay {
         redis: Option<redis::aio::MultiplexedConnection>,
         config: RelayConfig,
     ) -> Self {
-        Self { db, redis_url, redis, config }
+        Self {
+            db,
+            redis_url,
+            redis,
+            config,
+        }
     }
 
-    async fn ensure_redis(&mut self) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
-        if self.redis.is_some() {
-            return Ok(self.redis.as_mut().unwrap());
+    async fn ensure_redis(
+        &mut self,
+    ) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
+        if let Some(ref mut conn) = self.redis {
+            return Ok(conn);
         }
         // Try to reconnect with backoff logic
         let client = redis::Client::open(self.redis_url.as_str()).map_err(|e| {
@@ -154,6 +167,7 @@ impl OutboxRelay {
             };
 
             let stream_maxlen = self.config.stream_maxlen;
+            let network = self.config.network.clone();
             let conn = match self.ensure_redis().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -167,7 +181,7 @@ impl OutboxRelay {
                 &event,
                 stream_maxlen,
                 Some(&record.event_id.to_string()),
-                &self.config.network,
+                &network,
             )
             .await
             {

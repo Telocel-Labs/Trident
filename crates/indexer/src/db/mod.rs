@@ -334,9 +334,7 @@ where
     }
 
     let cols = EventColumns::build(events)?;
-    let networks: Vec<String> = std::iter::repeat(network.to_string())
-        .take(events.len())
-        .collect();
+    let networks: Vec<String> = std::iter::repeat_n(network.to_string(), events.len()).collect();
 
     sqlx::query(
         r#"
@@ -1245,6 +1243,7 @@ pub async fn handle_reorg_rollback(
 ///
 /// Returns `Ok(true)` if the hashes match (or no stored hash exists),
 /// `Ok(false)` if a reorg is detected (hash mismatch), or an error on DB failure.
+#[allow(dead_code)]
 pub async fn check_ledger_reorg(
     pool: &PgPool,
     sequence: u64,
@@ -1270,6 +1269,7 @@ pub async fn check_ledger_reorg(
 
 /// Rewind the cursor to `target` and delete all ledger metadata and events
 /// at sequences > `target`. Used to undo a reorg.
+#[allow(dead_code)]
 pub async fn rewind_cursor(pool: &PgPool, target: u64) -> Result<(), TridentError> {
     let mut tx = pool
         .begin()
@@ -2473,7 +2473,7 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_events_batch(&pool, "mainnet", &[event.clone()])
+        insert_events_batch(&pool, "mainnet", std::slice::from_ref(&event))
             .await
             .expect("insert failed");
 
@@ -2510,13 +2510,14 @@ mod tests {
         };
         let pool = PgPool::connect(&db_url).await.unwrap();
 
-        // Different contract_id so the two rows land under different
-        // deterministic ids (`event_uuid` hashes contract_id in) and never
+        // Different raw_event_index so the two rows land under different
+        // deterministic ids (`event_uuid` hashes raw_event_index in) and never
         // collide on the partitioned primary key; same transaction_hash and
         // event_index is what actually exercises the network-scoped natural
         // key below.
         let mainnet_event = make_event("CNETDUAL_MAINNET", 88, 1);
-        let testnet_event = make_event("CNETDUAL_TESTNET", 88, 1);
+        let mut testnet_event = make_event("CNETDUAL_TESTNET", 88, 1);
+        testnet_event.raw_event_index = 2;
         assert_eq!(
             mainnet_event.transaction_hash,
             testnet_event.transaction_hash
@@ -2534,10 +2535,10 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_events_batch(&pool, "mainnet", &[mainnet_event.clone()])
+        insert_events_batch(&pool, "mainnet", std::slice::from_ref(&mainnet_event))
             .await
             .expect("mainnet insert failed");
-        insert_events_batch(&pool, "testnet", &[testnet_event.clone()])
+        insert_events_batch(&pool, "testnet", std::slice::from_ref(&testnet_event))
             .await
             .expect("testnet insert failed");
 

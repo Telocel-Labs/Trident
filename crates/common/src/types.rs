@@ -212,3 +212,67 @@ impl std::fmt::Display for Network {
         write!(f, "{}", self.as_str())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #711 — Redis Stream shared schema constants
+// ---------------------------------------------------------------------------
+
+/// Field names published by the indexer to the `trident:events` Redis Stream.
+/// Shared between Rust and Go so the producer and consumer stream schemas cannot drift.
+pub mod redis_stream_fields {
+    pub const CONTRACT_ID: &str = "contract_id";
+    pub const LEDGER_SEQUENCE: &str = "ledger_sequence";
+    pub const LEDGER_TIMESTAMP: &str = "ledger_timestamp";
+    pub const TRANSACTION_HASH: &str = "transaction_hash";
+    pub const EVENT_INDEX: &str = "event_index";
+    pub const EVENT_TYPE: &str = "event_type";
+    pub const TOPICS: &str = "topics";
+    pub const DATA: &str = "data";
+    pub const EVENT_ID: &str = "event_id";
+
+    /// The canonical list of all field names that may appear on the event stream.
+    pub const ALL_FIELDS: &[&str] = &[
+        CONTRACT_ID,
+        LEDGER_SEQUENCE,
+        LEDGER_TIMESTAMP,
+        TRANSACTION_HASH,
+        EVENT_INDEX,
+        EVENT_TYPE,
+        TOPICS,
+        DATA,
+        EVENT_ID,
+    ];
+
+    /// Required fields published for every event.
+    pub const REQUIRED_FIELDS: &[&str] = &[
+        CONTRACT_ID,
+        LEDGER_SEQUENCE,
+        LEDGER_TIMESTAMP,
+        TRANSACTION_HASH,
+        EVENT_INDEX,
+        EVENT_TYPE,
+        TOPICS,
+        DATA,
+    ];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redis_stream_fields::*;
+
+    #[test]
+    fn test_stream_schema_fields_contract() {
+        assert_eq!(CONTRACT_ID, "contract_id");
+        assert_eq!(LEDGER_SEQUENCE, "ledger_sequence");
+        assert_eq!(LEDGER_TIMESTAMP, "ledger_timestamp");
+        assert_eq!(TRANSACTION_HASH, "transaction_hash");
+        assert_eq!(EVENT_INDEX, "event_index");
+        assert_eq!(EVENT_TYPE, "event_type");
+        assert_eq!(TOPICS, "topics");
+        assert_eq!(DATA, "data");
+        assert_eq!(EVENT_ID, "event_id");
+
+        assert_eq!(REQUIRED_FIELDS.len(), 8);
+        assert_eq!(ALL_FIELDS.len(), 9);
+    }
+}

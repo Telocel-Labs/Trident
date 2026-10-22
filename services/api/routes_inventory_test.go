@@ -228,6 +228,7 @@ func TestErrorCodeEnumMatchesHttputil(t *testing.T) {
 		string(httputil.PAYLOAD_TOO_LARGE): true,
 		string(httputil.FORBIDDEN):         true,
 		string(httputil.CONFLICT):          true,
+		string(httputil.API_KEY_EXPIRED):  true,
 	}
 
 	var missingFromSpec, missingFromGo []string

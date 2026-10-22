@@ -1,4 +1,4 @@
-﻿use serde::Deserialize;
+use serde::Deserialize;
 use serde_json::Value as Json;
 // ScVal decoding is shared with the live indexer (issue #506): this crate
 // previously carried a stale copy that predated the exact U256/I256
@@ -117,13 +117,13 @@ impl Parser {
         // `id` suffix is only correct on servers predating #382, which changed
         // the `id` format and made this parse fall through to 0 for every
         // event — colliding them all on the natural key (issue #388).
-        let event_index: u32 = raw.operation_index.unwrap_or_else(|| {
-            raw.id
-                .split('-')
-                .next_back()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0)
-        });
+        let event_index: u32 = raw
+            .id
+            .split('-')
+            .next_back()
+            .and_then(|s| s.parse().ok())
+            .or(raw.operation_index)
+            .unwrap_or(0);
 
         Ok(Some(SorobanEvent {
             contract_id,

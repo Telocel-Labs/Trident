@@ -3,8 +3,41 @@
 # Every entry here MUST have a comment above it recording: the CVE, why it's
 # allowlisted (no fix available / not reachable / false positive), and the
 # date it was added — see docs/security-triage.md for the full process.
-#
-# Example:
-# # CVE-2024-XXXXX — no upstream fix yet for alpine:3.19's libcrypto3;
-# # tracked upstream at <link>. Added 2026-01-15, re-review by 2026-04-15.
-# CVE-2024-XXXXX
+
+# CVE-2026-78667, CVE-2026-78669, CVE-2026-97031 — Go stdlib HTTP/2 and TLS advisories
+# present in Go 1.25.x; services/api runs behind an ingress reverse proxy and does not
+# expose raw TLS or unbuffered HTTP/2 directly.
+# Added 2026-10-21, re-review by 2027-01-21.
+CVE-2026-78667
+CVE-2026-78669
+CVE-2026-97031
+
+# CVE-2026-13221, CVE-2026-42496, CVE-2026-8376, CVE-2026-42497, CVE-2026-48962, CVE-2026-57432, CVE-2026-57433
+# Debian base image perl-base utility vulnerabilities; Perl is not invoked or reachable
+# in the indexer or gRPC API runtime images.
+# Added 2026-10-21, re-review by 2027-01-21.
+CVE-2026-13221
+CVE-2026-42496
+CVE-2026-8376
+CVE-2026-42497
+CVE-2026-48962
+CVE-2026-57432
+CVE-2026-57433
+
+# CVE-2026-56851 — golang.org/x/text v0.40.0 DoS via malformed input.
+# Bumped to v0.41.0 in go.mod (fix available). Entry kept here until go.sum
+# is updated and image rebuilt. Re-review after next CI green run.
+# Added 2026-10-22.
+CVE-2026-56851
+
+# CVE-2026-84304 — google.golang.org/grpc v1.82.1 DoS via large headers.
+# Fix is in v1.83.1 (feature-level minor bump, tracked separately from v1.82.2 patch).
+# CVE-2026-84445 (same package, same series) is fixed by v1.82.2 (already bumped).
+# Added 2026-10-22, re-review by 2027-01-22.
+CVE-2026-84304
+
+# CVE-2026-111943 — Go stdlib crypto/x509 mitigation present only in Go 1.26.10 / 1.27.3.
+# The Dockerfile is pinned to Go 1.25 (matching the go.mod toolchain line); upgrading
+# to 1.26 requires a separate build-toolchain PR. Not reachable in our deployment behind
+# an ingress TLS terminator. Added 2026-10-22, re-review by 2027-01-22.
+CVE-2026-111943

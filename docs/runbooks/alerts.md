@@ -1193,3 +1193,16 @@ considers this endpoint close to unusable, not merely degraded.
 
 **Escalation:** `severity: page` — this endpoint is near-unusable by the
 scorer's own floor.
+
+## TridentDatabaseBackupFailed
+
+**Means:** `time() - trident_database_backup_last_success_timestamp_seconds > 93600` (more than 26 hours since the last successful database backup).
+
+**Why this threshold:** Automated database backups run every 24 hours. A backup not succeeding within 26 hours means the scheduled backup failed or stalled, risking data loss in case of a hardware failure.
+
+**First steps:**
+1. Check Kubernetes CronJob or backup worker logs for errors (e.g. storage bucket permissions, pg_dump exit code).
+2. Manually trigger a backup run to verify if the issue is transient.
+3. Check available storage capacity in the backup bucket/volume.
+
+**Escalation:** `severity: critical` — page on-call to investigate immediately.

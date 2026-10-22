@@ -181,3 +181,33 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	}
 	return nil
 }
+
+// FailoverClient manages multiple Soroban RPC endpoints, trying them in order
+// until one succeeds or all fail.
+type FailoverClient struct {
+clients []*Client
+}
+
+// NewFailoverClient builds a FailoverClient from a list of URLs. It tries each
+// URL in sequence until one succeeds or all fail.
+func NewFailoverClient(urls []string) *FailoverClient {
+clients := make([]*Client, 0, len(urls))
+for _, url := range urls {
+clients = append(clients, NewClientWithHeaders(url, nil))
+}
+return &FailoverClient{clients: clients}
+}
+
+// Call implements the SorobanRPCCaller interface by trying each client in
+// sequence until one succeeds or all fail.
+func (fc *FailoverClient) Call(ctx context.Context, method string, params, result any) error {
+var lastErr error
+for _, client := range fc.clients {
+if err := client.Call(ctx, method, params, result); err == nil {
+return nil
+} else {
+lastErr = err
+}
+}
+return lastErr
+}
