@@ -147,7 +147,7 @@ type gqlSession struct {
 // (issues #223, #317).
 //
 // The handler shares the same Hub as the REST WebSocket endpoint — only one
-// Redis XREADGROUP reader runs per process, regardless of how many
+// Redis XREAD reader runs per process, regardless of how many
 // connections are open.
 //
 // Authentication happens in the connection_init phase via an Authorization
