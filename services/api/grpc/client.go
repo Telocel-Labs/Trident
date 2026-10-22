@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/gen"
@@ -61,9 +62,15 @@ func NewClient(_ context.Context, addr string) (*Client, error) {
 		return nil, fmt.Errorf("failed to build gRPC transport credentials: %w", err)
 	}
 
+	target := addr
+	if !strings.Contains(target, "://") {
+		target = "dns:///" + target
+	}
+
 	conn, err := grpc.NewClient(
-		addr,
+		target,
 		grpc.WithTransportCredentials(transportCreds),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin": {}}]}`),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(10*1024*1024)),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		grpc.WithConnectParams(grpc.ConnectParams{

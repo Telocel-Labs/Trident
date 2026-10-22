@@ -1,0 +1,24 @@
+{{- if .Values.grpcApi.hpa.enabled }}
+# Issue #765: HPA for gRPC API to scale automatically under query load
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "trident.fullname" . }}-grpc-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grpc-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "trident.fullname" . }}-grpc-api
+  minReplicas: {{ .Values.grpcApi.hpa.minReplicas }}
+  maxReplicas: {{ .Values.grpcApi.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.grpcApi.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
