@@ -48,6 +48,7 @@ pub struct OutboxRelay {
 }
 
 impl OutboxRelay {
+    #[allow(dead_code)]
     pub fn new(db: PgPool, redis: redis::aio::MultiplexedConnection, config: RelayConfig) -> Self {
         Self {
             db,
@@ -74,8 +75,8 @@ impl OutboxRelay {
     async fn ensure_redis(
         &mut self,
     ) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
-        if self.redis.is_some() {
-            return Ok(self.redis.as_mut().unwrap());
+        if let Some(ref mut conn) = self.redis {
+            return Ok(conn);
         }
         // Try to reconnect with backoff logic
         let client = redis::Client::open(self.redis_url.as_str()).map_err(|e| {

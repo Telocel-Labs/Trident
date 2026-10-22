@@ -84,4 +84,16 @@ ignore = [
     # Transitive dependency via rustls-webpki 0.102.8; no patch available on 0.102 line.
     # 0.103 line upgraded to 0.103.16. Triaged 2026-10-21.
     "RUSTSEC-2026-0382",
+
+    # rustls 0.21.12: Unauthenticated ServerHello can downgrade later connections to
+    # classical key exchange (loss of post-quantum confidentiality; no auth bypass).
+    # Reached transitively via opentelemetry-otlp -> tonic -> rustls. Fix requires
+    # upgrading to rustls >=0.23.46, a semver-major bump tracked in a separate PR.
+    # Triaged 2026-10-22.
+    "RUSTSEC-2026-0349",
+
+    # rustls 0.21.12: Debug impls for client session values expose TLS secrets.
+    # Same transitive path as RUSTSEC-2026-0349. Upgrading to >=0.23.46 resolves both;
+    # tracked in the same follow-up PR. Triaged 2026-10-22.
+    "RUSTSEC-2026-0346",
 ]

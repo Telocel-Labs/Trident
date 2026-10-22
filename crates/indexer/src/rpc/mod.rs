@@ -512,6 +512,7 @@ fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentErr
     TridentError::rpc(anyhow::Error::new(err).context(context))
 }
 
+#[allow(dead_code)]
 fn rpc_transport_error_redacted(
     err: reqwest::Error,
     context: &'static str,

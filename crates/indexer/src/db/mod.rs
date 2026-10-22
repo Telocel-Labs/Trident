@@ -334,8 +334,7 @@ where
     }
 
     let cols = EventColumns::build(events)?;
-    let networks: Vec<String> = std::iter::repeat(network.to_string())
-        .take(events.len())
+    let networks: Vec<String> = std::iter::repeat_n(network.to_string(), events.len())
         .collect();
 
     sqlx::query(
@@ -1245,6 +1244,7 @@ pub async fn handle_reorg_rollback(
 ///
 /// Returns `Ok(true)` if the hashes match (or no stored hash exists),
 /// `Ok(false)` if a reorg is detected (hash mismatch), or an error on DB failure.
+#[allow(dead_code)]
 pub async fn check_ledger_reorg(
     pool: &PgPool,
     sequence: u64,
@@ -1270,6 +1270,7 @@ pub async fn check_ledger_reorg(
 
 /// Rewind the cursor to `target` and delete all ledger metadata and events
 /// at sequences > `target`. Used to undo a reorg.
+#[allow(dead_code)]
 pub async fn rewind_cursor(pool: &PgPool, target: u64) -> Result<(), TridentError> {
     let mut tx = pool
         .begin()
@@ -2473,7 +2474,7 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_events_batch(&pool, "mainnet", &[event.clone()])
+        insert_events_batch(&pool, "mainnet", std::slice::from_ref(&event))
             .await
             .expect("insert failed");
 
@@ -2535,10 +2536,10 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_events_batch(&pool, "mainnet", &[mainnet_event.clone()])
+        insert_events_batch(&pool, "mainnet", std::slice::from_ref(&mainnet_event))
             .await
             .expect("mainnet insert failed");
-        insert_events_batch(&pool, "testnet", &[testnet_event.clone()])
+        insert_events_batch(&pool, "testnet", std::slice::from_ref(&testnet_event))
             .await
             .expect("testnet insert failed");
 
