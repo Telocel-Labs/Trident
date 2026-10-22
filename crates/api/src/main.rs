@@ -93,8 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%addr, "Trident gRPC server listening");
 
-    let events_service =
-        services::events::EventsServiceImpl::new(db_pool, redis_manager, redis_client);
+    let events_service = services::events::EventsServiceImpl::new(db_pool, redis_manager);
 
     let mut server_builder = tonic::transport::Server::builder();
 

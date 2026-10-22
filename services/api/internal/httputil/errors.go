@@ -20,6 +20,9 @@ const (
 	// key and rotate rather than retry.
 	API_KEY_EXPIRED  ErrorCode = "API_KEY_EXPIRED"
 	RATE_LIMITED     ErrorCode = "RATE_LIMITED"
+// QUOTA_EXCEEDED is returned (429) when a key exhausts its daily or monthly
+// request quota (issue #758), distinct from sliding-window rate limits.
+QUOTA_EXCEEDED   ErrorCode = "QUOTA_EXCEEDED"
 	INVALID_ARGUMENT ErrorCode = "INVALID_ARGUMENT"
 	UNAVAILABLE      ErrorCode = "UNAVAILABLE"
 	INTERNAL         ErrorCode = "INTERNAL"

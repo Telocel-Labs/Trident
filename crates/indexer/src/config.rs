@@ -731,7 +731,11 @@ pub(crate) fn redact_url(url: &str) -> String {
             "/[REDACTED]".to_string()
         };
         format!("{scheme}{redacted_authority}{redacted_path}#{frag}")
-    } else if tail == "/" || tail.is_empty() || scheme.starts_with("postgres") || scheme.starts_with("redis") {
+    } else if tail == "/"
+        || tail.is_empty()
+        || scheme.starts_with("postgres")
+        || scheme.starts_with("redis")
+    {
         format!("{scheme}{redacted_authority}{tail}")
     } else {
         format!("{scheme}{redacted_authority}/[REDACTED]")

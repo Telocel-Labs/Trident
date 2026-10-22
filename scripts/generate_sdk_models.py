@@ -80,7 +80,9 @@ def run_checked(command: list[str], *, capture_output: bool = False) -> str:
     # encoding is pinned rather than left to the platform default: quicktype
     # emits em-dashes from the spec's descriptions, and on a cp1252 default
     # those round-trip as mojibake, so the generated files differ from what
-    # CI produces and the drift check below fails with no real change.
+    # On Windows, use bash -c to run npx
+    if sys.platform == 'win32':
+        command = ['bash', '-c', ' '.join(command)]
     result = subprocess.run(
         command,
         cwd=REPO_ROOT,

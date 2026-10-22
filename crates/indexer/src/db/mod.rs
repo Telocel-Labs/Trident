@@ -334,8 +334,7 @@ where
     }
 
     let cols = EventColumns::build(events)?;
-    let networks: Vec<String> = std::iter::repeat_n(network.to_string(), events.len())
-        .collect();
+    let networks: Vec<String> = std::iter::repeat_n(network.to_string(), events.len()).collect();
 
     sqlx::query(
         r#"

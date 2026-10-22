@@ -1332,4 +1332,3 @@ mod tests {
         assert!(state.default_partition_last_alert_at.is_none());
     }
 }
-

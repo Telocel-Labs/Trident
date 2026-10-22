@@ -35,6 +35,12 @@ type TierDB interface {
 
 // RateLimitConfig configures TieredRateLimit.
 type RateLimitConfig struct {
+// Quotas maps tier names to their daily/monthly request quotas. When nil,
+// quota enforcement is disabled (issue #758).
+Quotas map[string]QuotaConfig
+// QuotaFn increments a quota counter; defaults to a Redis INCR with expiry.
+// Set in tests.
+QuotaFn QuotaCounterFn
 	Redis *redis.Client
 	DB    TierDB
 	Tiers map[string]TierConfig
@@ -287,4 +293,16 @@ func envInt(key string, def int) int {
 		return v
 	}
 	return def
+}
+
+// evictExpired removes all expired entries from the cache. Internal helper
+// used by tests.
+func (tc *TierCache) evictExpired(now time.Time) {
+tc.mu.Lock()
+for k, e := range tc.entries {
+if e.exp.Before(now) {
+delete(tc.entries, k)
+}
+}
+tc.mu.Unlock()
 }

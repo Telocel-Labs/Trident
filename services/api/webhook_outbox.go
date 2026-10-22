@@ -178,7 +178,7 @@ func (s sqlWebhookOutbox) Reschedule(ctx context.Context, id int64, failedAttemp
 }
 
 func (s sqlWebhookOutbox) RecordAttempt(ctx context.Context, item *webhookOutboxItem, attempt int, status string, result webhookDeliveryResult) error {
-	return recordWebhookDelivery(ctx, s.db, item.SubscriptionID, item.EventID, attempt, status, result)
+	return recordWebhookDelivery(ctx, s.db, item.SubscriptionID, item.EventID, attempt, status, result, nil)
 }
 
 // enqueueWebhookEvent queues one delivery per matching subscription. It is

@@ -1,3 +1,5 @@
+-- lint:allow-no-rollback CREATE TABLE IF NOT EXISTS is idempotent; dropping the table would lose queued deliveries
+
 -- webhook_outbox: durable per-subscription delivery queue (issues #747, #748).
 --
 -- The stream worker inserts one row per matching subscription and acks the
