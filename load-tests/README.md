@@ -38,6 +38,7 @@ scripts to match rather than the other way around.
 | `launch-soak.sh` | Combined 24-hour launch soak: ingest volume plus events, batch, stats, and SSE load running together (issue #440) | `BASE_URL=https://staging.example.com API_KEY=<key> ./load-tests/launch-soak.sh` |
 | `chaos-launch.sh` | Launch chaos verification for Postgres, Redis, and optional RPC faults with before/during/after readiness probes (issue #439) | `BASE_URL=http://localhost:3000 COMPOSE_FILE=docker/docker-compose.yml RPC_SERVICE=<rpc-service> ./load-tests/chaos-launch.sh` |
 | `graceful-shutdown-launch.sh` | Rolling SIGTERM verification for API request drain, SSE reconnect behavior, and indexer cursor safety (issue #442) | `BASE_URL=http://localhost:3000 COMPOSE_FILE=docker/docker-compose.yml ./load-tests/graceful-shutdown-launch.sh` |
+| `mainnet_scale_benchmark.py` | Query performance and plan evaluation on tens of millions of events (issue #672) | `python load-tests/mainnet_scale_benchmark.py --scale 10m` |
 
 `API_KEY` is optional for the k6 scripts — every script's checks accept
 either `200` or `401`, so they still validate the server doesn't error/crash

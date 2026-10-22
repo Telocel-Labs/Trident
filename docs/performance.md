@@ -652,3 +652,36 @@ PostgreSQL TPS Avg:          284 TPS
 - [PostgreSQL Index Types](https://www.postgresql.org/docs/current/indexes.html)
 - [CONCURRENTLY Behavior](https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY)
 - [Partial Indexes](https://www.postgresql.org/docs/current/indexes-partial.html)
+
+## Mainnet-Scale Database Benchmark (10M+ Events)
+
+To prevent regressions that only appear at true mainnet data volume (issue #672),
+Trident includes a dedicated benchmark suite evaluating query execution plans,
+buffer hit rates, and latency distributions against tables sized in the tens of
+millions of rows (10,000,000+).
+
+### Key Workloads Measured
+
+| Workload | Query Pattern | Expected Plan | Target P95 |
+|---|---|---|---|
+| Contract Ledger Range | `WHERE network = $1 AND contract_id = $2 AND ledger_sequence BETWEEN $3 AND $4 ORDER BY ledger_sequence DESC LIMIT 25` | `Index Scan` on `idx_soroban_events_contract_ledger` | ≤ 30ms |
+| Keyset Pagination | `WHERE network = $1 AND (ledger_sequence, event_index) > (...) ORDER BY ledger_sequence, event_index LIMIT 25` | `Index Scan` on `idx_soroban_events_keyset` | ≤ 40ms |
+| Topic 0 Filter | `WHERE network = $1 AND contract_id = $2 AND topic_0 = $3 ORDER BY ledger_sequence DESC LIMIT 25` | `Index Scan` on `idx_soroban_events_contract_topic0` | ≤ 35ms |
+| Partition Pruning | `WHERE network = $1 AND ledger_sequence BETWEEN $2 AND $3 LIMIT 25` | `Append` bound to single partition | ≤ 25ms |
+
+### Automation & Recurring Schedule
+
+The benchmark runs on a recurring schedule in CI:
+- **Workflow**: `.github/workflows/mainnet-scale-benchmark.yml`
+- **Schedule**: Weekly on Sundays at 03:00 UTC (`0 3 * * 0`)
+- **Triggers**: Also invokable via `workflow_dispatch` with custom scales (`1m`, `5m`, `10m`, `20m`)
+
+### Running Locally
+
+```bash
+# Run against local PostgreSQL with target scale
+python load-tests/mainnet_scale_benchmark.py --db-url postgres://localhost/trident --scale 10m --iterations 25
+
+# Offline verification mode (dry run)
+python load-tests/mainnet_scale_benchmark.py --dry-run
+```
