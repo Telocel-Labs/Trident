@@ -290,8 +290,10 @@ nginx:
   enabled: true
   image:
     repository: nginx
-    tag: "1.25-alpine"
-  replicaCount: 1
+    tag: "1.27-alpine"
+    digest: "sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
+  # Run >=2 replicas for high availability with no single point of failure (issue #766).
+  replicaCount: 2
   service:
     type: LoadBalancer
     port: 80
@@ -321,12 +323,22 @@ nginx:
   affinity: {}
   # The official nginx:alpine image's built-in `nginx` user/group.
   securityContextUid: 101
-  # Only rendered when nginx.replicaCount > 1 — with the default single
-  # replica, minAvailable: 1 would forbid any voluntary eviction at all
-  # (nothing left to keep "available" during the disruption).
+  # PodDisruptionBudget: keep at least this many nginx pods up through a
+  # voluntary disruption (node drain, rollout). With replicaCount: 2,
+  # maxUnavailable: 1 allows orderly voluntary evictions (e.g. kubectl drain)
+  # without blocking node drains (issue #766).
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
+    maxUnavailable: 1
+  # Spread nginx replicas across nodes so a single node loss or drain doesn't
+  # take out the reverse proxy edge entry point. ScheduleAnyway allows scheduling
+  # on single-node clusters or small dev environments.
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
 
 # ---------------------------------------------------------------------------
 # Ingress — use when nginx.enabled is false and a cluster Ingress controller
