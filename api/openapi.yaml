@@ -100,17 +100,22 @@ paths:
       summary: Readiness check
       description: >-
         Verifies Postgres, Redis, and the gRPC backend concurrently, each
-        with a 3-second timeout (issue #243). Returns 503 if any dependency
-        check fails. Intended for Kubernetes' readiness probe / Fly's HTTP
-        service check, so a pod with a broken dependency is pulled out of
-        rotation instead of continuing to receive traffic it can't serve.
+        with a 3-second timeout (issue #243). Returns 503 only when a
+        dependency required to serve core traffic (Postgres or the gRPC
+        backend) is unavailable, so a pod that cannot serve is pulled out of
+        rotation. Redis backs fail-open middlewares only (rate limit, cache,
+        idempotency), so a Redis failure is reported as `degraded` with a 200
+        and does not remove the pod from rotation (issue #758). The body
+        carries generic statuses only; error details are logged server-side.
       operationId: getReady
       tags:
         - System
       security: []
       responses:
         "200":
-          description: All dependencies reachable
+          description: >-
+            Pod can serve core traffic. `status` is "degraded" and
+            `checks.redis` is "degraded" when only Redis is unreachable.
           content:
             application/json:
               schema:
@@ -119,9 +124,9 @@ paths:
           $ref: "#/components/responses/TooManyRequestsIPOnly"
         "503":
           description: >-
-            Either one or more dependencies is unreachable (ReadyResponse
-            body, status "degraded", the failing entry in checks set to
-            "error: ..."), or the server is shedding load under the global
+            Postgres or the gRPC backend is unavailable (ReadyResponse body,
+            status "degraded", the failing entry in checks set to
+            "unavailable"), or the server is shedding load under the global
             concurrency cap (ErrorResponse body, Retry-After header set) —
             the same outermost load-shedding behavior every endpoint shares.
           headers:
@@ -1853,13 +1858,16 @@ components:
       properties:
         postgres:
           type: string
-          description: '"ok" or "error: <message>"'
+          enum: [ok, unavailable]
+          description: Required dependency. "unavailable" fails readiness.
         redis:
           type: string
-          description: '"ok" or "error: <message>"'
+          enum: [ok, degraded]
+          description: Optional dependency (middlewares fail open). "degraded" does not fail readiness.
         grpc_api:
           type: string
-          description: '"ok" or "error: <message>"'
+          enum: [ok, unavailable]
+          description: Required dependency. "unavailable" fails readiness.
 
     ReadyResponse:
       type: object
@@ -1872,7 +1880,9 @@ components:
         status:
           type: string
           enum: [ok, degraded]
-          description: '"degraded" when any dependency check in `checks` failed.'
+          description: >-
+            "degraded" when any dependency check in `checks` failed. The HTTP
+            status is 503 only when a required dependency failed.
         indexer_lag:
           type: integer
           format: int64
@@ -2909,7 +2919,30 @@ components:
         Rate limit exceeded for this API key's tier (error.code
         RATE_LIMITED). Carries the same X-RateLimit-* headers as a
         successful response (X-RateLimit-Remaining is 0) plus Retry-After.
+        When a daily or monthly request quota is exhausted the error.code is
+        QUOTA_EXCEEDED instead, with X-Quota-{Daily,Monthly}-{Limit,Remaining,Reset}
+        headers (Reset is a Unix timestamp) and Retry-After set to the reset.
+        Concurrent WebSocket/GraphQL/SSE stream caps per key also return 429
+        RATE_LIMITED.
       headers:
+        X-Quota-Daily-Limit:
+          description: Daily request quota for this key's tier (absent when unlimited).
+          schema: { type: integer }
+        X-Quota-Daily-Remaining:
+          description: Requests left in the current UTC day.
+          schema: { type: integer }
+        X-Quota-Daily-Reset:
+          description: Unix time the daily quota resets (next UTC midnight).
+          schema: { type: integer }
+        X-Quota-Monthly-Limit:
+          description: Monthly request quota for this key's tier (absent when unlimited).
+          schema: { type: integer }
+        X-Quota-Monthly-Remaining:
+          description: Requests left in the current UTC month.
+          schema: { type: integer }
+        X-Quota-Monthly-Reset:
+          description: Unix time the monthly quota resets (first of next UTC month).
+          schema: { type: integer }
         X-RateLimit-Limit:
           $ref: "#/components/headers/X-RateLimit-Limit"
         X-RateLimit-Remaining:
