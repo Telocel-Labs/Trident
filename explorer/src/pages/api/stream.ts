@@ -1,12 +1,6 @@
 import type { APIRoute } from 'astro';
 import type { Network } from '../../lib/types';
-
-// EventSource cannot send custom headers, so the browser connects here and
-// this endpoint attaches the API key while piping the upstream SSE body
-// through untouched (same pattern as /api/events.json, but streaming).
-const TESTNET_URL = import.meta.env.TRIDENT_TESTNET_API_URL ?? 'https://api.testnet.trident.dev';
-const MAINNET_URL = import.meta.env.TRIDENT_MAINNET_API_URL ?? 'https://api.mainnet.trident.dev';
-const API_KEY: string = import.meta.env.EXPLORER_API_KEY ?? '';
+import { sseHub } from '../../lib/sse-hub';
 
 const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
 
@@ -23,40 +17,35 @@ export const GET: APIRoute = async ({ url, request }) => {
     });
   }
 
-  const upstream = new URL(
-    `${network === 'mainnet' ? MAINNET_URL : TESTNET_URL}/v1/events/stream`
-  );
-  upstream.searchParams.set('contract_id', contractId);
-  if (topic0) upstream.searchParams.set('topic_0', topic0);
+  // Create client-facing streaming response multiplexed via sseHub (issue #784).
+  // All concurrent visitors viewing this contract share one single upstream
+  // SSE connection, preventing rate limiting (429) and stream quota exhaustion.
+  const stream = new ReadableStream({
+    start(controller) {
+      const subscriberId = Math.random().toString(36).slice(2);
+      const unsubscribe = sseHub.subscribe(network, contractId, topic0, {
+        id: subscriberId,
+        write(chunk) {
+          try {
+            controller.enqueue(chunk);
+          } catch (_) {
+            unsubscribe();
+          }
+        },
+        close() {
+          try {
+            controller.close();
+          } catch (_) {}
+        },
+      });
 
-  const headers: Record<string, string> = { Accept: 'text/event-stream' };
-  if (API_KEY) headers['X-API-Key'] = API_KEY;
-  // Preserve resume semantics: the browser re-sends Last-Event-ID on
-  // reconnect and the upstream uses it to continue from that stream entry.
-  const lastEventId = request.headers.get('last-event-id');
-  if (lastEventId) headers['Last-Event-ID'] = lastEventId;
+      request.signal.addEventListener('abort', () => {
+        unsubscribe();
+      });
+    },
+  });
 
-  let res: Response;
-  try {
-    res = await fetch(upstream.toString(), {
-      headers,
-      signal: request.signal,
-    });
-  } catch {
-    return new Response(JSON.stringify({ error: 'upstream unreachable' }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  if (!res.ok || !res.body) {
-    return new Response(JSON.stringify({ error: `upstream ${res.status}` }), {
-      status: res.status === 429 ? 429 : 502,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  return new Response(res.body, {
+  return new Response(stream, {
     status: 200,
     headers: {
       'Content-Type': 'text/event-stream',

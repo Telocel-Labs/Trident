@@ -3,14 +3,21 @@ import { ApiError, listEvents } from "../../lib/api";
 import { isValidContractId } from "../../lib/contracts";
 import { probeContractOnChain } from "../../lib/soroban";
 import type { ExplorerEventsResponse, Network, UnreachableReason } from "../../lib/types";
+import { serverCache } from "../../lib/cache";
 
 const jsonHeaders = {
   "Content-Type": "application/json",
   "Cache-Control": "public, max-age=5, s-maxage=5",
 };
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: jsonHeaders });
+function json(body: unknown, status = 200, cached = false): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...jsonHeaders,
+      "X-Cache": cached ? "HIT" : "MISS",
+    },
+  });
 }
 
 export const GET: APIRoute = async ({ url }) => {
@@ -35,55 +42,67 @@ export const GET: APIRoute = async ({ url }) => {
     } satisfies ExplorerEventsResponse, 400);
   }
 
+  const cacheKey = `events:${network}:${contractId || ''}:${topic0 || ''}:${cursor || ''}:${rawFrom || ''}:${rawTo || ''}`;
+
   try {
-    const result = await listEvents({
-      network,
-      contractId,
-      topic0,
-      cursor,
-      ledgerFrom: rawFrom ? Number(rawFrom) : undefined,
-      ledgerTo: rawTo ? Number(rawTo) : undefined,
-      limit: 25,
+    const { data: responseBody, cached } = await serverCache.getOrSet(cacheKey, 5000, async () => {
+      const result = await listEvents({
+        network,
+        contractId,
+        topic0,
+        cursor,
+        ledgerFrom: rawFrom ? Number(rawFrom) : undefined,
+        ledgerTo: rawTo ? Number(rawTo) : undefined,
+        limit: 25,
+      });
+
+      const base: ExplorerEventsResponse = { ...result, status: "ok" };
+
+      // Happy path and the tail of a paginated list.
+      if (result.events.length > 0 || cursor) return { body: base, status: 200 };
+
+      // Empty result for the contract itself: probe when browsing without filters
+      if (contractId && !filtered) {
+        const probe = await probeContractOnChain(network, contractId);
+        if (probe.status === "has_events") {
+          return {
+            body: {
+              ...base,
+              status: "not_indexed",
+              message:
+                "This contract is emitting events on the Stellar network, but Trident has not indexed any of them yet.",
+            } satisfies ExplorerEventsResponse,
+            status: 200,
+          };
+        }
+        if (probe.status === "invalid_contract") {
+          return {
+            body: {
+              status: "invalid_contract",
+              events: [],
+              has_more: false,
+              next_cursor: null,
+              message: "That address is not a valid Stellar contract id.",
+            } satisfies ExplorerEventsResponse,
+            status: 400,
+          };
+        }
+      }
+
+      return {
+        body: {
+          ...base,
+          status: "no_events",
+          filtered,
+          message: filtered
+            ? "No events match the active filters for this contract."
+            : "Trident has not recorded any events for this contract yet.",
+        } satisfies ExplorerEventsResponse,
+        status: 200,
+      };
     });
 
-    const base: ExplorerEventsResponse = { ...result, status: "ok" };
-
-    // Happy path and the tail of a paginated list.
-    if (result.events.length > 0 || cursor) return json(base);
-
-    // Empty result for the contract itself: decide between "no events yet"
-    // (quiet but known) and "not indexed" (emitting on-chain but Trident has
-    // nothing). Only probe when the visitor is browsing the contract without
-    // filters, where the distinction actually matters.
-    if (contractId && !filtered) {
-      const probe = await probeContractOnChain(network, contractId);
-      if (probe.status === "has_events") {
-        return json({
-          ...base,
-          status: "not_indexed",
-          message:
-            "This contract is emitting events on the Stellar network, but Trident has not indexed any of them yet.",
-        } satisfies ExplorerEventsResponse);
-      }
-      if (probe.status === "invalid_contract") {
-        return json({
-          status: "invalid_contract",
-          events: [],
-          has_more: false,
-          next_cursor: null,
-          message: "That address is not a valid Stellar contract id.",
-        } satisfies ExplorerEventsResponse, 400);
-      }
-    }
-
-    return json({
-      ...base,
-      status: "no_events",
-      filtered,
-      message: filtered
-        ? "No events match the active filters for this contract."
-        : "Trident has not recorded any events for this contract yet.",
-    } satisfies ExplorerEventsResponse);
+    return json(responseBody.body, responseBody.status, cached);
   } catch (err) {
     if (!(err instanceof ApiError)) {
       return json({

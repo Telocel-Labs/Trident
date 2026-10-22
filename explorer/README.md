@@ -1,43 +1,25 @@
-# Trident Explorer
+# Trident Soroban Event Explorer
 
-Public event explorer for Soroban contracts on Stellar. Read-only, no API key required for end users.
+A web explorer for Soroban contract events on the Stellar network, powered by the Trident indexer.
 
-## Stack
+## Features
 
-- [Astro](https://astro.build) (SSR, `@astrojs/node` standalone adapter)
-- Tailwind CSS
-- TypeScript
+- **Real-time Event Stream**: Live SSE connection to the indexer for real-time contract events.
+- **Contract Search**: Search by contract ID or view recent events across the network.
+- **Pagination & Filters**: Paginate through historical events with optional topic filters.
+- **Responsive Design**: Clean, accessible UI built with Astro, React, and Tailwind CSS.
+- **Traffic Isolation & Caching**: Server-side in-memory response caching and upstream SSE multiplexing ensure smooth operation under heavy public traffic without exhausting API quotas (issue #784).
 
-## Routes
+## Configuration
 
-| Path | Description |
-|------|-------------|
-| `/` | Landing page — search + live recent events ticker |
-| `/contract/:address` | All events for a contract, server-rendered with pagination + filters. Distinct error/empty states, plus a live SSE feed (status pill + auto-reconnect) |
-| `/contract/:address/event/:id` | Single event detail, shareable, og:tags |
-| `/api/events.json` | Events API with classified result states (see below) |
-| `/api/events/stream` | Server-side SSE proxy for the live feed (keeps `EXPLORER_API_KEY` and the `Last-Event-ID` handshake private) |
-| `/api/recent-events.json` | Recent events feed for the homepage ticker |
-
-## Setup
-
-```bash
-cp .env.example .env
-# edit .env with your API URLs and internal key
-npm install
-npm run dev        # http://localhost:4321
-npm run build      # production build
-npm run preview    # preview production build
-npm run lint       # type-check with astro check
-```
-
-## Environment variables
+Set the following environment variables in `.env`:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `TRIDENT_TESTNET_API_URL` | Yes | Base URL for the testnet Trident REST API |
 | `TRIDENT_MAINNET_API_URL` | Yes | Base URL for the mainnet Trident REST API |
-| `EXPLORER_API_KEY` | Yes | Internal API key (free tier, created at deploy time) |
+| `EXPLORER_API_KEY` | Yes | Internal API key (`internal` tier, sized for public explorer traffic) |
+| `EXPLORER_EDGE_RATE_LIMIT_RPM` | No | Edge rate limit per visitor IP in requests/min (default: 120) |
 | `TRIDENT_TESTNET_SOROBAN_RPC_URL` | No | Soroban RPC used to probe contracts on-chain (testnet default: `https://soroban-testnet.stellar.org`) |
 | `TRIDENT_MAINNET_SOROBAN_RPC_URL` | No | Soroban RPC used to probe contracts on-chain (mainnet default: `https://mainnet.sorobanrpc.com`) |
 
@@ -55,13 +37,13 @@ The explorer distinguishes failures deliberately instead of showing blank pages 
 - **Indexer unavailable**: any upstream failure maps to a human-readable reason (`network`, `rate_limited`, `unauthorized`, `timeout`, `down`) with a retry path.
 - **Live feed status**: the contract page shows a persistent connection pill (connecting / live / reconnecting / off) and auto-resumes the SSE stream via `Last-Event-ID`, so no events are skipped during a drop.
 
-## Rate limiting
+## Rate Limiting & Traffic Protection
 
-- The explorer uses an internal `EXPLORER_API_KEY` at the free tier (60 req/min).
-- IP-based rate limiting (30 req/min per IP) must be configured at the CDN/edge layer:
-  - **Vercel**: Edge Config rate limiting rule
-  - **Cloudflare**: Rate limiting rule on the `explorer.*` hostname
+- **API Tier**: The explorer server key `EXPLORER_API_KEY` is configured on the `internal` rate limit tier (up to 1,000 RPS).
+- **Server Response Cache**: Endpoints (`/api/status.json`, `/api/recent-events.json`, `/api/events.json`) use an in-memory TTL cache (3–5s) with singleflight deduplication to avoid redundant upstream hits under concurrency.
+- **SSE Multiplexing**: Multiple visitors viewing live feeds for the same contract share a single upstream EventSource connection via `SSEHub`.
+- **Edge Visitor Limiting**: Built-in middleware enforces per-IP limits (`EXPLORER_EDGE_RATE_LIMIT_RPM`, default 120 req/min) returning HTTP 429 directly at the edge.
 
 ## Deployment
 
-The Astro SSR app runs as a Node.js standalone server. A `Dockerfile` is not included — use Vercel, Railway, or Fly.io with `npm run build && node dist/server/entry.mjs`.
+The Astro SSR app runs as a Node.js standalone server. Use Vercel, Railway, or Fly.io with `npm run build && node dist/server/entry.mjs`.
