@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 )
@@ -45,6 +46,7 @@ func requestIDUnaryInterceptor(
 type Client struct {
 	conn *grpc.ClientConn
 	gen.EventsClient
+	HealthClient grpc_health_v1.HealthClient
 }
 
 // NewClient creates a new gRPC client connection.
@@ -90,6 +92,7 @@ func NewClient(_ context.Context, addr string) (*Client, error) {
 	return &Client{
 		conn:         conn,
 		EventsClient: gen.NewEventsClient(conn),
+		HealthClient: grpc_health_v1.NewHealthClient(conn),
 	}, nil
 }
 
@@ -97,6 +100,16 @@ func NewClient(_ context.Context, addr string) (*Client, error) {
 func (c *Client) Close() error {
 	return c.conn.Close()
 }
+// Check queries the standard gRPC health check service (issue #678).
+func (c *Client) Check(ctx context.Context, in *grpc_health_v1.HealthCheckRequest, opts ...grpc.CallOption) (*grpc_health_v1.HealthCheckResponse, error) {
+	return c.HealthClient.Check(ctx, in, opts...)
+}
+
+// Watch streams health status updates from the standard gRPC health service (issue #678).
+func (c *Client) Watch(ctx context.Context, in *grpc_health_v1.HealthCheckRequest, opts ...grpc.CallOption) (grpc_health_v1.Health_WatchClient, error) {
+	return c.HealthClient.Watch(ctx, in, opts...)
+}
+
 
 // transportCredentials builds the gRPC transport credentials for the
 // connection to the Rust gRPC service (issue #320).

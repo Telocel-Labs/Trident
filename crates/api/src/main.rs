@@ -118,8 +118,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%addr, "Trident gRPC server listening");
 
-    let events_service = services::events::EventsServiceImpl::new(db_pool, redis_manager);
+    let events_service = services::events::EventsServiceImpl::new(db_pool.clone(), redis_manager.clone());
 
+    // Standard gRPC Health Checking Protocol (issue #678)
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+    health_reporter
+        .set_service_status("trident.Events", tonic_health::ServingStatus::Serving)
+        .await;
+
+    // Background readiness loop: probes Postgres and Redis and updates the
+    // gRPC health status so orchestrators (Kubernetes gRPC probe) and load
+    // balancers detect backend degradation.
+    let probe_db = db_pool.clone();
+    let mut probe_redis = redis_manager.clone();
+    let mut probe_reporter = health_reporter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+        loop {
+            interval.tick().await;
+            let db_ok = sqlx::query("SELECT 1").execute(&probe_db).await.is_ok();
+            let redis_ok = redis::cmd("PING")
+                .query_async::<_, String>(&mut probe_redis)
+                .await
+                .is_ok();
+
+            let status = if db_ok && redis_ok {
+                tonic_health::ServingStatus::Serving
+            } else {
+                tonic_health::ServingStatus::NotServing
+            };
+
+            probe_reporter.set_service_status("", status).await;
+            probe_reporter.set_service_status("trident.Events", status).await;
+        }
+    });
+
+    let mut shutdown_reporter = health_reporter.clone();
     let mut server_builder = tonic::transport::Server::builder();
 
     if let Some(mtls) = &cfg.mtls {
@@ -144,10 +181,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     server_builder
+        .add_service(health_service)
         .add_service(trident::events_server::EventsServer::new(events_service))
-        .serve_with_shutdown(addr, async {
+        .serve_with_shutdown(addr, async move {
             tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Received shutdown signal");
+            tracing::info!("Received shutdown signal; setting gRPC health status to NotServing");
+            shutdown_reporter
+                .set_service_status("", tonic_health::ServingStatus::NotServing)
+                .await;
+            shutdown_reporter
+                .set_service_status("trident.Events", tonic_health::ServingStatus::NotServing)
+                .await;
         })
         .await?;
 

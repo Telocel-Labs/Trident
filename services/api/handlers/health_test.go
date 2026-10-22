@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
 // fakeEventsClient implements EventsLister for Ready() tests (package
@@ -239,4 +240,59 @@ func assertDegraded(t *testing.T, rr *httptest.ResponseRecorder, failingCheck st
 	if got == "ok" || got == "" {
 		t.Errorf("checks.%s: want a failure reason, got %q", failingCheck, got)
 	}
+}
+
+
+// fakeHealthChecker implements GRPCHealthChecker for standard gRPC health tests (issue #678).
+type fakeHealthChecker struct {
+	status grpc_health_v1.HealthCheckResponse_ServingStatus
+	err    error
+}
+
+func (f *fakeHealthChecker) Check(ctx context.Context, in *grpc_health_v1.HealthCheckRequest, opts ...grpc.CallOption) (*grpc_health_v1.HealthCheckResponse, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &grpc_health_v1.HealthCheckResponse{Status: f.status}, nil
+}
+
+func TestReady_GRPCHealthCheck_Serving_Returns200(t *testing.T) {
+	ledger := int64(42)
+	db := &healthMockDB{lastLedger: &ledger}
+	redis := fakeRedisPinger{}
+	grpcClient := &fakeHealthChecker{status: grpc_health_v1.HealthCheckResponse_SERVING}
+
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, redis, grpcClient).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestReady_GRPCHealthCheck_NotServing_Returns503(t *testing.T) {
+	ledger := int64(42)
+	db := &healthMockDB{lastLedger: &ledger}
+	redis := fakeRedisPinger{}
+	grpcClient := &fakeHealthChecker{status: grpc_health_v1.HealthCheckResponse_NOT_SERVING}
+
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, redis, grpcClient).ServeHTTP(rr, req)
+
+	assertDegraded(t, rr, "grpc_api")
+}
+
+func TestReady_GRPCHealthCheck_Error_Returns503(t *testing.T) {
+	ledger := int64(42)
+	db := &healthMockDB{lastLedger: &ledger}
+	redis := fakeRedisPinger{}
+	grpcClient := &fakeHealthChecker{err: errors.New("connection refused")}
+
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, redis, grpcClient).ServeHTTP(rr, req)
+
+	assertDegraded(t, rr, "grpc_api")
 }
