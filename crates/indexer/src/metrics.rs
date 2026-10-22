@@ -169,6 +169,16 @@ pub const LEDGER_GAPS_CLOSED_TOTAL: &str = "trident_indexer_ledger_gaps_closed_t
 /// instead of relying on the gap scan to notice later.
 pub const RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL: &str =
     "trident_indexer_retained_floor_ledgers_skipped_total";
+pub const FILTER_SHARDS: &str = "trident_indexer_filter_shards";
+pub const FILTER_DEGRADED: &str = "trident_indexer_filter_degraded";
+
+pub fn set_filter_shards(shards: usize) {
+    gauge!(FILTER_SHARDS).set(shards as f64);
+}
+
+pub fn set_filter_degraded(degraded: bool) {
+    gauge!(FILTER_DEGRADED).set(if degraded { 1.0 } else { 0.0 });
+}
 
 /// Failed runs of `ensure_future_event_partitions` (issue #431/#771). Before
 /// this metric the only signal was a `tracing::error!` log line in
@@ -190,6 +200,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
             TridentError::config(anyhow::Error::new(e).context("failed to start metrics exporter"))
         })?;
 
+    describe_gauge!(
+        FILTER_SHARDS,
+        "Number of getEvents filter shards in the current allowlist plan (issue #801)"
+    );
+    describe_gauge!(
+        FILTER_DEGRADED,
+        "Whether allowlist filtering has degraded to index-all (1=degraded, 0=filtered) (issue #801)"
+    );
     describe_gauge!(
         LEDGER_LAG,
         "Difference between chain tip and indexer cursor (ledgers)"
@@ -393,6 +411,8 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
+    gauge!(FILTER_SHARDS).set(0.0);
+    gauge!(FILTER_DEGRADED).set(0.0);
     // Seed at 0 so the gauge is present from the first scrape and fails safe.
     // Seeding at i64::MAX would report infinite headroom, so an indexer that
     // crash-loops before its first successful poll would leave both partition

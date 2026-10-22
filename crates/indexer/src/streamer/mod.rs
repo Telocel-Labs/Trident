@@ -35,7 +35,7 @@ use crate::{
     db, metrics,
     parser::Parser,
     poll::{apply_degraded_backoff, AdaptivePoll, AdaptivePollConfig},
-    rpc::{filters::build_event_filters, retry_strategy, FilterPlan, RpcClient, RpcHttpSettings},
+    rpc::{filters::build_event_filters, retry_strategy, EventsPage, FilterPlan, RawEvent, RpcClient, RpcHttpSettings},
     token_metadata,
 };
 pub use circuit_breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, Outcome};
@@ -886,27 +886,63 @@ impl Streamer {
         let mut page_cursor: Option<String> = None;
         let mut total = 0;
 
-        // Snapshot the server-side filters for the whole cycle (issue #203) so
+        // Snapshot the server-side filter shards for the whole cycle (issues #203, #801) so
         // the request shape is stable across pages and the borrow does not
         // conflict with the mutable state updated inside the loop.
-        let filters = self.filter_plan.filters.clone();
+        let shards = self.filter_plan.shards.clone();
 
         loop {
             let (sl, pc) = page_request_params(effective_cursor, page_cursor.as_deref());
-            let mut attempt = 0u32;
             let limit = self.config.max_events_per_poll;
-            // Server-side narrowing (issue #203). Empty in index-all mode; the
-            // client-side allowlist check below stays as the safety net.
-            let filters = filters.as_slice();
-            let page = Retry::start(retry_strategy.clone(), || {
-                attempt += 1;
-                if attempt > 1 {
-                    metrics::record_rpc_retry();
+
+            let page = if shards.len() <= 1 {
+                let filters = shards.first().map(|s| s.as_slice()).unwrap_or(&[]);
+                let mut attempt = 0u32;
+                Retry::start(retry_strategy.clone(), || {
+                    attempt += 1;
+                    if attempt > 1 {
+                        metrics::record_rpc_retry();
+                    }
+                    async { self.rpc.get_events(sl, pc.clone(), limit, filters).await }
+                        .instrument(tracing::info_span!("rpc_get_events"))
+                })
+                .await?
+            } else {
+                // Sharded allowlist (issue #801): send a filtered getEvents request
+                // per shard (at most 25 contracts each) and merge their events in ledger/event order.
+                let mut all_events: Vec<RawEvent> = Vec::new();
+                let mut max_latest_ledger: u64 = self.last_chain_tip;
+
+                for shard in &shards {
+                    let mut attempt = 0u32;
+                    let filters = shard.as_slice();
+                    let shard_page = Retry::start(retry_strategy.clone(), || {
+                        attempt += 1;
+                        if attempt > 1 {
+                            metrics::record_rpc_retry();
+                        }
+                        async { self.rpc.get_events(sl, pc.clone(), limit, filters).await }
+                            .instrument(tracing::info_span!("rpc_get_events_sharded"))
+                    })
+                    .await?;
+
+                    if shard_page.latest_ledger > max_latest_ledger {
+                        max_latest_ledger = shard_page.latest_ledger;
+                    }
+                    all_events.extend(shard_page.events);
                 }
-                async { self.rpc.get_events(sl, pc.clone(), limit, filters).await }
-                    .instrument(tracing::info_span!("rpc_get_events"))
-            })
-            .await?;
+
+                all_events.sort_by(|a, b| {
+                    let a_seq: u64 = a.ledger.parse().unwrap_or(0);
+                    let b_seq: u64 = b.ledger.parse().unwrap_or(0);
+                    a_seq.cmp(&b_seq).then_with(|| a.id.cmp(&b.id))
+                });
+
+                EventsPage {
+                    events: all_events,
+                    latest_ledger: max_latest_ledger,
+                }
+            };
 
             tracing::debug!(
                 latest_ledger = page.latest_ledger,
@@ -1450,20 +1486,23 @@ fn plan_filters(
     let contract_ids: Option<HashSet<String>> = allowlist.map(|map| map.keys().cloned().collect());
     let plan = build_event_filters(contract_ids.as_ref(), topic_filters);
 
+    metrics::set_filter_shards(plan.shards.len());
+    metrics::set_filter_degraded(plan.degraded);
+
     if plan.degraded {
         tracing::warn!(
             contracts = allowlist.map(|s| s.len()).unwrap_or(0),
-            max = crate::rpc::filters::MAX_FILTERABLE_CONTRACTS,
+            shards = plan.shards.len(),
             "Allowlist exceeds the RPC filter caps; falling back to index-all with client-side filtering"
         );
-    } else if plan.filters.is_empty() {
+    } else if plan.shards.is_empty() {
         tracing::info!("No contract allowlist; requesting all events (index-all mode)");
     } else {
         tracing::info!(
-            filters = plan.filters.len(),
+            shards = plan.shards.len(),
             contracts = allowlist.map(|s| s.len()).unwrap_or(0),
             topic_patterns = topic_filters.len(),
-            "Server-side getEvents filtering active"
+            "Server-side getEvents filtering active across multiple shards"
         );
     }
 
@@ -2707,11 +2746,11 @@ mod tests {
             s.db.clone(),
             conn.clone(),
             RelayConfig {
+                network: "testnet".to_string(),
                 interval: Duration::from_millis(10),
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
-                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
@@ -2782,11 +2821,11 @@ mod tests {
             s.db.clone(),
             conn.clone(),
             RelayConfig {
+                network: "testnet".to_string(),
                 interval: Duration::from_millis(10),
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
-                network: "testnet".to_string(),
             },
         );
         assert_eq!(relay.publish_pending().await.unwrap(), 3);
@@ -2862,6 +2901,7 @@ mod tests {
             s.db.clone(),
             conn.clone(),
             RelayConfig {
+                network: "testnet".to_string(),
                 interval: Duration::from_millis(10),
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
@@ -3509,24 +3549,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_allowlist_degrades_to_unfiltered_request() {
+    async fn allowlist_with_100_contracts_shards_into_filtered_requests() {
         let (db_url, redis_url) = require_services!();
         let server = MockServer::start().await;
 
+        // With 100 contracts (4 shards of 25), poll_once issues 4 getEvents calls,
+        // each carrying non-empty filters (never empty filters).
         Mock::given(method("POST"))
             .and(path("/"))
             .and(body_partial_json(serde_json::json!({
-                "method": "getEvents",
-                "params": { "filters": [] }
+                "method": "getEvents"
             })))
             .respond_with(rpc_ok(events_page(602, 0)))
-            .expect(1..)
+            .expect(4..)
             .mount(&server)
             .await;
 
-        let ids: Vec<String> = (0..crate::rpc::filters::MAX_FILTERABLE_CONTRACTS + 1)
-            .map(|i| format!("CBIG_{i:03}"))
-            .collect();
+        let ids: Vec<String> = (0..100).map(|i| format!("CBIG_{i:03}")).collect();
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
 
         let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
@@ -3534,10 +3573,22 @@ mod tests {
         set_allowlist(&s.db, &id_refs).await;
         s.refresh_contract_filter().await.unwrap();
 
-        assert!(
-            s.filter_plan.degraded,
-            "an allowlist past the RPC caps must degrade to index-all"
+        assert_eq!(
+            s.filter_plan.shards.len(),
+            4,
+            "100 contracts must produce 4 filter shards"
         );
+        assert!(
+            !s.filter_plan.degraded,
+            "100 contracts must not degrade to index-all"
+        );
+
+        for shard in &s.filter_plan.shards {
+            assert_eq!(shard.len(), 5, "each shard has 5 filters");
+            for f in shard {
+                assert_eq!(f.contract_ids.len(), 5, "each filter has 5 contracts");
+            }
+        }
 
         let mut cursor = 0u64;
         s.poll_once(&mut cursor).await.unwrap();

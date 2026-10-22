@@ -220,10 +220,6 @@ impl Config {
         let explicit_network = std::env::var("NETWORK")
             .ok()
             .filter(|v| !v.trim().is_empty());
-        let explicit_network = std::env::var("NETWORK")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let network = explicit_network.clone().unwrap_or_else(|| "testnet".into());
         validate_network_against_rpc(explicit_network.as_deref(), &stellar_rpc_urls)?;
         // Normalise exactly once, here (issue #736). Every later consumer —
         // the cursor key, the network column on every write, the passphrase
@@ -711,7 +707,7 @@ pub(crate) fn redact_url(url: &str) -> String {
     if let Some(qmark) = tail.find('?') {
         // Check if this is an RPC-style URL that might need special handling?
         // For now preserve for DB URLs as before
-        let (path_part, query_part) = tail.split_at(qmark);
+        let (path_part, _query_part) = tail.split_at(qmark);
         // But issue #734 says redact path tokens and query strings for RPC URLs
         // This function is used generally - but tests expect specific behavior
         // Tests are for postgres URLs - don't change those
