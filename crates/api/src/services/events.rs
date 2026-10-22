@@ -109,11 +109,29 @@ fn validate_start_id(start_id: &str) -> Result<String, Status> {
 pub struct EventsServiceImpl {
     pub db: PgPool,
     pub redis: redis::aio::ConnectionManager,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl EventsServiceImpl {
+    #[allow(dead_code)]
     pub fn new(db: PgPool, redis: redis::aio::ConnectionManager) -> Self {
-        Self { db, redis }
+        Self {
+            db,
+            redis,
+            shutdown_rx: None,
+        }
+    }
+
+    pub fn with_shutdown(
+        db: PgPool,
+        redis: redis::aio::ConnectionManager,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            db,
+            redis,
+            shutdown_rx: Some(shutdown_rx),
+        }
     }
 }
 
@@ -321,6 +339,7 @@ async fn run_stream_consumer(
     mut redis: redis::aio::ConnectionManager,
     tx: tokio::sync::mpsc::Sender<Result<Event, Status>>,
     subscription: StreamSubscription,
+    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
     let StreamSubscription {
         contract_id,
@@ -339,6 +358,27 @@ async fn run_stream_consumer(
         let reply: redis::RedisResult<StreamReadReply> = tokio::select! {
             biased;
             _ = tx.closed() => return,
+            _ = async {
+                match shutdown_rx.as_mut() {
+                    Some(rx) => {
+                        while rx.changed().await.is_ok() {
+                            if *rx.borrow() {
+                                return;
+                            }
+                        }
+                        std::future::pending::<()>().await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Issue #788: End streams with UNAVAILABLE on shutdown so clients reconnect elsewhere.
+                let _ = tx
+                    .send(Err(Status::unavailable(
+                        "server is shutting down; please reconnect to an active replica",
+                    )))
+                    .await;
+                return;
+            }
             reply = redis.xread_options(&[REDIS_STREAM_KEY], &ids, &opts) => reply,
         };
 
@@ -581,6 +621,7 @@ impl Events for EventsServiceImpl {
                 start_id: last_id,
                 network,
             },
+            self.shutdown_rx.clone(),
         ));
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -1198,6 +1239,7 @@ mod tests {
                 start_id: "$".to_string(),
                 network: None,
             },
+            None,
         ));
 
         // Let the consumer park inside a blocking XREAD first.
