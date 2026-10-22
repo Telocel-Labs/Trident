@@ -171,6 +171,17 @@ jobs:
         with:
           cache-dependency-path: services/api/go.sum
 
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1.45.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify generated proto code is clean
+        working-directory: .
+        run: |
+          buf generate
+          git diff --exit-code services/api/gen
+
       - name: go vet
         run: go vet ./...
 

@@ -1,7 +1,6 @@
-version: v1
-name: buf.build/telocel-labs/trident
-deps:
-  - buf.build/googleapis/googleapis
+version: v2
+modules:
+  - path: proto
 lint:
   use:
     - DEFAULT
