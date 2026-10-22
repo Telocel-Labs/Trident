@@ -1,0 +1,123 @@
+# Mainnet overlay for the Trident Helm chart (issue #676).
+#
+# Captures mainnet-specific configuration overrides — network settings,
+# passphrase, appropriate resource sizing for mainnet ledger ingestion and
+# query volume, and mainnet secrets mapping — in a reviewable, versioned
+# values file rather than scattered manual documentation steps.
+#
+# Applied on top of values.yaml via:
+#   helm upgrade --install trident-mainnet helm/trident \
+#     -f helm/trident/values.yaml -f helm/trident/values-mainnet.yaml \
+#     --namespace trident-mainnet --create-namespace
+#
+# To combine with the production ingress / PDB topology from values-prod.yaml:
+#   helm upgrade --install trident-mainnet helm/trident \
+#     -f helm/trident/values.yaml \
+#     -f helm/trident/values-prod.yaml \
+#     -f helm/trident/values-mainnet.yaml \
+#     --namespace trident-mainnet --create-namespace
+
+# ---------------------------------------------------------------------------
+# Global configuration
+# ---------------------------------------------------------------------------
+global:
+  # Name of pre-existing secret holding mainnet credentials (issue #305, #676).
+  # Required keys:
+  #   DATABASE_URL     - PostgreSQL connection string for mainnet database
+  #   REDIS_URL        - Redis connection string for mainnet cache/streams
+  #   STELLAR_RPC_URL  - Mainnet Soroban RPC endpoint (e.g. from an RPC provider)
+  #   ADMIN_API_KEY    - Shared secret guarding /v1/admin/*
+  #   API_KEY_SALT     - Salt for HMAC hashing of issued API keys
+  existingSecret: trident-mainnet-secrets
+
+# ---------------------------------------------------------------------------
+# Indexer — mainnet event ingestion
+# ---------------------------------------------------------------------------
+indexer:
+  replicaCount: 1
+  # Mainnet ledger ingestion handles higher transaction density and event
+  # volume than testnet; size memory and CPU requests accordingly.
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+  env:
+    # Explicit network setting for mainnet (issue #676). Normalised by
+    # crates/indexer/src/config.rs and checked against DB constraints.
+    NETWORK: "mainnet"
+    # Stellar public network passphrase (RFC 6979 / SAC derivation)
+    NETWORK_PASSPHRASE: "Public Global Stellar Network ; July 2015"
+    # Mainnet batch commit size: commits larger pages per transaction to reduce
+    # write overhead under mainnet event arrival rates.
+    DB_BATCH_SIZE: "2000"
+
+# ---------------------------------------------------------------------------
+# Rust gRPC API — event query service
+# ---------------------------------------------------------------------------
+grpcApi:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+  env:
+    NETWORK: "mainnet"
+
+# ---------------------------------------------------------------------------
+# Go REST / WebSocket API — public endpoints
+# ---------------------------------------------------------------------------
+goApi:
+  # High availability: default to 3 replicas for mainnet traffic
+  replicaCount: 3
+  hpa:
+    minReplicas: 3
+    maxReplicas: 15
+    targetCPUUtilizationPercentage: 70
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  env:
+    NETWORK: "mainnet"
+    STELLAR_NETWORK: "mainnet"
+    # Pre-auth rate limits calibrated for mainnet production
+    PER_IP_RATE_LIMIT_RPS: "20"
+    PER_IP_RATE_LIMIT_WINDOW_MS: "1000"
+    RATE_LIMIT_FREE_RPS: "10"
+    RATE_LIMIT_PRO_RPS: "100"
+    RATE_LIMIT_INTERNAL_RPS: "1000"
+
+# ---------------------------------------------------------------------------
+# Nginx — gateway proxy
+# ---------------------------------------------------------------------------
+nginx:
+  replicaCount: 2
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+# ---------------------------------------------------------------------------
+# Schema Migrations hook
+# ---------------------------------------------------------------------------
+migrations:
+  env:
+    NETWORK: "mainnet"

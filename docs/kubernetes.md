@@ -192,6 +192,35 @@ your actual infrastructure, which only you can supply — replace
 alternative, and size `resources.requests`/`resources.limits` per service
 against your real traffic before launch.
 
+### Mainnet configuration {#mainnet}
+
+`helm/trident/values-mainnet.yaml` (issue #676) provides a versioned, testable overlay for deploying against the Stellar public network (mainnet):
+
+```bash
+helm upgrade --install trident-mainnet helm/trident \
+  -f helm/trident/values.yaml \
+  -f helm/trident/values-mainnet.yaml \
+  --namespace trident-mainnet \
+  --create-namespace
+```
+
+Or combined with production topology hardening:
+
+```bash
+helm upgrade --install trident-mainnet helm/trident \
+  -f helm/trident/values.yaml \
+  -f helm/trident/values-prod.yaml \
+  -f helm/trident/values-mainnet.yaml \
+  --namespace trident-mainnet \
+  --create-namespace
+```
+
+Key overrides in `values-mainnet.yaml`:
+- **Network identity**: Sets `NETWORK: "mainnet"` across `indexer`, `grpcApi`, `goApi`, and `migrations`, paired with the official mainnet passphrase `Public Global Stellar Network ; July 2015`.
+- **Secrets separation**: References `global.existingSecret: trident-mainnet-secrets` so mainnet credentials (RPC endpoints, database, API salt) are isolated from testnet/staging.
+- **Mainnet throughput & sizing**: Allocates dedicated resources (`indexer` scaled to 2 CPU / 2Gi memory, `DB_BATCH_SIZE: 2000`) for continuous ledger ingestion at mainnet event density.
+- **High availability**: Configures `goApi` with 3 replicas, PodDisruptionBudget (`minAvailable: 2`), and HPA scaling up to 15 replicas.
+
 ### Using an Ingress controller instead of Nginx
 
 Disable the bundled Nginx deployment and enable the Ingress resource:
