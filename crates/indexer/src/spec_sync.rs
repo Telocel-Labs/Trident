@@ -205,7 +205,10 @@ impl SpecSync {
             let mut token_contracts = self
                 .token_contracts
                 .write()
-                .expect("token_contracts lock poisoned");
+                .unwrap_or_else(|e| {
+                    tracing::warn!("token_contracts write lock poisoned; recovering inner guard");
+                    e.into_inner()
+                });
             for (contract_id, is_token) in token_updates {
                 if is_token {
                     classification_changed |= token_contracts.insert(contract_id);
@@ -221,7 +224,10 @@ impl SpecSync {
                 tokens = self
                     .token_contracts
                     .read()
-                    .expect("token_contracts lock poisoned")
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("token_contracts read lock poisoned; recovering inner guard");
+                        e.into_inner()
+                    })
                     .len(),
                 "Contract spec sync pass completed"
             );

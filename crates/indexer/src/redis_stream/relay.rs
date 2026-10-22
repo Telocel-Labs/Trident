@@ -154,6 +154,7 @@ impl OutboxRelay {
             };
 
             let stream_maxlen = self.config.stream_maxlen;
+            let network = self.config.network.clone();
             let conn = match self.ensure_redis().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -167,7 +168,7 @@ impl OutboxRelay {
                 &event,
                 stream_maxlen,
                 Some(&record.event_id.to_string()),
-                &self.config.network,
+                &network,
             )
             .await
             {

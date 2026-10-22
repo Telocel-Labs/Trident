@@ -1192,7 +1192,10 @@ impl Streamer {
             let token_contracts = self
                 .token_contracts
                 .read()
-                .expect("token_contracts lock poisoned")
+                .unwrap_or_else(|e| {
+                    tracing::warn!("token_contracts read lock poisoned; recovering inner guard");
+                    e.into_inner()
+                })
                 .clone();
             let mut owned_storage_snapshots: Vec<OwnedStorageSnapshot> = Vec::new();
             if !token_contracts.is_empty() {
@@ -2866,6 +2869,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
