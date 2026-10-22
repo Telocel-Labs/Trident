@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -223,6 +222,7 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, deps GraphQLDeps
 		}
 	}()
 
+	_ = conn.SetReadDeadline(time.Now().Add(gqlInitTimeout))
 	initTimer := time.NewTimer(gqlInitTimeout)
 	defer initTimer.Stop()
 	pingTicker := time.NewTicker(gqlPingInterval)
@@ -261,14 +261,24 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, deps GraphQLDeps
 			}
 
 			switch fm.opcode {
-			case 0x8: // WebSocket close
+			case 0x8: // WebSocket close: respond with close frame to complete RFC 6455 handshake
+				var code uint16 = 1000
+				if len(fm.data) >= 2 {
+					code = binary.BigEndian.Uint16(fm.data[:2])
+				}
+				_ = gc.writeClose(code, "")
 				return
-			case 0x9: // WebSocket ping → pong
+			case 0x9: // WebSocket ping -> pong with identical payload and refresh read deadline
 				_ = gc.writePong(fm.data)
+				_ = conn.SetReadDeadline(time.Now().Add(gqlPingInterval * 2))
 				continue
-			case 0xA: // WebSocket pong — ignore
+			case 0xA: // WebSocket pong -> refresh read deadline
+				_ = conn.SetReadDeadline(time.Now().Add(gqlPingInterval * 2))
 				continue
 			}
+
+			// Any valid data frame refreshes read deadline
+			_ = conn.SetReadDeadline(time.Now().Add(gqlPingInterval * 2))
 
 			if fm.opcode != 0x1 && fm.opcode != 0x2 {
 				continue // skip non-text/binary frames
@@ -440,57 +450,6 @@ func upgradeGQLWebSocket(w http.ResponseWriter, r *http.Request) (net.Conn, *buf
 	return conn, bufrw, nil
 }
 
-// readClientFrame reads one RFC 6455 frame from a client.
-// Client→server frames are always masked per spec.
-func readClientFrame(r *bufio.Reader) ([]byte, byte, error) {
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, 0, err
-	}
-
-	opcode := header[0] & 0x0F
-	masked := header[1]&0x80 != 0
-	payloadLen := int64(header[1] & 0x7F)
-
-	switch payloadLen {
-	case 126:
-		b := make([]byte, 2)
-		if _, err := io.ReadFull(r, b); err != nil {
-			return nil, 0, err
-		}
-		payloadLen = int64(binary.BigEndian.Uint16(b))
-	case 127:
-		b := make([]byte, 8)
-		if _, err := io.ReadFull(r, b); err != nil {
-			return nil, 0, err
-		}
-		payloadLen = int64(binary.BigEndian.Uint64(b))
-	}
-
-	if payloadLen > gqlMaxFrameSize {
-		return nil, 0, fmt.Errorf("frame payload too large: %d bytes", payloadLen)
-	}
-
-	var maskKey [4]byte
-	if masked {
-		if _, err := io.ReadFull(r, maskKey[:]); err != nil {
-			return nil, 0, err
-		}
-	}
-
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, 0, err
-	}
-
-	if masked {
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
-	}
-
-	return payload, opcode, nil
-}
 
 var (
 	reContractID = regexp.MustCompile(`contractId\s*:\s*"([^"]+)"`)
