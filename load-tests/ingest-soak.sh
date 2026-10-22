@@ -45,6 +45,7 @@ SOAK_DURATION_SECONDS="${SOAK_DURATION_SECONDS:-1800}"      # 30 minutes default
 MINT_INTERVAL_SECONDS="${MINT_INTERVAL_SECONDS:-2}"
 SAMPLE_INTERVAL_SECONDS="${SAMPLE_INTERVAL_SECONDS:-30}"
 MAX_GROWTH_PCT="${MAX_GROWTH_PCT:-50}"                       # coarse "no unbounded growth" bar
+ENABLE_VARIED_EVENTS="${ENABLE_VARIED_EVENTS:-true}"         # exercise multi-shape events (issue #673)
 GO_API_CONTAINER="${GO_API_CONTAINER:-docker-api-1}"
 INDEXER_CONTAINER="${INDEXER_CONTAINER:-docker-indexer-1}"
 WASM_PATH="${WASM_PATH:-contracts/target/wasm32v1-none/release/token.wasm}"
@@ -144,12 +145,24 @@ SAMPLER_PID=$!
 echo "Sustained mint loop running for ${SOAK_DURATION_SECONDS}s (interval ${MINT_INTERVAL_SECONDS}s)..." | tee -a "$MINT_LOG"
 MINT_COUNT=0
 while [ "$(date +%s)" -lt "$END_TS" ]; do
+  if [ "$ENABLE_VARIED_EVENTS" = "true" ]; then
+    # Cycle through diverse event shapes (mint, transfer, burn) (issue #673)
+    MOD=$((MINT_COUNT % 3))
+    case "$MOD" in
+      0) OP="mint --to $RECIPIENT_ADDR --amount 1000" ;;
+      1) OP="transfer --from $ADMIN_ADDR --to $RECIPIENT_ADDR --amount 250" ;;
+      2) OP="burn --from $ADMIN_ADDR --amount 50" ;;
+    esac
+  else
+    OP="mint --to $RECIPIENT_ADDR --amount 1000"
+  fi
+
   if stellar contract invoke \
       --id "$CONTRACT_ID" --source soak-admin --network local \
-      -- mint --to "$RECIPIENT_ADDR" --amount 1000 >> "$MINT_LOG" 2>&1; then
+      -- $OP >> "$MINT_LOG" 2>&1; then
     MINT_COUNT=$((MINT_COUNT + 1))
   else
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) mint invocation failed (see above)" >> "$MINT_LOG"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) invocation ($OP) failed (see above)" >> "$MINT_LOG"
   fi
   sleep "$MINT_INTERVAL_SECONDS"
 done

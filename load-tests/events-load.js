@@ -41,11 +41,19 @@ export const options = {
       duration: __ENV.DURATION || "2m",
       startTime: "5s", // let the list scenario populate knownIds first
     },
+    varied: {
+      executor: "constant-vus",
+      exec: "listVariedEvents",
+      vus: Number(__ENV.VARIED_VUS || 10),
+      duration: __ENV.DURATION || "2m",
+      startTime: "5s",
+    },
   },
   thresholds: {
     // SLO 2 (docs/slo.md): p95 < 500ms for read routes.
     "http_req_duration{scenario:list}": ["p(95)<500"],
     "http_req_duration{scenario:get}": ["p(95)<500"],
+    "http_req_duration{scenario:varied}": ["p(95)<500"],
     // SLO 3 (docs/slo.md): 99.5% non-5xx over a rolling window; for a short
     // load-test run we assert the stricter "no failures at all" bar, since
     // any 5xx here indicates a real regression rather than budget burn.
