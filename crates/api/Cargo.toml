@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 trident-common = { path = "../common" }
 anyhow = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tonic = { version = "0.11", features = ["tls"] }
 prost = "0.12"
 tokio-stream = "0.1"
