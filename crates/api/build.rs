@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(false)
-        .compile(&["../../proto/trident.proto"], &["../../proto"])?;
+        .compile_protos(&["../../proto/trident.proto"], &["../../proto"])?;
 
     Ok(())
 }
