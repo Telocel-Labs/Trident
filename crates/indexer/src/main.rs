@@ -15,6 +15,7 @@ mod alerting;
 mod config;
 mod db;
 mod health;
+mod liveness;
 mod metrics;
 mod parser;
 mod poll;
@@ -468,12 +469,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn health and readiness endpoints on HEALTH_PORT (default 8080, separate
     // from the Prometheus /metrics listener on METRICS_PORT) (#206).
+    //
+    // `heartbeat` is shared with the streamer's poll loop (issue #764): the
+    // loop stamps it every iteration, and /readyz fails once it goes stale,
+    // independent of whatever the DB/Redis checks say.
+    let heartbeat = liveness::Heartbeat::new();
     let health_addr: SocketAddr = ([0, 0, 0, 0], cfg.health_port).into();
     let health_db = db_pool.clone();
     let health_redis_url = cfg.redis_url.clone();
     let health_network = cfg.network.clone();
+    let health_heartbeat = heartbeat.clone();
+    let health_config = health::HealthConfig {
+        admin_token: cfg.admin_token.clone(),
+        readiness_heartbeat_stale: Duration::from_secs(cfg.readiness_heartbeat_stale_secs),
+    };
     tokio::spawn(async move {
-        health::serve(health_addr, health_db, health_redis_url, health_network).await;
+        health::serve(
+            health_addr,
+            health_db,
+            health_redis_url,
+            health_network,
+            health_heartbeat,
+            health_config,
+        )
+        .await;
     });
 
     let shutdown = CancellationToken::new();
@@ -568,7 +587,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const SHUTDOWN_GRACE_SECS: u64 = 30;
 
     let mut s = streamer::Streamer::new(cfg, db_pool).await?;
-    let result = s.run(shutdown).await;
+    let result = s.run(shutdown, heartbeat).await;
 
     // Let the relay drain its current pass before the process exits, bounded
     // by the shutdown grace period (issue #205).

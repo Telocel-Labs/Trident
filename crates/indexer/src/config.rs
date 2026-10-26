@@ -79,6 +79,14 @@ pub struct Config {
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
     pub health_port: u16,
+    /// Shared-secret bearer token guarding `/admin/dead-letter` on the health
+    /// server (issue #764). `None` disables the endpoint entirely rather than
+    /// leaving it open — it is only ever logged by name, never by value.
+    pub admin_token: Option<String>,
+    /// How stale the poll loop's heartbeat may get before `/readyz` reports
+    /// not-ready (issue #764), i.e. the loop is wedged even though the
+    /// process is still running and DB/Redis both answer.
+    pub readiness_heartbeat_stale_secs: u64,
     pub alert_webhook_url: Option<String>,
     pub alert_lag_threshold: u64,
     pub alert_cooldown_minutes: u64,
@@ -398,6 +406,12 @@ impl Config {
         let redis_stream_maxlen = parse_bounded_u64("REDIS_STREAM_MAXLEN", 10_000, 1, 100_000_000);
         let metrics_port = parse_bounded_u64("METRICS_PORT", 9090, 1, 65_535);
         let health_port = parse_bounded_u64("HEALTH_PORT", 8080, 1, 65_535);
+        // Default threshold comfortably above the adaptive poll ceiling
+        // (600s max, see POLL_INTERVAL_CEILING_MS) so a slow-but-healthy
+        // cadence never trips readiness; a genuinely wedged loop still gets
+        // caught well before an operator would otherwise notice.
+        let readiness_heartbeat_stale_secs =
+            parse_bounded_u64("READINESS_HEARTBEAT_STALE_SECS", 120, 5, 3_600);
 
         // Collect all parse/range errors at once.
         for (key, result) in [
@@ -451,6 +465,10 @@ impl Config {
             ("REDIS_STREAM_MAXLEN", redis_stream_maxlen.as_ref()),
             ("METRICS_PORT", metrics_port.as_ref()),
             ("HEALTH_PORT", health_port.as_ref()),
+            (
+                "READINESS_HEARTBEAT_STALE_SECS",
+                readiness_heartbeat_stale_secs.as_ref(),
+            ),
             ("MAX_REORG_DEPTH", max_reorg_depth.as_ref()),
         ] {
             if let Err(e) = result {
@@ -517,6 +535,13 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Shared secret for /admin/dead-letter (issue #764). Deliberately not
+        // range/shape validated beyond non-empty: it's an opaque bearer
+        // token, not a structured value.
+        let admin_token = std::env::var("ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         // ── Bail if any errors were collected ────────────────────────────────
         if !errors.is_empty() {
             return Err(TridentError::config(anyhow::anyhow!(
@@ -529,6 +554,7 @@ impl Config {
         let redis_stream_maxlen = redis_stream_maxlen.unwrap();
         let metrics_port = metrics_port.unwrap() as u16;
         let health_port = health_port.unwrap() as u16;
+        let readiness_heartbeat_stale_secs = readiness_heartbeat_stale_secs.unwrap();
         let max_events_per_poll = max_events_per_poll.unwrap();
         let db_batch_size = db_batch_size.unwrap();
         let poll_interval_floor_ms = poll_interval_floor_ms.unwrap();
@@ -595,6 +621,8 @@ impl Config {
             redis_stream_maxlen,
             metrics_port,
             health_port,
+            admin_token,
+            readiness_heartbeat_stale_secs,
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,
@@ -635,6 +663,8 @@ impl Config {
             redis_stream_maxlen = self.redis_stream_maxlen,
             metrics_port = self.metrics_port,
             health_port = self.health_port,
+            admin_token_configured = self.admin_token.is_some(),
+            readiness_heartbeat_stale_secs = self.readiness_heartbeat_stale_secs,
             alert_webhook_configured = self.alert_webhook_url.is_some(),
             alert_lag_threshold = self.alert_lag_threshold,
             alert_cooldown_minutes = self.alert_cooldown_minutes,

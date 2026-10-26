@@ -79,6 +79,15 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: STELLAR_RPC_URL
+            # Guards /admin/dead-letter on the health server (issue #764).
+            # Optional: a secret missing this key leaves the env var unset,
+            # which disables the endpoint (404) rather than leaving it open.
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: ADMIN_TOKEN
+                  optional: true
             {{- range $k, $v := .Values.indexer.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}

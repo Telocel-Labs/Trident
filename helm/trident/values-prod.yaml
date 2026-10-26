@@ -37,10 +37,14 @@
 # in front of it by whatever load balancer/CDN you put in front, e.g. an AWS
 # NLB + ACM cert) rather than the Ingress resource. This just strengthens
 # nginx's own PodDisruptionBudget for production availability.
+#
+# maxUnavailable: 1 here (issue #766), not minAvailable — see values.yaml's
+# own comment on nginx.podDisruptionBudget for why minAvailable: 1 was wrong
+# at the default replica count.
 nginx:
   podDisruptionBudget:
     enabled: true
-    minAvailable: 1
+    maxUnavailable: 1
 
 # ---------------------------------------------------------------------------
 # Ingress — an alternative to the bundled nginx above, for clusters with an

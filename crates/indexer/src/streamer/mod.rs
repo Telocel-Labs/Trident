@@ -32,7 +32,9 @@ use trident_common::{Severity, TridentError};
 use crate::{
     alerting::{AlertContext, Alerter},
     config::Config,
-    db, metrics,
+    db,
+    liveness::Heartbeat,
+    metrics,
     parser::Parser,
     poll::{apply_degraded_backoff, AdaptivePoll, AdaptivePollConfig},
     rpc::{filters::build_event_filters, retry_strategy, FilterPlan, RpcClient, RpcHttpSettings},
@@ -382,7 +384,11 @@ impl Streamer {
 
     /// Start the polling loop. Runs until `shutdown` is cancelled, always
     /// finishing the current `poll_once` before stopping (never mid-batch).
-    pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
+    pub async fn run(
+        &mut self,
+        shutdown: CancellationToken,
+        heartbeat: Heartbeat,
+    ) -> Result<(), TridentError> {
         tracing::info!(network = %self.config.network, "Streamer started");
         tracing::info!(
             poll_interval_floor_ms = self.config.poll_interval_floor.as_millis() as u64,
@@ -421,8 +427,12 @@ impl Streamer {
 
             // Dead-man's-switch: ticks once per loop iteration regardless of
             // poll outcome, so Prometheus can alert on a hung/crashed process
-            // even when lag itself still looks fine.
+            // even when lag itself still looks fine. `heartbeat` is the same
+            // signal mirrored into process-local state so /readyz can fail
+            // readiness directly, without round-tripping through Prometheus
+            // (issue #764).
             metrics::record_heartbeat();
+            heartbeat.record();
             metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
 
             // Periodically refresh the contract allowlist so new contracts
@@ -2152,6 +2162,8 @@ mod tests {
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
             health_port: 0,
+            admin_token: None,
+            readiness_heartbeat_stale_secs: 120,
             statement_timeout_ms: 30_000,
             idle_in_transaction_timeout_ms: 60_000,
             token_metadata_refresh_interval: Duration::from_secs(86_400),
