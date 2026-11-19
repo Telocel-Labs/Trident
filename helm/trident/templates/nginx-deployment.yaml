@@ -1,6 +1,15 @@
 {{- if .Values.nginx.enabled }}
 ---
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "trident.fullname" . }}-nginx
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nginx
+automountServiceAccountToken: false
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "trident.fullname" . }}-nginx-config
@@ -50,6 +59,8 @@ spec:
       labels:
         {{- include "trident.selectorLabels" (dict "root" . "component" "nginx") | nindent 8 }}
     spec:
+      serviceAccountName: {{ include "trident.fullname" . }}-nginx
+      automountServiceAccountToken: false
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.nginx.securityContextUid) | nindent 8 }}

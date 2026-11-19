@@ -38,6 +38,8 @@ spec:
       labels:
         {{- include "trident.selectorLabels" (dict "root" . "component" "migrate") | nindent 8 }}
     spec:
+      serviceAccountName: {{ include "trident.fullname" . }}-migrate
+      automountServiceAccountToken: false
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
       restartPolicy: Never
       securityContext:

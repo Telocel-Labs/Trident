@@ -4,8 +4,8 @@
   "description": "End-to-end example application demonstrating Soroban event indexing and live streaming on Stellar Testnet with Trident TypeScript SDK.",
   "main": "dist/index.js",
   "scripts": {
-    "start": "ts-node src/index.ts",
-    "build": "tsc",
+    "start": "node init && ts-node src/index.ts",
+    "build": "node init && tsc",
     "test": "ts-node src/index.ts --dry-run"
   },
   "dependencies": {

@@ -44,6 +44,10 @@ spec:
         # up{job="trident-indexer"} matcher exactly.
         job: {{ .Values.monitoring.indexer.jobLabel }}
     spec:
+      # Dedicated ServiceAccount; the indexer never calls the Kubernetes API,
+      # so the token is not mounted into the pod.
+      serviceAccountName: {{ include "trident.fullname" . }}-indexer
+      automountServiceAccountToken: false
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.indexer.securityContextUid) | nindent 8 }}

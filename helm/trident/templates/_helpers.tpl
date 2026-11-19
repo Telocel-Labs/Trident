@@ -83,3 +83,11 @@ readOnlyRootFilesystem: true
 capabilities:
   drop: ["ALL"]
 {{- end }}
+
+{{/*
+Dedicated ServiceAccount name for a component. Usage:
+  {{ include "trident.serviceAccountName" (dict "root" . "component" "go-api") }}
+*/}}
+{{- define "trident.serviceAccountName" -}}
+{{- printf "%s-%s" (include "trident.fullname" .root) .component | trunc 63 | trimSuffix "-" }}
+{{- end }}
