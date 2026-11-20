@@ -53,6 +53,34 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SILENCE_ALERTS=("TridentIndexerHeartbeatStale" "TridentIndexerMetricsMissing" "TridentIndexerProcessDown")
 
+# promtool unit tests for the silence alerts (healthy / flat-line / absent).
+# These run against the real alerts.yml with promtool's own time control, so
+# they prove the `expr:` logic and `for:` windows without needing a live
+# Prometheus or a real indexer. Run them first: if the rules themselves are
+# wrong, there is no point spinning up a whole Prometheus to find out.
+ALERTS_FILE="$REPO_ROOT/monitoring/alerts.yml"
+RULES_TEST_FILE="$REPO_ROOT/monitoring/alerts_silence_test.yml"
+
+run_promtool_tests() {
+  if ! command -v promtool >/dev/null 2>&1; then
+    echo "ERROR: 'promtool' not found on PATH; required to run $RULES_TEST_FILE" >&2
+    return 2
+  fi
+  if [ ! -f "$RULES_TEST_FILE" ]; then
+    echo "ERROR: rules test file not found: $RULES_TEST_FILE" >&2
+    return 2
+  fi
+  echo "=== promtool test rules $RULES_TEST_FILE ===" >&2
+  promtool check rules "$ALERTS_FILE" >&2
+  promtool test rules "$RULES_TEST_FILE" >&2
+}
+
+if ! run_promtool_tests; then
+  echo "FAILURE: promtool rule tests for the silence alerts did not pass" >&2
+  exit 1
+fi
+echo "✓ promtool rule tests passed (healthy / flat-line / absent)" >&2
+
 cleanup() {
   [ -n "${METRICS_SERVER_PID:-}" ] && kill "$METRICS_SERVER_PID" 2>/dev/null || true
   [ -n "${PROMETHEUS_PID:-}" ] && kill "$PROMETHEUS_PID" 2>/dev/null || true
@@ -171,10 +199,11 @@ EOF
 # production noise tolerance. Running the real "for:" windows here would
 # make this script take 3-5 minutes to prove the same state-machine
 # transition a much shorter window already demonstrates — so this harness
-# overrides just the `for:` durations to a few seconds via promtool's
-# unit-test-independent config, keeping every `expr:` (the actual detection
-# logic under test) byte-for-byte identical to production.
-python3 - "${REPO_ROOT}/monitoring/alerts.yml" "$PROM_WORKDIR/alerts-fast.yml" <<'PYEOF'
+# overrides just the `for:` durations to a few seconds, keeping every
+# `expr:` (the actual detection logic under test) byte-for-byte identical
+# to production. (The `for:` windows themselves are covered exactly, at
+# their real durations, by the promtool tests above.)
+python3 - "$ALERTS_FILE" "$PROM_WORKDIR/alerts-fast.yml" <<'PYEOF'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src, encoding="utf-8").read()
@@ -184,7 +213,7 @@ text = open(src, encoding="utf-8").read()
 fast = re.sub(r"^(\s*for:\s*)\d+[ms]\s*$", r"\g<1>3s", text, flags=re.MULTILINE)
 open(dst, "w", encoding="utf-8").write(fast)
 PYEOF
-sed -i.bak "s#${REPO_ROOT}/monitoring/alerts.yml#${PROM_WORKDIR}/alerts-fast.yml#" "$PROM_WORKDIR/prometheus.yml"
+sed -i.bak "s#${ALERTS_FILE}#${PROM_WORKDIR}/alerts-fast.yml#" "$PROM_WORKDIR/prometheus.yml"
 
 promtool check rules "$PROM_WORKDIR/alerts-fast.yml" >&2
 

@@ -232,6 +232,39 @@ fi
 echo "✓ ${#ALERT_NAMES[@]} alert names, all unique"
 echo ""
 
+# The indexer-silence alerts (issue #400) page on the *absence* of a metric
+# rather than on its value, so they are the easiest rules to lose track of:
+# if the rule is renamed or dropped, nothing else in this script notices,
+# because the metric it reads still exists. Assert the names are present
+# exactly once each, so a rename or a stray duplicate fails here rather than
+# in production when the indexer dies and nobody is paged.
+REQUIRED_ALERT_NAMES=(
+  "TridentIndexerHeartbeatStale"
+  "TridentIndexerMetricsMissing"
+)
+MISSING_ALERT_NAMES=()
+for required in "${REQUIRED_ALERT_NAMES[@]}"; do
+  count=$(printf '%s\n' "${ALERT_NAMES[@]}" | grep -cxF "$required" || true)
+  if [ "$count" -eq 0 ]; then
+    MISSING_ALERT_NAMES+=("$required")
+  elif [ "$count" -gt 1 ]; then
+    # Already caught by the duplicate check above, but be explicit.
+    MISSING_ALERT_NAMES+=("$required (defined $count times)")
+  fi
+done
+if [ ${#MISSING_ALERT_NAMES[@]} -gt 0 ]; then
+  echo "FAILURE: required indexer-silence alert(s) missing or duplicated:" >&2
+  for name in "${MISSING_ALERT_NAMES[@]}"; do
+    echo "  - $name" >&2
+  done
+  echo "" >&2
+  echo "These alerts fire when the indexer stops polling or stops being" >&2
+  echo "scraped (issue #400). Without them a dead indexer looks healthy." >&2
+  exit 1
+fi
+echo "✓ required indexer-silence alerts present: ${REQUIRED_ALERT_NAMES[*]}"
+echo ""
+
 REFERENCED_METRICS=()
 for alert_file in "${ALERT_FILES[@]}"; do
   if [ ! -f "$alert_file" ]; then
@@ -267,6 +300,19 @@ for metric in "${REFERENCED_METRICS[@]}"; do
     MISSING_METRICS+=("$metric")
   fi
 done
+
+# The heartbeat alerts read trident_indexer_last_poll_timestamp_seconds. If
+# the indexer stops exporting it, `absent()` fires forever and the alert is
+# noise; if it is renamed, the alert never fires at all. Either way the rule
+# has drifted from the emitted metric, so check it explicitly even though it
+# is already covered by the referenced-metrics pass above.
+HEARTBEAT_METRIC="trident_indexer_last_poll_timestamp_seconds"
+if printf '%s\n' "$EMITTED_METRICS" | grep -qxF "$HEARTBEAT_METRIC"; then
+  echo "✓ $HEARTBEAT_METRIC (heartbeat metric present)"
+else
+  echo "✗ $HEARTBEAT_METRIC (NOT FOUND in live /metrics)"
+  MISSING_METRICS+=("$HEARTBEAT_METRIC")
+fi
 
 echo ""
 if [ ${#MISSING_METRICS[@]} -eq 0 ]; then

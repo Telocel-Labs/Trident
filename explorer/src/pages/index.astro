@@ -82,7 +82,7 @@ const ecosystem = [
 >
   <!-- Hero -->
   <section class="relative overflow-hidden border-b border-white/10">
-    <Squares client:load className="absolute inset-0 h-full w-full opacity-70" />
+    <Squares client:load class="absolute inset-0 h-full w-full opacity-70" />
     <div
       class="pointer-events-none absolute inset-0"
       style="background: radial-gradient(60% 50% at 50% 0%, rgba(255, 74, 31, 0.12) 0%, transparent 70%), radial-gradient(40% 35% at 80% 100%, rgba(47, 213, 117, 0.08) 0%, transparent 70%);"
@@ -142,7 +142,7 @@ const ecosystem = [
       </h2>
       <div class="mt-10 grid gap-6 md:grid-cols-3">
         <div class="rounded-xl border border-white/10 bg-black/40 p-6">
-          <Satellite className="h-5 w-5 text-ember-500" aria-hidden="true" />
+          <Satellite class="h-5 w-5 text-ember-500" aria-hidden="true" />
           <h3 class="mt-4 text-base font-medium text-white">Ingest</h3>
           <p class="mt-2 text-sm leading-relaxed text-white/60">
             A Rust indexer follows the chain in real time, pulling every contract event from
@@ -150,7 +150,7 @@ const ecosystem = [
           </p>
         </div>
         <div class="rounded-xl border border-white/10 bg-black/40 p-6">
-          <Database className="h-5 w-5 text-ember-500" aria-hidden="true" />
+          <Database class="h-5 w-5 text-ember-500" aria-hidden="true" />
           <h3 class="mt-4 text-base font-medium text-white">Store</h3>
           <p class="mt-2 text-sm leading-relaxed text-white/60">
             Events land in partitioned Postgres with their topics, data, and transaction context —
@@ -158,7 +158,7 @@ const ecosystem = [
           </p>
         </div>
         <div class="rounded-xl border border-white/10 bg-black/40 p-6">
-          <Search className="h-5 w-5 text-ember-500" aria-hidden="true" />
+          <Search class="h-5 w-5 text-ember-500" aria-hidden="true" />
           <h3 class="mt-4 text-base font-medium text-white">Query</h3>
           <p class="mt-2 text-sm leading-relaxed text-white/60">
             REST, GraphQL, and live streams serve the indexed history — filtered, paginated, and
@@ -223,7 +223,7 @@ const ecosystem = [
         {
           capabilities.map((cap) => (
             <div class="rounded-xl border border-white/10 bg-black/40 p-6">
-              <cap.icon className="h-5 w-5 text-ember-500" aria-hidden="true" />
+              <cap.icon class="h-5 w-5 text-ember-500" aria-hidden="true" />
               <h3 class="mt-4 text-base font-medium text-white">{cap.title}</h3>
               <p class="mt-2 text-sm leading-relaxed text-white/60">{cap.body}</p>
             </div>
@@ -249,7 +249,7 @@ const ecosystem = [
         class="absolute right-3 top-3 z-10 inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-black/60 px-2.5 py-1.5 text-xs text-white/70 transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember-400"
         data-snippet={sdkSnippet}
       >
-        <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+        <Copy class="h-3.5 w-3.5" aria-hidden="true" />
         <span>Copy</span>
       </button>
       <Code

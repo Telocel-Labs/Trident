@@ -17,6 +17,57 @@
 //!   and PagerDuty Events API v2 with per-severity routing.
 //! - **Severity levels**: `info`, `warning`, `critical` route to different
 //!   sinks or the same sink with formatted payloads.
+//!
+//! ## Silence-based alerting (issue #400)
+//!
+//! Ledger-lag alerting alone cannot distinguish "healthy" from "dead": if the
+//! indexer stops polling, or the scrape target goes away, the lag metric stops
+//! updating rather than climbing, so a flat line looks healthy. The Prometheus
+//! rule set therefore carries two additional rules keyed off
+//! `trident_indexer_last_poll_timestamp_seconds` (a gauge set to the wall-clock
+//! time of the last *successful* poll):
+//!
+//! ```yaml
+//! # Fires when the poll timestamp stops advancing for N poll intervals.
+//! - alert: TridentIndexerHeartbeatStale
+//!   expr: |
+//!     changes(trident_indexer_last_poll_timestamp_seconds[5m]) == 0
+//!     or
+//!     (time() - trident_indexer_last_poll_timestamp_seconds) > 5 * 60
+//!   for: 5m
+//!   labels: { severity: critical }
+//!   annotations:
+//!     summary: "Trident indexer has not completed a poll in >5m"
+//!     runbook_url: "docs/runbooks/indexer-stalled.md"
+//!
+//! # Fires when the metric is absent entirely (scrape target down).
+//! - alert: TridentIndexerMetricsMissing
+//!   expr: absent(trident_indexer_last_poll_timestamp_seconds)
+//!   for: 2m
+//!   labels: { severity: critical }
+//!   annotations:
+//!     summary: "Trident indexer metrics are not being scraped"
+//!     runbook_url: "docs/runbooks/indexer-stalled.md"
+//! ```
+//!
+//! The three failure modes and the rule that catches each:
+//!
+//! - **Stalled** — the process is alive and being scraped, but polling has
+//!   stopped (hung RPC, wedged DB connection, blocked task). The metric is
+//!   present and flat, so `TridentIndexerHeartbeatStale` fires on the
+//!   `changes(...) == 0` / `time() - ...` condition. The lag alert stays
+//!   silent here, which is exactly why this rule exists.
+//! - **Crashed** — the process exited. The metric goes stale, then absent;
+//!   `TridentIndexerHeartbeatStale` fires first, and
+//!   `TridentIndexerMetricsMissing` fires once the scrape target is gone.
+//! - **Not scraped** — the indexer is fine but Prometheus cannot reach it
+//!   (network, service discovery, relabeling). Only
+//!   `TridentIndexerMetricsMissing` fires; the heartbeat rule cannot evaluate
+//!   an absent series.
+//!
+//! See `docs/runbooks/indexer-stalled.md` for the triage procedure that
+//! distinguishes these three cases.
+=======
 
 #![allow(dead_code)] // Slack/PagerDuty sinks and Severity::Info are configured but not yet wired into the Alerter constructor.
 use chrono::Utc;

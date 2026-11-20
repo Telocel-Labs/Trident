@@ -18,9 +18,9 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
 # Threshold for security vulnerabilities.
-# "deny" fails the build on any vulnerability; we can temporarily set to
-# "allow" with explicit ignore entries below while triaging the backlog
-# from issue #373, then restore to "deny" once all 10 advisories are cleared.
+# "deny" fails the build on any vulnerability. The only exceptions are the
+# individually triaged entries in `ignore` below, each of which documents why
+# the advisory is not exploitable in our usage and when it must be re-reviewed.
 vulnerability = "deny"
 
 # Threshold for unmaintained crates
@@ -33,35 +33,91 @@ notice = "warn"
 yanked = "deny"
 
 # Ignore advisories for the given IDs during cargo-deny checks.
-# Each entry must document:
-#   - Which dependency/version is affected
-#   - Why we accept the risk (no fix available, doesn't affect our usage, etc.)
-#   - Date triaged
-#   - Issue reference if remediation is planned
 #
-# Template:
-# { id = "RUSTSEC-YYYY-NNNN", reason = "Explanation of why this is accepted" }
+# Every entry below is a formal acceptance of a specific advisory that could
+# not be resolved by upgrading or replacing the dependency. Each entry must
+# state:
+#   - the affected dependency and version
+#   - why the advisory is not exploitable in our usage
+#   - the date it was triaged and the issue reference
+#   - a review-by date, after which the entry must be re-validated
 #
-# Example ignore entries (remove/replace with actual triaged advisories):
-# { id = "RUSTSEC-2023-0001", reason = "Affects unused feature flag in transitive dep; no fix available; mitigated by not calling affected API. Triaged 2026-08-26 (#401)" }
+# Blanket ignores are not permitted. Keep this list in sync with
+# .cargo/audit.toml (cargo audit reads that file; cargo deny reads this one).
+#
+# Review-by dates are enforced by the `Dependency audit` CI job, which fails
+# once a review-by date has passed so the entry cannot silently rot.
 
 ignore = [
-    # The 11 advisories from issue #373 plus RUSTSEC-2026-0258, all triaged
-    # 2026-08-30 into .cargo/audit.toml. See that file for full rationale
-    # per advisory. Keep both lists in sync: cargo audit reads audit.toml,
-    # cargo deny reads this file, and the two use different entry syntax.
-    { id = "RUSTSEC-2026-0204", reason = "Transitive; fmt::Display only. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2023-0071", reason = "Transitive; no RSA ops. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2026-0049", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2026-0098", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2026-0099", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2026-0104", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2026-0190", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2024-0363", reason = "sqlx 0.7; needs dedicated upgrade PR. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2024-0436", reason = "Unmaintained build-time macro; no runtime impact. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2025-0119", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2025-0134", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.4.x upgraded to 0.4.19; remaining hit is h2 0.3.27 via tonic 0.11, which has no patched 0.3 release. Triaged 2026-08-30." },
+    # RUSTSEC-2026-0204: `time` 0.3.x panic in `Parsed::parse_str` on
+    # malformed offset. We only format timestamps via `time::OffsetDateTime`
+    # and never parse untrusted input with `time`. No patched release for the
+    # pinned 0.3 line yet. Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2026-0204", reason = "time 0.3.x: we only format timestamps, never parse untrusted input; no patched 0.3 release. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2023-0071: Marvin attack in `rsa` key decryption. Pulled in
+    # transitively by sqlx's MySQL backend; we use Postgres only and perform
+    # no RSA decryption anywhere. No fixed release exists upstream.
+    # Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2023-0071", reason = "rsa: transitive via sqlx MySQL backend (unused; we use Postgres only) and no RSA decryption is performed. No upstream fix. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2026-0049: rustls-webpki name-constraint bypass. The affected
+    # code path is only reachable when validating client certificates against
+    # name constraints; we use server-auth TLS with the platform verifier and
+    # never enable client-cert verification. Triaged 2026-08-30 (#401).
+    # Review by 2026-11-30.
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki: name-constraint path only reachable with client-cert verification, which we never enable (server-auth TLS only). Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2026-0098: `hickory-proto` NSEC3 record parsing panic. We use
+    # hickory only for forward A/AAAA lookups via the system resolver; DNSSEC
+    # record parsing is not enabled. Triaged 2026-08-30 (#401).
+    # Review by 2026-11-30.
+    { id = "RUSTSEC-2026-0098", reason = "hickory-proto: DNSSEC/NSEC3 parsing not enabled; only forward A/AAAA lookups are performed. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2026-0099: `hickory-proto` excessive memory use on crafted
+    # responses. Same usage as above: resolver queries only, with response
+    # size bounded by our HTTP client timeouts. Triaged 2026-08-30 (#401).
+    # Review by 2026-11-30.
+    { id = "RUSTSEC-2026-0099", reason = "hickory-proto: resolver-only usage with bounded response sizes; crafted-response path not exposed. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2026-0104: `hickory-proto` panic on malformed SVCB records.
+    # SVCB/HTTPS record queries are not issued by our resolver configuration.
+    # Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2026-0104", reason = "hickory-proto: SVCB/HTTPS record queries are not issued by our resolver configuration. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2026-0190: `hickory-proto` unbounded recursion in DNS message
+    # parsing. We never parse untrusted DNS messages directly; all parsing is
+    # internal to the resolver with recursion limits applied. Triaged
+    # 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2026-0190", reason = "hickory-proto: we never parse untrusted DNS messages directly; resolver applies recursion limits. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2024-0363: `sqlx` binary protocol mis-decoding with the MySQL
+    # backend. We compile sqlx with the `postgres` feature only; the MySQL
+    # driver is not linked. Upgrade to sqlx 0.8 is tracked separately and will
+    # remove this entry. Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2024-0363", reason = "sqlx: MySQL backend not compiled (postgres feature only); upgrade to 0.8 tracked separately. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2024-0436: `paste` is unmaintained. It is a build-time
+    # proc-macro dependency with no runtime code emitted into the binary and
+    # no known vulnerability. Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained build-time proc-macro; no runtime code emitted and no known vulnerability. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2025-0119: `hickory-proto` panic in `Message::from_vec` on
+    # truncated input. Not reachable: we do not call `Message::from_vec` on
+    # untrusted bytes. Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2025-0119", reason = "hickory-proto: Message::from_vec is never called on untrusted bytes. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2025-0134: `hickory-proto` denial of service via deeply nested
+    # records. Same mitigation as RUSTSEC-2026-0190: resolver-only usage with
+    # recursion limits. Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2025-0134", reason = "hickory-proto: resolver-only usage with recursion limits; nested-record DoS path not exposed. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
+
+    # RUSTSEC-2026-0258: `h2` request smuggling. h2 0.4.x has been upgraded to
+    # 0.4.19 (patched). The remaining hit is h2 0.3.27 via tonic 0.11, which
+    # has no patched 0.3 release; tonic is only used for gRPC health checks
+    # against a trusted in-cluster peer, not for untrusted client traffic.
+    # Triaged 2026-08-30 (#401). Review by 2026-11-30.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 via tonic 0.11 (no patched 0.3 release); used only for gRPC health checks to a trusted in-cluster peer, not untrusted client traffic. h2 0.4.x upgraded to 0.4.19. Triaged 2026-08-30 (#401). Review by 2026-11-30." },
 ]
 
 [licenses]

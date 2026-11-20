@@ -147,7 +147,5 @@ export function streamHeaders(network: Network, lastEventId?: string): HeadersIn
 
 export async function getIndexerStats(network: Network = "testnet"): Promise<IndexerStats> {
   // Public endpoint (security: [] in the OpenAPI spec) — no API key attached.
-  const res = await fetch(`${baseUrl(network)}/v1/stats/indexer`);
-  if (!res.ok) throw new Error(`API ${res.status}`);
-  return (await res.json()) as IndexerStats;
+  return fetchJson<IndexerStats>(`${baseUrl(network)}/v1/stats/indexer`);
 }

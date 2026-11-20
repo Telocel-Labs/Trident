@@ -12,7 +12,8 @@ import { truncate } from './format';
 
 const params = new URLSearchParams(window.location.search);
 const network: Network = params.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
-const contractId = decodeURIComponent(window.location.pathname.split('/')[2] ?? '');
+const pathSegments = window.location.pathname.split('/').filter(Boolean);
+const contractId = decodeURIComponent(pathSegments[1] ?? '');
 const topic0 = params.get('topic0') ?? '';
 
 const MAX_RECONNECT_ATTEMPTS = 10;
@@ -194,16 +195,24 @@ function stopStream(): void {
   }
 }
 
-document.addEventListener('click', (e) => {
-  const target = e.target as HTMLElement;
-  if (target.closest('#stream-reconnect')) {
-    startStream();
-    return;
-  }
-  const row = target.closest<HTMLTableRowElement>('tr[data-href]');
-  if (row?.dataset.href && !target.closest('a')) {
-    window.location.href = row.dataset.href;
-  }
-});
+function init(): void {
+  document.addEventListener('click', (e) => {
+    const target = e.target as HTMLElement;
+    if (target.closest('#stream-reconnect')) {
+      startStream();
+      return;
+    }
+    const row = target.closest<HTMLTableRowElement>('tr[data-href]');
+    if (row?.dataset.href && !target.closest('a')) {
+      window.location.href = row.dataset.href;
+    }
+  });
 
-startStream();
+  startStream();
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init, { once: true });
+} else {
+  init();
+}

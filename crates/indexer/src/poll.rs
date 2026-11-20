@@ -15,6 +15,45 @@
 
 use std::time::Duration;
 
+/// Records the wall-clock time (seconds since the Unix epoch) of the most
+/// recent *successful* poll, exported as
+/// `trident_indexer_last_poll_timestamp_seconds`.
+///
+/// The indexer-stalled alert (issue #400) watches this metric for silence
+/// rather than watching lag: if the indexer dies or the scrape target goes
+/// away, lag stops updating instead of climbing, so a flat lag line is
+/// indistinguishable from a healthy caught-up indexer. A heartbeat that only
+/// advances on success makes "no successful poll for N intervals" observable.
+///
+/// A failed poll (RPC error, DB error) must **not** bump the heartbeat — that
+/// is precisely what distinguishes "stalled" from "healthy but idle".
+#[derive(Debug, Default)]
+pub struct PollHeartbeat {
+    last_success_secs: Option<u64>,
+}
+
+impl PollHeartbeat {
+    pub fn new() -> Self {
+        Self {
+            last_success_secs: None,
+        }
+    }
+
+    /// Record a successful poll at `now_secs`. Call this only after the poll
+    /// has fully succeeded (RPC fetch *and* persistence); a poll that returns
+    /// no new ledgers still counts as success and must bump the heartbeat.
+    pub fn record_success(&mut self, now_secs: u64) {
+        self.last_success_secs = Some(now_secs);
+    }
+
+    /// The last successful poll timestamp, or `None` if no poll has ever
+    /// succeeded. Exported as the gauge value; `None` means the metric is
+    /// absent, which the scrape-target-down alert keys on.
+    pub fn last_success_secs(&self) -> Option<u64> {
+        self.last_success_secs
+    }
+}
+
 /// Multiplier applied to the adaptive interval when every configured RPC
 /// endpoint is critically degraded (`RpcHealthScorer::all_degraded`).
 /// Deliberately a flat multiplier rather than a separate set of
@@ -225,5 +264,44 @@ mod tests {
         assert_eq!(ap.next_interval(100), Duration::from_millis(250));
         // Caught up snaps to ceiling immediately.
         assert_eq!(ap.next_interval(0), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn heartbeat_starts_absent() {
+        let hb = PollHeartbeat::new();
+        assert_eq!(hb.last_success_secs(), None);
+    }
+
+    #[test]
+    fn heartbeat_flat_line_still_bumps_on_success() {
+        // A poll that returns no new ledgers (lag unchanged, flat line) is
+        // still a successful poll and must advance the heartbeat.
+        let mut hb = PollHeartbeat::new();
+        hb.record_success(1_000);
+        assert_eq!(hb.last_success_secs(), Some(1_000));
+        // Next poll: no new ledgers, but it succeeded.
+        hb.record_success(1_005);
+        assert_eq!(hb.last_success_secs(), Some(1_005));
+    }
+
+    #[test]
+    fn heartbeat_unchanged_on_failed_poll() {
+        // A failed poll (RPC or DB error) must not bump the heartbeat: the
+        // caller simply does not call `record_success`. The timestamp stays
+        // frozen, which is what the silence alert fires on.
+        let mut hb = PollHeartbeat::new();
+        hb.record_success(1_000);
+        // Failed poll at t=1_005: no `record_success` call.
+        assert_eq!(hb.last_success_secs(), Some(1_000));
+        // Still frozen after several consecutive failures.
+        assert_eq!(hb.last_success_secs(), Some(1_000));
+    }
+
+    #[test]
+    fn heartbeat_never_advances_if_all_polls_fail() {
+        let hb = PollHeartbeat::new();
+        // No successful poll ever: metric stays absent so the
+        // scrape-target-down alert fires.
+        assert_eq!(hb.last_success_secs(), None);
     }
 }

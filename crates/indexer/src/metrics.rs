@@ -452,6 +452,23 @@ pub fn record_heartbeat() {
     set_heartbeat_timestamp(secs);
 }
 
+/// Stamp the poll heartbeat at the end of a completed poll cycle (issue #400).
+///
+/// Must be called on *every* completed cycle, including ones that make no
+/// forward progress (no new ledgers, empty event page, or a cycle that ends in
+/// a recoverable error). The heartbeat is the only signal that distinguishes
+/// "indexer is alive but the chain is quiet" from "indexer is dead": ledger lag
+/// stops updating rather than climbing when the process dies, so a lag-only
+/// alert reads a flat line as healthy. An alert on `absent()`/`changes()` over
+/// this gauge fires when no successful poll has occurred for N intervals.
+///
+/// Kept as a thin wrapper over [`record_heartbeat`] so the metric name and
+/// help text stay unchanged and the alert rules / verify-alert-metrics.sh keep
+/// matching.
+pub fn record_poll_heartbeat() {
+    record_heartbeat();
+}
+
 /// Publish the indexer's own Postgres pool utilisation (docs/metrics-catalog.md).
 pub fn set_db_pool_stats(size: u32, idle: u32) {
     gauge!(DB_POOL_SIZE).set(size as f64);
@@ -709,4 +726,43 @@ pub fn set_rpc_circuit_state(endpoint: &str, state: &str) {
         _ => 0.0,
     };
     gauge!(RPC_CIRCUIT_STATE, "endpoint" => endpoint.to_string()).set(val);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    /// The heartbeat must advance on a completed cycle that made no forward
+    /// progress (issue #400). A no-progress cycle is the flat-line case: lag
+    /// does not change, so only the heartbeat proves the indexer is alive.
+    #[test]
+    fn poll_heartbeat_updates_on_no_progress_cycle() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // Seed an older heartbeat, as if the previous cycle ran a while ago.
+        set_heartbeat_timestamp(1_000.0);
+
+        // A cycle that advances nothing still completes and must stamp.
+        record_poll_heartbeat();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let heartbeat = snapshot
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == HEARTBEAT_TIMESTAMP)
+            .expect("heartbeat gauge must be present after a completed cycle");
+
+        match heartbeat.3 {
+            DebugValue::Gauge(value) => {
+                let stamped = value.into_inner();
+                assert!(
+                    stamped > 1_000.0,
+                    "heartbeat must advance past the seeded value on a no-progress cycle, got {stamped}"
+                );
+            }
+            other => panic!("heartbeat must be a gauge, got {other:?}"),
+        }
+    }
 }
