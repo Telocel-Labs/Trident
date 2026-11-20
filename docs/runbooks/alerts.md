@@ -912,6 +912,115 @@ distinct poisoned events, not retry bursts.
 
 ---
 
+## TridentIndexerPollFailures
+
+**Means:** one of the poll cycle's deliberately non-fatal failure paths is
+failing repeatedly. `trident_indexer_poll_failures_total` is a single counter
+labelled by `failure_class` (issue #631); every class is a path that logs a
+`tracing::warn!` and lets the cycle continue, so the indexer looks healthy —
+lag, heartbeat and RPC metrics are normal — while that specific work keeps
+failing. Before #631 none of these incremented anything, so the only trace was
+a log line nothing watched.
+
+`contract_filter_refresh` is emitted by two independent loops — the poll
+loop's periodic reload and the spec-sync pass's allowlist read. They are
+separate failed reads, so during a shared database outage the class can rise
+once per attempt; each individual failed read is counted exactly once.
+
+**Why this threshold:** the rule checks whether failures occurred in the last 5 minutes and requires that condition to remain true for 15 minutes. Failures must therefore keep recurring throughout the hold period; one isolated failure will not trigger the alert. Every class is seeded at zero on startup.
+**The classes, and what each one affects:**
+
+| `failure_class` | Path | What is degraded while it fails |
+|---|---|---|
+| `contract_filter_refresh` | `refresh_contract_filter` / spec-sync allowlist load | The previous allowlist stays in effect; newly registered contracts are not picked up until a refresh succeeds. |
+| `contract_spec_persist` | `db::upsert_contract_spec` | A redeployed contract's spec (and its SEP-41 token classification) is stale until a later pass persists it. |
+| `contract_spec_fetch` | `spec::fetch_contract_specs` | The whole spec-sync pass is skipped; token classification and storage-snapshot bounding stay on the previous result. |
+| `get_transaction` | `RpcClient::get_transaction` | Invocation fee/resource metering is skipped for the affected transactions. |
+| `get_transaction_not_found` | `getTransaction` returned `NOT_FOUND` | Same as above for a just-indexed event; usually a lagging RPC node, not data loss. |
+| `get_transaction_missing_xdr` | response lacked envelope/result XDR | Invocation metering skipped for those transactions. |
+| `invocation_metrics_decode` | `decode_invocation_metrics` | Invocation metering skipped for those transactions; likely a parser gap if sustained. |
+| `token_metadata_lookup` | `db::fresh_token_metadata_contract_ids` | This cycle's token-metadata resolution is skipped entirely. |
+| `token_metadata_resolve` | `token_metadata::resolve` | One contract's token metadata is not refreshed; retried on a later poll. |
+| `token_metadata_cache` | `db::upsert_token_metadata` | Metadata was resolved but not cached, so it is re-resolved on the next activity-bearing page. |
+| `get_ledgers` | `getLedger(seq)` | The page's `ledger_metadata` row is stored with an empty hash, so reorg detection cannot compare that ledger. |
+| `storage_snapshot_fetch` | `storage::fetch_balance_snapshots` | Balance snapshots are missing for that contract's holders this cycle. |
+| `health_stats_write` | `db::update_health_stats` | `indexer_health_stats` is stale; other lag/heartbeat signals are unaffected. |
+| `alert_state` | `db::get_alert_state` / `db::set_alert_state` | Webhook alerting cannot read or persist its cooldown/state, so alerts may repeat or be missed this cycle. |
+
+**First steps:**
+
+1. Find the `failure_class` in the alert label, then search the indexer logs
+   for that class's warning. All fourteen messages are distinct; this single
+   regex covers every one of them and matches nothing else in the poll cycle
+   (each alternative is a literal from `crates/indexer/src/streamer/mod.rs` or
+   `spec_sync.rs`):
+
+   ```bash
+   kubectl logs deploy/trident-indexer --since=1h --tail=-1 | grep -E \
+     'Failed to (refresh contract filter|load contracts for spec sync|persist contract spec|decode invocation metrics|load fresh token_metadata|resolve token metadata|cache token metadata|fetch storage snapshot|update health stats|persist alert state|read alert state)|Contract spec fetch failed|getTransaction (failed|returned NOT_FOUND|response missing)|getLedgers failed'
+   ```
+
+   A bare `grep -i "failed to"` is not enough: several classes never use that
+   phrasing (`getTransaction returned NOT_FOUND …`, `getLedgers failed,
+   storing empty hash`), so they are missed, and it also drags in unrelated
+   warnings. `--tail=-1` defeats kubectl's default 10-line cap; raise `--since`
+   if the class has been failing for longer than an hour. The indexer is
+   deployed `Recreate` and single-writer, so `deploy/trident-indexer` has one
+   pod at a time — after a crash-loop restart, add `--previous` to read the
+   container that was replaced.
+
+   The class → warning mapping (grep a single quoted fragment if you only care
+   about one class):
+
+   | `failure_class` | Warning text |
+   |---|---|
+   | `contract_filter_refresh` | `Failed to refresh contract filter; keeping existing` (poll loop) / `Failed to load contracts for spec sync; will retry next pass` (spec sync) |
+   | `contract_spec_persist` | `Failed to persist contract spec` |
+   | `contract_spec_fetch` | `Contract spec fetch failed; will retry next pass` |
+   | `get_transaction` | `getTransaction failed; skipping invocation metrics` |
+   | `get_transaction_not_found` | `getTransaction returned NOT_FOUND for a just-indexed event; skipping invocation metrics` |
+   | `get_transaction_missing_xdr` | `getTransaction response missing envelope/result XDR; skipping invocation metrics` |
+   | `invocation_metrics_decode` | `Failed to decode invocation metrics` |
+   | `token_metadata_lookup` | `Failed to load fresh token_metadata contract ids; skipping this cycle's resolution` |
+   | `token_metadata_resolve` | `Failed to resolve token metadata; will retry on a future poll` |
+   | `token_metadata_cache` | `Failed to cache token metadata` |
+   | `get_ledgers` | `getLedgers failed, storing empty hash` |
+   | `storage_snapshot_fetch` | `Failed to fetch storage snapshot` |
+   | `health_stats_write` | `Failed to update health stats` |
+   | `alert_state` | `Failed to persist alert state` / `Failed to read alert state` |
+
+   Each warning carries the full error (`error = ...`) and the context the
+   metric deliberately omits (`tx_hash`, `contract_id`, `seq`).
+   `getLedgers returned no ledger for sequence` is a separate, deliberately
+   uninstrumented path — it belongs to no class and is not in this filter.
+2. Check whether the failure is shared across classes. Several classes
+   failing together (e.g. `token_metadata_cache` + `health_stats_write` +
+   `alert_state`) points at the database rather than at any one code path —
+   check the DB pool gauges, connection errors, and `pg_stat_activity`.
+3. `get_transaction*` / `get_ledgers` / `storage_snapshot_fetch` / `contract_spec_fetch`
+   classes failing together point at the RPC provider: check
+   `trident_indexer_rpc_errors_total` and the endpoint health scores. These
+   resume automatically once the provider recovers.
+4. A single class failing persistently usually means a schema/permissions
+   problem (e.g. a missing grant on `token_metadata` or `indexer_health_stats`)
+   or a parser gap. Fix the cause; the affected work resumes on the next poll
+   cycle or spec-sync pass automatically.
+
+   `trident-backfill` re-fetches `soroban_events` for a ledger range
+   (`--from-ledger`/`--to-ledger`, optionally `--contract`); it does not
+   rebuild invocation metering, `token_metadata`, storage snapshots,
+   `ledger_metadata` hashes, contract specs, health stats, or alerter state.
+   So for most of these classes there is no backfill that repairs what was
+   skipped. The exception is `contract_filter_refresh`: while the allowlist
+   is stale, events from a newly registered contract are not indexed for the
+   ledgers that pass in the meantime, and those events can be recovered with
+   `trident-backfill --from-ledger <from> --to-ledger <to> --contract <id>`
+   (its derived tables are still not rebuilt by backfill).
+5. If the class is `alert_state`, confirm webhook alerting still works
+   (`ALERT_WEBHOOK_URL`); the failure only affects cooldown/state persistence.
+
+---
+
 ## TridentOutboxBacklogWarning
 
 **Means:** `trident_indexer_outbox_backlog` has been at or above 10,000 rows

@@ -178,6 +178,78 @@ pub const RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL: &str =
 pub const PARTITION_MAINTENANCE_FAILURES_TOTAL: &str =
     "trident_indexer_partition_maintenance_failures_total";
 
+/// Failure paths in the poll cycle (and the spec-sync pass it depends on)
+/// that are deliberately non-fatal — the cycle logs a warning, keeps polling,
+/// and until issue #631 incremented nothing. One shared counter labelled by
+/// `failure_class` (see [`POLL_FAILURE_CLASSES`]) rather than fourteen metric
+/// names, so a single alert covers all of them while the label still says
+/// which one is happening. Each value counts failed attempts: one increment
+/// per failed operation, at the branch that swallows it.
+pub const POLL_FAILURES_TOTAL: &str = "trident_indexer_poll_failures_total";
+
+/// The bounded `failure_class` values for [`POLL_FAILURES_TOTAL`].
+///
+/// Every value is a stable, compile-time constant: the label never carries a
+/// transaction hash, contract ID, ledger number, or error message, so its
+/// cardinality is fixed at 14. Used both to seed the series at zero in
+/// [`install`] and to document the accepted set next to the recorder.
+pub const POLL_FAILURE_CLASSES: [&str; 14] = [
+    POLL_FAILURE_CONTRACT_FILTER_REFRESH,
+    POLL_FAILURE_CONTRACT_SPEC_PERSIST,
+    POLL_FAILURE_CONTRACT_SPEC_FETCH,
+    POLL_FAILURE_GET_TRANSACTION,
+    POLL_FAILURE_GET_TRANSACTION_NOT_FOUND,
+    POLL_FAILURE_GET_TRANSACTION_MISSING_XDR,
+    POLL_FAILURE_INVOCATION_METRICS_DECODE,
+    POLL_FAILURE_TOKEN_METADATA_LOOKUP,
+    POLL_FAILURE_TOKEN_METADATA_RESOLVE,
+    POLL_FAILURE_TOKEN_METADATA_CACHE,
+    POLL_FAILURE_GET_LEDGERS,
+    POLL_FAILURE_STORAGE_SNAPSHOT_FETCH,
+    POLL_FAILURE_HEALTH_STATS_WRITE,
+    POLL_FAILURE_ALERT_STATE,
+];
+
+/// The contract allowlist could not be reloaded, so the previous filter is
+/// still in effect.
+///
+/// Two independent loops perform this read: the poll loop's periodic
+/// `refresh_contract_filter` and the spec-sync pass's allowlist load. Each
+/// failed read increments the class once, at its own error branch. They are
+/// separate attempts on separate tasks — neither calls the other, and the
+/// poll loop's caller only logs the propagated error — so one failed read is
+/// never counted twice.
+pub const POLL_FAILURE_CONTRACT_FILTER_REFRESH: &str = "contract_filter_refresh";
+/// A fetched contract spec could not be persisted to `contract_specs`.
+pub const POLL_FAILURE_CONTRACT_SPEC_PERSIST: &str = "contract_spec_persist";
+/// Fetching contract specs for the allowlist failed for the whole pass.
+pub const POLL_FAILURE_CONTRACT_SPEC_FETCH: &str = "contract_spec_fetch";
+/// The `getTransaction` call for per-invocation metering failed.
+pub const POLL_FAILURE_GET_TRANSACTION: &str = "get_transaction";
+/// `getTransaction` reported `NOT_FOUND` for a just-indexed event.
+pub const POLL_FAILURE_GET_TRANSACTION_NOT_FOUND: &str = "get_transaction_not_found";
+/// A `getTransaction` response lacked the envelope/result XDR needed to decode
+/// metering.
+pub const POLL_FAILURE_GET_TRANSACTION_MISSING_XDR: &str = "get_transaction_missing_xdr";
+/// Invocation-metrics decoding failed for a transaction whose metering was
+/// otherwise retrievable.
+pub const POLL_FAILURE_INVOCATION_METRICS_DECODE: &str = "invocation_metrics_decode";
+/// Reading the cache of fresh `token_metadata` contract IDs failed.
+pub const POLL_FAILURE_TOKEN_METADATA_LOOKUP: &str = "token_metadata_lookup";
+/// Resolving SEP-41 token metadata for one contract failed.
+pub const POLL_FAILURE_TOKEN_METADATA_RESOLVE: &str = "token_metadata_resolve";
+/// Resolved token metadata could not be cached (upsert failed).
+pub const POLL_FAILURE_TOKEN_METADATA_CACHE: &str = "token_metadata_cache";
+/// The `getLedgers` call that supplies a page's ledger hash failed.
+pub const POLL_FAILURE_GET_LEDGERS: &str = "get_ledgers";
+/// Fetching contract-storage balance snapshots failed for one contract.
+pub const POLL_FAILURE_STORAGE_SNAPSHOT_FETCH: &str = "storage_snapshot_fetch";
+/// The per-cycle `indexer_health_stats` write failed.
+pub const POLL_FAILURE_HEALTH_STATS_WRITE: &str = "health_stats_write";
+/// Reading or persisting alerter state failed (either direction of the
+/// read-modify-write).
+pub const POLL_FAILURE_ALERT_STATE: &str = "alert_state";
+
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
 pub fn install(port: u16) -> Result<(), TridentError> {
@@ -349,6 +421,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         LEDGER_GAPS_CLOSED_TOTAL,
         "Previously-enqueued backfill jobs confirmed filled by a later gap scan (issue #216)"
     );
+    describe_counter!(
+        POLL_FAILURES_TOTAL,
+        "Non-fatal poll-cycle failures that were logged and swallowed, labelled by failure_class (issue #631)"
+    );
     describe_gauge!(
         LEDGER_GAPS_TOTAL,
         "Number of missing ledger sequences detected in the processed range"
@@ -417,6 +493,12 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     // alerts `sum()` across labels, so the series just has to exist.
     for method in ["getEvents", "getLedgers"] {
         histogram!(RPC_CALL_DURATION_SECONDS, "method" => method, "endpoint" => "0").record(0.0);
+    }
+    // Seed every bounded failure class at zero, so a class that has never
+    // failed is visibly present (and distinguishable from one this build does
+    // not know about) from the first scrape (issue #631).
+    for failure_class in POLL_FAILURE_CLASSES {
+        counter!(POLL_FAILURES_TOTAL, "failure_class" => failure_class).increment(0);
     }
 
     tracing::info!(port, "Metrics endpoint listening");
@@ -694,6 +776,20 @@ pub fn record_partition_maintenance_failure() {
     counter!(PARTITION_MAINTENANCE_FAILURES_TOTAL).increment(1);
 }
 
+/// Count a non-fatal poll-cycle failure (issue #631).
+///
+/// `failure_class` must be one of [`POLL_FAILURE_CLASSES`] — those constants
+/// are the only accepted values, which is what keeps the label bounded. The
+/// corresponding warning log still carries the full error and context; this
+/// counter only makes the occurrence visible to Prometheus.
+pub fn record_poll_failure(failure_class: &'static str) {
+    debug_assert!(
+        POLL_FAILURE_CLASSES.contains(&failure_class),
+        "unbounded poll failure_class label: {failure_class}"
+    );
+    counter!(POLL_FAILURES_TOTAL, "failure_class" => failure_class).increment(1);
+}
+
 /// Publish the current number of detected ledger gaps.
 pub fn set_ledger_gaps(count: i64) {
     gauge!(LEDGER_GAPS_TOTAL).set(count as f64);
@@ -709,4 +805,75 @@ pub fn set_rpc_circuit_state(endpoint: &str, state: &str) {
         _ => 0.0,
     };
     gauge!(RPC_CIRCUIT_STATE, "endpoint" => endpoint.to_string()).set(val);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::MetricKind;
+
+    /// Read one `trident_indexer_poll_failures_total{failure_class=...}` series
+    /// out of the flattened recorder snapshot, or 0 when it has not been
+    /// touched. A macro rather than a function because the snapshot's element
+    /// type is an internal tuple, and naming it in a signature adds nothing.
+    macro_rules! poll_failures_value {
+        ($snapshot:expr, $class:expr) => {
+            $snapshot
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.kind() == MetricKind::Counter
+                        && key.key().name() == POLL_FAILURES_TOTAL
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "failure_class" && label.value() == $class)
+                })
+                .map(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => *n,
+                    other => panic!("expected a counter, got {other:?}"),
+                })
+                .unwrap_or(0)
+        };
+    }
+
+    #[test]
+    fn record_poll_failure_increments_the_expected_labelled_counter() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = ::metrics::set_default_local_recorder(&recorder);
+
+        record_poll_failure(POLL_FAILURE_GET_LEDGERS);
+        record_poll_failure(POLL_FAILURE_GET_LEDGERS);
+        record_poll_failure(POLL_FAILURE_ALERT_STATE);
+        drop(guard);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            poll_failures_value!(snapshot, POLL_FAILURE_GET_LEDGERS),
+            2,
+            "the labelled series must count every increment"
+        );
+        assert_eq!(
+            poll_failures_value!(snapshot, POLL_FAILURE_ALERT_STATE),
+            1,
+            "a different failure class must stay distinguishable"
+        );
+    }
+
+    #[test]
+    fn poll_failure_classes_are_distinct_and_bounded() {
+        // Bounded cardinality is the whole point of one shared counter: a
+        // duplicated or accidentally-unbounded value would either collide two
+        // failure classes or let the label set grow without limit.
+        let unique: std::collections::HashSet<&str> = POLL_FAILURE_CLASSES.into_iter().collect();
+        assert_eq!(unique.len(), POLL_FAILURE_CLASSES.len());
+        assert_eq!(unique.len(), 14, "issue #631 enumerates fourteen classes");
+        for class in POLL_FAILURE_CLASSES {
+            assert!(
+                class.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "failure classes are stable snake_case identifiers: {class}"
+            );
+        }
+    }
 }

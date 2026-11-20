@@ -253,6 +253,46 @@ groups:
           runbook_url: "docs/runbooks/alerts.md#tridentindexerretainedfloorledgersskipped"
 
   # ---------------------------------------------------------------------------
+  # Swallowed poll-cycle failures (issue #631). Fourteen failure paths in the
+  # poll cycle (and the spec-sync pass it depends on) are deliberately
+  # non-fatal: the cycle logs a warning and keeps polling. Before #631 the only
+  # trace was a log line, so a permanently failing token-metadata cache, storage
+  # snapshot fetch, or health-stats write could run for weeks unnoticed — the
+  # indexer stayed "up" while quietly degrading. They now share one counter,
+  # trident_indexer_poll_failures_total, labelled by the bounded failure_class
+  # (never a tx hash, contract ID, or error message).
+  #
+  # Grouped by failure_class so the alert names which path is failing instead
+  # of paging on an opaque total. The 5m range only sees recent failures, so a
+  # one-off blip falls back to zero long before `for: 15m` elapses; the alert
+  # fires only when a class keeps failing in every 5-minute window for 15
+  # minutes straight.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.poll_failures
+    rules:
+      - alert: TridentIndexerPollFailures
+        expr: sum by (failure_class) (increase(trident_indexer_poll_failures_total[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer poll-cycle failures keep occurring ({{ $labels.failure_class }})"
+          description: >
+            trident_indexer_poll_failures_total{failure_class="{{ $labels.failure_class }}"}
+            has recorded at least one failure in every 5-minute window for the
+            last 15 minutes. This failure path is
+            non-fatal by design — the poll cycle logs a warning and carries on
+            — so the indexer can look healthy (lag, heartbeat, RPC metrics all
+            normal) while this specific work keeps failing. Depending on the
+            class, events are still indexed but invocation metering, token
+            metadata, storage snapshots, ledger hashes, health stats, alerter
+            state, or the contract allowlist reload may be stale or missing.
+            Check the indexer logs for the matching warning and the runbook
+            for what each class affects.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpollfailures"
+
+  # ---------------------------------------------------------------------------
   # Stellar RPC health (#297).
   # ---------------------------------------------------------------------------
   - name: trident.indexer.rpc
