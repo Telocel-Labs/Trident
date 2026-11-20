@@ -24,6 +24,7 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_persist_dead_letter_backlog` | gauge | — | rows | `failed_events` rows awaiting replay (`replayed_at IS NULL`), refreshed each active poll cycle and on every dead-letter write; non-empty pages via `TridentIndexerPersistDeadLetterBacklog` (#508). |
 | `trident_indexer_poll_duration_seconds` | histogram | — | seconds | Wall-clock time of one `poll_once` cycle (may span multiple RPC pages). |
 | `trident_indexer_poll_errors_total` | counter | — | cycles | Poll cycles that returned an error (logged, cursor unaffected, retried next interval). |
+| `trident_indexer_poll_failures_total` | counter | `failure_class` (14 bounded values, e.g. `get_transaction`, `token_metadata_cache`, `health_stats_write`) | failures | Non-fatal poll-cycle failure paths that log a warning and let the cycle continue (#631). One shared counter instead of fourteen names; the label never carries a tx hash, contract ID or error message. Seeded at zero for every class on startup, alerted via `TridentIndexerPollFailures`. |
 | `trident_indexer_rpc_retries_total` | counter | — | retries | Retries triggered by transient `getEvents` failures (exponential backoff). |
 | `trident_indexer_rpc_call_duration_seconds` | histogram | `method` (`getEvents`\|`getLedgers`) | seconds | Stellar RPC call latency, per method. |
 | `trident_indexer_rpc_errors_total` | counter | `method` | calls | Stellar RPC calls that returned an error, per method. |

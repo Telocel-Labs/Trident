@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use trident_common::TridentError;
 
 use crate::db;
+use crate::metrics;
 use crate::rpc::RpcClient;
 use crate::spec::{self, SpecCache};
 
@@ -125,6 +126,7 @@ impl SpecSync {
             }
             Ok(map) => map.into_keys().collect::<Vec<_>>(),
             Err(e) => {
+                metrics::record_poll_failure(metrics::POLL_FAILURE_CONTRACT_FILTER_REFRESH);
                 tracing::warn!(
                     error = %e,
                     "Failed to load contracts for spec sync; will retry next pass"
@@ -136,6 +138,7 @@ impl SpecSync {
         let specs = match spec::fetch_contract_specs(&self.rpc, &self.cache, &contract_ids).await {
             Ok(specs) => specs,
             Err(e) => {
+                metrics::record_poll_failure(metrics::POLL_FAILURE_CONTRACT_SPEC_FETCH);
                 tracing::warn!(
                     error = %e,
                     "Contract spec fetch failed; will retry next pass"
@@ -191,6 +194,7 @@ impl SpecSync {
                     }
                 }
                 Err(e) => {
+                    metrics::record_poll_failure(metrics::POLL_FAILURE_CONTRACT_SPEC_PERSIST);
                     tracing::warn!(
                         contract_id = %contract_id,
                         error = %e,

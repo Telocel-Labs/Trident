@@ -261,9 +261,11 @@ impl Streamer {
                 Ok(())
             }
             Err(e) => {
-                // Non-fatal: keep the existing filter, log the error.
-                tracing::warn!(error = %e, "Failed to refresh contract filter; keeping existing");
-                Ok(())
+                // Non-fatal for the poll loop, but not a success: the existing
+                // filter is preserved and the failure is propagated so the
+                // caller can log it and carry on polling (issue #631).
+                metrics::record_poll_failure(metrics::POLL_FAILURE_CONTRACT_FILTER_REFRESH);
+                Err(e)
             }
         }
     }
@@ -431,7 +433,14 @@ impl Streamer {
             if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 // Spec sync reloads the allowlist itself on every pass, so it
                 // needs no coupling to this refresh (issue #725).
-                self.refresh_contract_filter().await?;
+                //
+                // A failed reload keeps the previous filter in effect and is
+                // retried on the next refresh; it is not a reason to halt the
+                // poll loop. Surfaced as a warning and a metric rather than
+                // silently reported as success (issue #631).
+                if let Err(e) = self.refresh_contract_filter().await {
+                    tracing::warn!(error = %e, "Failed to refresh contract filter; keeping existing");
+                }
             }
 
             // Periodically scan for gaps in the processed ledger range and
@@ -601,6 +610,7 @@ impl Streamer {
         let resp = match self.rpc.get_transaction(tx_hash).await {
             Ok(resp) => resp,
             Err(e) => {
+                metrics::record_poll_failure(metrics::POLL_FAILURE_GET_TRANSACTION);
                 tracing::warn!(
                     tx_hash,
                     error = %e,
@@ -611,6 +621,7 @@ impl Streamer {
         };
 
         if resp.status == "NOT_FOUND" {
+            metrics::record_poll_failure(metrics::POLL_FAILURE_GET_TRANSACTION_NOT_FOUND);
             tracing::warn!(
                 tx_hash,
                 "getTransaction returned NOT_FOUND for a just-indexed event; skipping invocation metrics"
@@ -621,6 +632,7 @@ impl Streamer {
         let (envelope_xdr, result_xdr) = match (resp.envelope_xdr, resp.result_xdr) {
             (Some(envelope), Some(result)) => (envelope, result),
             _ => {
+                metrics::record_poll_failure(metrics::POLL_FAILURE_GET_TRANSACTION_MISSING_XDR);
                 tracing::warn!(
                     tx_hash,
                     status = %resp.status,
@@ -636,6 +648,7 @@ impl Streamer {
         ) {
             Ok(metrics) => Some(metrics),
             Err(e) => {
+                metrics::record_poll_failure(metrics::POLL_FAILURE_INVOCATION_METRICS_DECODE);
                 tracing::warn!(tx_hash, error = %e, "Failed to decode invocation metrics");
                 None
             }
@@ -675,6 +688,7 @@ impl Streamer {
         {
             Ok(fresh) => fresh,
             Err(e) => {
+                metrics::record_poll_failure(metrics::POLL_FAILURE_TOKEN_METADATA_LOOKUP);
                 tracing::warn!(error = %e, "Failed to load fresh token_metadata contract ids; skipping this cycle's resolution");
                 return;
             }
@@ -688,6 +702,7 @@ impl Streamer {
             let resolution = match token_metadata::resolve(&self.rpc, &contract_id).await {
                 Ok(resolution) => resolution,
                 Err(e) => {
+                    metrics::record_poll_failure(metrics::POLL_FAILURE_TOKEN_METADATA_RESOLVE);
                     tracing::warn!(
                         contract_id = %contract_id,
                         error = %e,
@@ -701,6 +716,7 @@ impl Streamer {
                 db::upsert_token_metadata(&self.db, &contract_id, &self.config.network, &resolution)
                     .await
             {
+                metrics::record_poll_failure(metrics::POLL_FAILURE_TOKEN_METADATA_CACHE);
                 tracing::warn!(
                     contract_id = %contract_id,
                     error = %e,
@@ -1098,6 +1114,7 @@ impl Streamer {
                             String::new()
                         }
                         Err(e) => {
+                            metrics::record_poll_failure(metrics::POLL_FAILURE_GET_LEDGERS);
                             tracing::warn!(seq, error = %e, "getLedgers failed, storing empty hash");
                             String::new()
                         }
@@ -1231,6 +1248,9 @@ impl Streamer {
                     {
                         Ok(obs) => obs,
                         Err(e) => {
+                            metrics::record_poll_failure(
+                                metrics::POLL_FAILURE_STORAGE_SNAPSHOT_FETCH,
+                            );
                             tracing::warn!(contract_id, error = %e, "Failed to fetch storage snapshot");
                             continue;
                         }
@@ -1383,6 +1403,7 @@ impl Streamer {
         )
         .await
         {
+            metrics::record_poll_failure(metrics::POLL_FAILURE_HEALTH_STATS_WRITE);
             tracing::warn!(error = %e, "Failed to update health stats");
         }
 
@@ -1418,10 +1439,12 @@ impl Streamer {
                     if let Err(e) =
                         db::set_alert_state(&self.db, &self.config.network, &alert_state).await
                     {
+                        metrics::record_poll_failure(metrics::POLL_FAILURE_ALERT_STATE);
                         tracing::warn!(error = %e, "Failed to persist alert state");
                     }
                 }
                 Err(e) => {
+                    metrics::record_poll_failure(metrics::POLL_FAILURE_ALERT_STATE);
                     tracing::warn!(error = %e, "Failed to read alert state");
                 }
             }
@@ -2168,6 +2191,138 @@ mod tests {
     ) -> Streamer {
         let config = test_config(db_url, redis_url, rpc_url);
         Streamer::new(config, db).await.unwrap()
+    }
+
+    /// Build a `Streamer` without any reachable service.
+    ///
+    /// `Streamer::new` loads the contract allowlist first, so a test that
+    /// needs that load to fail cannot go through it. The pool here is lazy and
+    /// points at a closed port: nothing connects until the first query, which
+    /// then fails fast. Used to exercise the refresh failure path (issue #631).
+    fn streamer_with_unreachable_db() -> Streamer {
+        let config = test_config(
+            "postgres://trident:trident@127.0.0.1:1/trident",
+            "redis://127.0.0.1:1",
+            "http://127.0.0.1:1".to_string(),
+        );
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy(&config.database_url)
+            .expect("lazy pool");
+        let rpc = RpcClient::with_endpoints(
+            config.stellar_rpc_urls.clone(),
+            &RpcHttpSettings {
+                connect_timeout: config.rpc_connect_timeout,
+                request_timeout: config.rpc_request_timeout,
+                pool_idle_timeout: config.rpc_pool_idle_timeout,
+                pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
+                tcp_keepalive: config.rpc_tcp_keepalive,
+                max_calls_per_sec: config.rpc_max_calls_per_sec,
+                headers: Vec::new(),
+                endpoint_headers: (0..config.stellar_rpc_urls.len())
+                    .map(|index| config.rpc_headers.for_endpoint(index))
+                    .collect(),
+            },
+        )
+        .expect("rpc client");
+        let adaptive_poll = AdaptivePoll::new(AdaptivePollConfig {
+            floor: config.poll_interval_floor,
+            ceiling: config.poll_interval_ceiling,
+            high_watermark: config.lag_high_watermark,
+            hysteresis_ledgers: config.poll_hysteresis_ledgers,
+        });
+        let rpc_breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: config.rpc_breaker_failure_threshold,
+            cooldown: config.rpc_breaker_cooldown,
+        });
+        let alerter = Alerter::from_config(
+            None,
+            config.alert_lag_threshold,
+            config.alert_cooldown_minutes,
+        )
+        .expect("alerter");
+
+        Streamer {
+            parser: Parser::new(config.index_diagnostic),
+            db,
+            rpc: Arc::new(rpc),
+            contract_filter: None,
+            filter_plan: plan_filters(None, &config.topic_filters),
+            poll_count: 0,
+            alerter,
+            last_chain_tip: 0,
+            adaptive_poll,
+            token_contracts: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            rpc_breaker,
+            config,
+        }
+    }
+
+    /// Issue #631: a failed allowlist reload must not report success. The
+    /// previous filter stays in effect (indexing keeps working against the
+    /// old allowlist) and the error is propagated so the poll loop can log it
+    /// and retry next refresh instead of halting.
+    #[tokio::test]
+    async fn refresh_contract_filter_propagates_load_failure_and_keeps_existing_filter() {
+        let mut s = streamer_with_unreachable_db();
+        let existing: HashMap<String, i64> =
+            [("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), 7i64)]
+                .into_iter()
+                .collect();
+        s.filter_plan = plan_filters(Some(&existing), &s.config.topic_filters);
+        let existing_plan = s.filter_plan.clone();
+        s.contract_filter = Some(existing.clone());
+
+        // Exactly one increment for one failed reload (issue #631): the counter
+        // is recorded at the error branch, and the caller only logs the
+        // propagated error, so the same failure cannot be counted twice. The
+        // recorder is installed before the failure so this single attempt is
+        // the only thing it can observe. A local (thread) recorder keeps the
+        // test independent of the global recorder installed by `install()`.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let err = s
+            .refresh_contract_filter()
+            .await
+            .expect_err("a failed reload must be propagated, not reported as Ok(())");
+        assert!(
+            !err.to_string().is_empty(),
+            "the propagated error should carry the load failure"
+        );
+        drop(guard);
+
+        assert_eq!(
+            s.contract_filter.as_ref(),
+            Some(&existing),
+            "a failed refresh must leave the previous allowlist intact"
+        );
+        assert_eq!(
+            s.filter_plan, existing_plan,
+            "a failed refresh must leave the previous filter plan intact"
+        );
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counted: u64 = snapshot
+            .iter()
+            .filter(|(key, _, _, _)| {
+                key.kind() == metrics_util::MetricKind::Counter
+                    && key.key().name() == metrics::POLL_FAILURES_TOTAL
+                    && key.key().labels().any(|label| {
+                        label.key() == "failure_class"
+                            && label.value() == metrics::POLL_FAILURE_CONTRACT_FILTER_REFRESH
+                    })
+            })
+            .map(|(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(n) => *n,
+                other => panic!("expected a counter, got {other:?}"),
+            })
+            .sum();
+        assert_eq!(
+            counted, 1,
+            "one failed reload must increment contract_filter_refresh exactly once"
+        );
     }
 
     async fn reset_db(pool: &sqlx::PgPool) {
